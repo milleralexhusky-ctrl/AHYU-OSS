@@ -67,7 +67,8 @@ public abstract class LoginPageBase extends Activity {
         root.addView(statusCard, Ui.lp(this, 14));
 
         buildBody(root);
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.50 —— 登录页基类：表单
+        setContentView(Ui.glassScaffold(this, root, 0.50f));
         // 按用户要求放开截屏：登录页也不再禁。
         // 这里原本是为了 token / 二维码不进"最近任务"缩略图，
         // 但代价是用户没法截图反馈登录问题——实际使用中后者更要紧。

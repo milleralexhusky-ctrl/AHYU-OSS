@@ -240,7 +240,8 @@ public class SettingsActivity extends Activity {
         body.addView(versionLine, Ui.lp(this, 18));
 
         root.addView(sv, Ui.fill(this, 0));
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.32 —— 设置：密集文字，底层几乎只剩色调
+        setContentView(Ui.glassScaffold(this, root, 0.32f));
         // 刻意**不**调 Ui.secure()：
         // 设置页只有端口、主题、自启动开关这类东西，没有账号凭据，
         // 禁截屏是误伤——用户想截图反馈问题（或记录配置）时会被直接挡住。

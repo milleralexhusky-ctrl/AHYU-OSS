@@ -282,6 +282,20 @@ final class GlassDrawable extends Drawable {
              * 旧实现是线性递减 alpha 直接叠，结果比设计值深 107%（0.374 vs 0.180），
              * 那种"发闷"的观感就是从这里来的。
              */
+            /*
+             * 4.30.22：整组阴影裁进控件本体范围。
+             *
+             * 原来的画法会把阴影外扩到控件之外（最大 SHADOW_SPREAD_DP）。
+             * 平时父容器把它裁掉，看不出问题；但 Jelly 允许拖动控件出界，
+             * 那一刻外扩的阴影就露出来——比本体大一圈、圆角还不一样，
+             * 看起来像控件钻进了一层"隔层"下面（用户 4.30.22 反馈）。
+             *
+             * 与其为了藏住它而禁止控件拖出边界（那会让拖动变得局促），
+             * 不如让阴影从一开始就不越界：它只负责本体之内的柔和过渡，
+             * 越界的事交给父容器正常裁剪。这样两个问题一起消失。
+             */
+            int saveLayer = canvas.save();
+            canvas.clipRect(b);
             double target = Color.alpha(SHADOW_1) / 255.0;
             int cr = Color.red(SHADOW_1);
             int cg = Color.green(SHADOW_1);
@@ -303,6 +317,7 @@ final class GlassDrawable extends Drawable {
                 shadowPaint.setColor(Color.argb((int) Math.round(a * 255), cr, cg, cb));
                 canvas.drawRoundRect(shadowRect, rr, rr, shadowPaint);
             }
+            canvas.restoreToCount(saveLayer);
         }
 
         // 2. tinted base

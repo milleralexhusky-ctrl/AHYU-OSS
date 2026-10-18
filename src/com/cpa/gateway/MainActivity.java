@@ -335,7 +335,8 @@ public class MainActivity extends Activity {
         bottom.addView(settings, Ui.weight(this, 1f, 0));
         root.addView(bottom, Ui.lp(this, 12));
 
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 1.00 —— 主界面：空间多、文字少，底层是主角
+        setContentView(Ui.glassScaffold(this, root, 1.00f));
     }
 
     /* ------------------------------------------------------------------ state */

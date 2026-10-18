@@ -71,6 +71,7 @@ public class UnusableActivity extends Activity {
         root.addView(sv, Ui.fill(this, 14));
 
         root.addView(Ui.label(this, "这些账号被移到本页是因为：已停用、最近调用失败、或全部模型都调不通。在详情页里「启用」或重新登录即可回到首页。"), Ui.lp(this, 8));
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.65 —— 不可用模型：列表
+        setContentView(Ui.glassScaffold(this, root, 0.65f));
     }
 }

@@ -66,6 +66,40 @@ public final class Capacity {
     /** 上一次算出来的建议容量。 */
     private static volatile int suggestion = MIN_FLOOR;
 
+    /**
+     * 只读：当前活跃请求数。
+     *
+     * <p>给界面上的动态层用——它要知道"现在有多忙"来决定图形铺多开。
+     * 刻意返回原始计数而不是归一化值：怎么压缩、怎么映射是渲染层的事，
+     * 这里只负责如实给出事实。
+     */
+    public static synchronized int inflight() {
+        return inflight;
+    }
+
+    /**
+     * 只读：最近 windowMs 内完成的请求数。
+     *
+     * <p>用"时间戳落在这个窗口里"来数，不假设环形缓冲是按时间有序的——
+     * 虽然实际是，但依赖这个隐含前提会让以后加别的写入点变成陷阱。
+     */
+    public static synchronized int recentCount(long windowMs) {
+        long now = System.currentTimeMillis();
+        int hits = 0;
+        for (int i = 0; i < count; i++) {
+            long t = at[i];
+            if (t > 0 && now - t <= windowMs) hits++;
+        }
+        return hits;
+    }
+
+    /** 只读：最近一次完成的请求耗时（毫秒）；没有样本返回 0。 */
+    public static synchronized long lastDurationMs() {
+        if (count <= 0) return 0;
+        int last = (head - 1 + RING) % RING;
+        return dur[last];
+    }
+
     /** 记一条已完成的请求（由 Server 在请求收尾时调用）。 */
     public static void record(long startMs, long tookMs) {
         if (tookMs <= 0) return;

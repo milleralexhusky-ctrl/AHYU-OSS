@@ -23,7 +23,7 @@ final class Ui {
      *   · 导航层（标题栏、底部栏、按钮、控件）= 玻璃，背景要透出来      → NAV_* / GlassDrawable.navBar
      *   · 内容层（卡片、列表行、文本块、输入框）= 实体面，背景不许透过来  → SURFACE*
      *
-     * 背景只画一次（GlassBackground）；玻璃只负责自己那一块，不做整屏模糊。
+     * 背景按配色现算（Swatch）；玻璃只负责自己那一块，不做整屏模糊。
      * 这条线是给"液体玻璃"留的地基：以后给导航层加折射，内容层不受影响。
      */
 
@@ -269,13 +269,25 @@ final class Ui {
      * where the platform supports it, with the content laid on top.
      */
     static android.widget.FrameLayout glassScaffold(android.app.Activity a, View content) {
+        return glassScaffold(a, content, 1f);
+    }
+
+    /**
+     * Same scaffold, with an explicit presence (0..1) for the backdrop layer.
+     *
+     * <p>This is the "denser the content, the further the visuals recede" rule
+     * made concrete: main screen 1.0, list pages 0.65, settings 0.32,
+     * error banners 0.15 -- one backdrop, not one per page.
+     */
+    static android.widget.FrameLayout glassScaffold(android.app.Activity a, View content, float strength) {
         android.widget.FrameLayout container = new android.widget.FrameLayout(a);
-        View backdrop = new View(a);
-        GlassBackground.ctxRef = a.getApplicationContext();
-        backdrop.setBackground(new GlassBackground.Cached());
+        DynamicBackdrop backdrop = new DynamicBackdrop(a);
+        backdrop.strength(strength);
+        // purely visual: never consumes touch, so taps land on the buttons
+        backdrop.setClickable(false);
+        backdrop.setFocusable(false);
         container.addView(backdrop, new android.widget.FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        BackdropTex.watch(container);
         // deliberately NOT blurred: the artwork must stay perfectly sharp
         final int fallback = statusBarHeight(a);
         final int baseTop = content.getPaddingTop();

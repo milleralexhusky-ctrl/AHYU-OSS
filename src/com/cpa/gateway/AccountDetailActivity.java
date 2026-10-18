@@ -165,7 +165,8 @@ public class AccountDetailActivity extends Activity {
         sv.addView(modelBox);
         root.addView(sv, Ui.fill(this, 10));
         renderModels();
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.50 —— 账号详情：字段较多
+        setContentView(Ui.glassScaffold(this, root, 0.50f));
     }
 
     /** 账号显示名，去掉 "WorkBuddy-" 这类冗余前缀。 */

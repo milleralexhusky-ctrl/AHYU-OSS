@@ -30,13 +30,6 @@ public final class Gateway {
             }
         } catch (Throwable ignored) {
         }
-        if (com.cpa.gateway.GlassBackground.photoBitmap == null) {
-            // 原来在主线程同步解码 358KB 背景大图，服务启动时卡一下；挪后台，
-            // 解出来之前 GlassBackground 会画渐变兜底（draw 里已判空）。
-            // 这里刻意不再预热底纹：后台服务状态（没有 Activity）根本用不到它，
-            // 常驻那 3.5MB 纯属白占（实测后台 PSS 11.2MB 里它占三分之一）。
-            // 底纹改由 UI 第一次挂载时同步备好——预置底纹 14ms，不会让首帧慢。
-        }
         if (config != null && config.providers.isEmpty()) {
             // UI 与 Service 各持一份内存配置时，谁先启动都可能读到旧值；磁盘才是权威
             try {

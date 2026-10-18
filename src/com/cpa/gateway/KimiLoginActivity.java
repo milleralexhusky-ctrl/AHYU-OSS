@@ -55,7 +55,8 @@ public class KimiLoginActivity extends Activity {
             Log.i("kimi 从请求头直接拿到 token（长度 " + t.length() + "）");
             saveToken(t);
         };
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.50 —— 登录：表单
+        setContentView(Ui.glassScaffold(this, root, 0.50f));
         web.loadUrl("https://www.kimi.com");
         Threads.io(this::watch);
     }

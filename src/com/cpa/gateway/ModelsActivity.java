@@ -176,7 +176,8 @@ public class ModelsActivity extends Activity {
             }
         });
 
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.65 —— 模型列表：中等
+        setContentView(Ui.glassScaffold(this, root, 0.65f));
         render("");
     }
 

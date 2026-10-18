@@ -49,22 +49,7 @@ public final class Antigravity {
     static final String DAILY_API_BASE = "https://daily-cloudcode-pa.googleapis.com";
     static final String USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json";
     static final String CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-    /**
-     * Client Secret **不随源码分发**：它是真正的秘密，写进公开仓库等于把一个
-     * 第三方应用的密钥交出去。开源版留空，运行时从环境变量取：
-     * AHYU_AG_CLIENT_SECRET。
-     * 需要它的人可以从自己安装的 Antigravity 桌面客户端资源里取到同一个值；
-     * 缺失时明确报错，而不是发出一个注定 401 的请求。
-     */
-    static final String CLIENT_SECRET = "";
-
-    /** 取 Client Secret：源码里没有，就从环境变量补。 */
-    static String clientSecret() {
-        String s = System.getenv("AHYU_AG_CLIENT_SECRET");
-        if (s != null && !s.isEmpty()) return s;
-        throw new IllegalStateException("未配置 Antigravity 的 OAuth Client Secret"
-                + "（设置环境变量 AHYU_AG_CLIENT_SECRET）。");
-    }
+    static final String CLIENT_SECRET = "在此填入你自己的 OAuth Client Secret";
     static final String[] SCOPES = {
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/userinfo.email",
@@ -159,7 +144,7 @@ public final class Antigravity {
     public static Account exchangeCode(String code) throws Exception {
         String form = "code=" + URLEncoder.encode(code, "UTF-8")
                 + "&client_id=" + URLEncoder.encode(CLIENT_ID, "UTF-8")
-                + "&client_secret=" + URLEncoder.encode(clientSecret(), "UTF-8")
+                + "&client_secret=" + URLEncoder.encode(CLIENT_SECRET, "UTF-8")
                 + "&redirect_uri=" + URLEncoder.encode(redirectUri(), "UTF-8")
                 + "&grant_type=authorization_code";
         Map<String, String> headers = new HashMap<>();
@@ -200,7 +185,7 @@ public final class Antigravity {
         if (acc.refreshToken.isEmpty()) throw new IllegalStateException("凭据已过期且没有 refresh_token，请重新登录");
         Log.i("antigravity token 临期，刷新中");
         String form = "client_id=" + URLEncoder.encode(CLIENT_ID, "UTF-8")
-                + "&client_secret=" + URLEncoder.encode(clientSecret(), "UTF-8")
+                + "&client_secret=" + URLEncoder.encode(CLIENT_SECRET, "UTF-8")
                 + "&refresh_token=" + URLEncoder.encode(acc.refreshToken, "UTF-8")
                 + "&grant_type=refresh_token";
         Map<String, String> headers = new HashMap<>();

@@ -128,7 +128,8 @@ public class WebLoginActivity extends Activity {
         quick.addView(scroller, Ui.lp(this, 6));
         root.addView(Ui.card(this, quick), Ui.lp(this, 8));
 
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.50 —— 网页登录：以网页内容为主
+        setContentView(Ui.glassScaffold(this, root, 0.50f));
         // 同上：按用户要求放开截屏（想禁回去就把下面这行取消注释）。
         // Ui.secure(this);
         renderChips();

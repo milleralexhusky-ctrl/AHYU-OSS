@@ -108,7 +108,8 @@ public class OAuthLoginActivity extends Activity {
         bottom.addView(check, Ui.weight(this, 1f, 0));
         root.addView(bottom, Ui.lp(this, 14));
 
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.50 —— 登录：表单
+        setContentView(Ui.glassScaffold(this, root, 0.50f));
         Threads.io(this::run);
     }
 

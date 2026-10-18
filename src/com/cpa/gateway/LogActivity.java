@@ -130,7 +130,8 @@ public class LogActivity extends Activity {
 
         logListener = line -> handler.post(this::render);
         Log.addListener(logListener);
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.32 —— 日志：密集等宽文字，必须最淡
+        setContentView(Ui.glassScaffold(this, root, 0.32f));
         render();
     }
 

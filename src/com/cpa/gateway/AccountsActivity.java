@@ -118,7 +118,8 @@ public class AccountsActivity extends Activity {
         sv.setOverScrollMode(android.view.View.OVER_SCROLL_NEVER);
         sv.addView(list);
         root.addView(sv, Ui.fill(this, 14));
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.65 —— 账号列表：中等
+        setContentView(Ui.glassScaffold(this, root, 0.65f));
         if (vendor == null) renderVendors();
         else renderVendorAccounts();
         MainActivity.refreshCreditsAsync(this, this::refreshCurrent);

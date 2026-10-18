@@ -64,7 +64,8 @@ public class BrowseActivity extends Activity {
         }, false);
         LoginWebView.fill(card, web);
         root.addView(card, Ui.fill(this, 12));
-        setContentView(Ui.glassScaffold(this, root));
+        // 底层强度 0.50 —— 浏览：内容为主
+        setContentView(Ui.glassScaffold(this, root, 0.50f));
         web.loadUrl(url);
     }
 

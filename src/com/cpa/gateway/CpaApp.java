@@ -23,7 +23,7 @@ public class CpaApp extends Application {
             Ui.applyTheme(cfg.accentTheme, cfg.lightMode);
         } catch (Throwable ignored) {
         }
-        // 此刻 Application 还没 onCreate，但 Context/资源都可用，够解码和读文件了
+        // 此刻 Application 还没 onCreate，但 Context 可用，够算色版了
         BackdropTex.startWarm(base);
     }
 
