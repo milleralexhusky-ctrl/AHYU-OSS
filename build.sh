@@ -89,8 +89,30 @@ PY
 cp $OUT/unsigned.apk $OUT/aligned.apk
 
 echo "[6/6] sign"
-KS=$ROOT/keystore.jks
-if [ ! -f $KS ]; then
+KS=${KS_PATH:-$ROOT/keystore.jks}
+# 口令从环境变量读，**不写进这个文件**。
+#
+# 以前这里硬编码了口令明文，而这个文件是公开仓库的一部分 ——
+# 等于把签名密钥的钥匙挂在门上：谁拿到 keystore.jks，再从这里读到口令，
+# 就能签出同签名的包冒充升级。口令和密钥必须分开存放。
+#
+# 本地使用：构建前 export KS_STOREPASS / KS_KEYPASS
+#（或放进未跟踪的 .env 再 source，.gitignore 已排除）。
+if [ -z "${KS_STOREPASS:-}" ]; then
+  cat >&2 <<PASSMSG
+[错误] 没有提供签名密钥口令。
+
+口令不写在源码里（build.sh 是公开的），构建前请设置环境变量：
+
+    export KS_STOREPASS='你的口令'
+    export KS_KEYPASS='你的口令'     # 与 storepass 相同可省略
+    ./build.sh
+PASSMSG
+  exit 1
+fi
+KS_KEYPASS=${KS_KEYPASS:-$KS_STOREPASS}
+
+if [ ! -f "$KS" ]; then
   cat >&2 <<KEYMSG
 [错误] 找不到签名密钥：$KS
 
@@ -103,13 +125,13 @@ if [ ! -f $KS ]; then
   1) 只想用 App：直接下载 Release 里的 APK，不要自己编译。
   2) 本地调试自用：显式造一把密钥，并清楚它和原版签名不同：
        keytool -genkeypair -keystore keystore.jks -alias cpa -keyalg RSA \
-         -keysize 2048 -validity 10000 -storepass ***REMOVED*** -keypass ***REMOVED*** \
+         -keysize 2048 -validity 10000 -storepass "\$KS_STOREPASS" -keypass "\$KS_KEYPASS" \
          -dname "CN=CPA Gateway, O=Local, C=CN"
-  3) 要发布可覆盖升级的包：使用原作者的 keystore.jks 与之配套口令。
+  3) 要发布可覆盖升级的包：使用你自己的 keystore.jks 与对应口令（只存本地）。
 KEYMSG
   exit 1
 fi
-apksigner sign --ks $KS --ks-pass pass:***REMOVED*** --key-pass pass:***REMOVED*** --out $ROOT/cpa-gateway.apk $OUT/aligned.apk 2>&1 | grep -v WARNING || true
+apksigner sign --ks "$KS" --ks-pass "pass:$KS_STOREPASS" --key-pass "pass:$KS_KEYPASS" --out $ROOT/cpa-gateway.apk $OUT/aligned.apk 2>&1 | grep -v WARNING || true
 apksigner verify --print-certs $ROOT/cpa-gateway.apk 2>&1 | grep -v WARNING | head -6
 ls -la $ROOT/cpa-gateway.apk
 echo BUILD_OK
