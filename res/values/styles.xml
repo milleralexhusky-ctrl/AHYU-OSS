@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      启动窗口（Android 12+ 的 SplashScreen）用背景画自己的平均色。
+
+      之前这里是 #10150C —— 那是"照片没就绪时兜底色斑"的色调，而这张画本身是亮的灰绿
+      （整图平均 #989381，暗化后的底纹平均 #858271）。于是打开应用会先黑/暗一下再亮起来，
+      就是那一瞬间的黑。现在启动窗口的颜色 = 底纹的平均色，首帧接上去是连续的。
+
+      windowBackground 保持深色：它只在视图没盖住的地方露出来（对话框外框等），
+      跟着 splash 改亮反而会在这些地方冒出亮边。
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#10150C</item>
+        <item name="android:windowSplashScreenBackground">#858271</item>
+        <item name="android:colorBackground">#10150C</item>
+        <item name="android:navigationBarColor">#070A11</item>
+        <item name="android:statusBarColor">#070A11</item>
+    </style>
+</resources>

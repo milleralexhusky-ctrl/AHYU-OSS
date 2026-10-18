@@ -1,0 +1,859 @@
+package com.cpa.gateway.core;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+
+/**
+ * Native WorkBuddy / CodeBuddy upstream (the service wb2api wraps), so the gateway no longer needs
+ * a second app running on 127.0.0.1:7863.
+ *
+ * Protocol facts established against the live service:
+ *  - POST {base}/v2/chat/completions speaks OpenAI chat-completions with a WorkBuddy header set.
+ *  - The upstream REFUSES non-streaming ("code":11101) - every request is forced to stream:true and
+ *    aggregated here, exactly like the reference implementation documents.
+ *  - Failures can arrive as HTTP 200 with a business "code" field, so body codes are inspected.
+ *  - GET {base}/v3/config returns the per-agent model catalog.
+ *  - cn realm bases: www.codebuddy.cn, copilot.tencent.com. global realm base: www.workbuddy.ai.
+ */
+public final class WorkBuddy {
+
+    /** Convenience accessor for diagnostics. */
+    public static org.json.JSONObject fromJson2(String json) {
+        try {
+            return new org.json.JSONObject(json == null || json.isEmpty() ? "{}" : json);
+        } catch (Exception e) {
+            return new org.json.JSONObject();
+        }
+    }
+
+
+    private WorkBuddy() {}
+
+    public static final String REALM_CN = "cn";
+    public static final String REALM_GLOBAL = "global";
+    private static final long REFRESH_SKEW_SECONDS = 300L;
+
+    /* ------------------------------------------------------------- account */
+
+    public static final class Account {
+        public String uid = "";
+        public String nickname = "";
+        public String realm = REALM_CN;
+        public String accessToken = "";
+        public String refreshToken = "";
+        public long accessExpiresAt = 0L;
+        public long refreshExpiresAt = 0L;
+        public String deviceToken = "";
+        public String domain = "";
+        public String enterpriseId = "";
+        public String region = "";
+
+        public static Account fromJson(String json) {
+            try {
+                return fromJson(new JSONObject(json));
+            } catch (Exception e) {
+                return new Account();
+            }
+        }
+
+        public static Account fromJson(JSONObject o) {
+            Account a = new Account();
+            a.uid = Proto.optString(o, "uid", "");
+            a.nickname = Proto.optString(o, "nickname", "");
+            a.realm = Proto.optString(o, "realm", REALM_CN);
+            a.accessToken = Proto.optString(o, "access_token", Proto.optString(o, "accessToken", ""));
+            a.refreshToken = Proto.optString(o, "refresh_token", Proto.optString(o, "refreshToken", ""));
+            Integer ae = Proto.optInt(o, "access_expires_at");
+            a.accessExpiresAt = ae == null ? 0L : ae.longValue();
+            Integer re = Proto.optInt(o, "refresh_expires_at");
+            a.refreshExpiresAt = re == null ? 0L : re.longValue();
+            a.deviceToken = Proto.optString(o, "device_token", "");
+            a.domain = Proto.optString(o, "domain", "");
+            a.enterpriseId = Proto.optString(o, "enterprise_id", "");
+            a.region = Proto.optString(o, "region", "");
+            return a;
+        }
+
+        public JSONObject toJson() {
+            JSONObject o = new JSONObject();
+            try {
+                o.put("uid", uid);
+                o.put("nickname", nickname);
+                o.put("realm", realm);
+                o.put("access_token", accessToken);
+                o.put("refresh_token", refreshToken);
+                o.put("access_expires_at", accessExpiresAt);
+                o.put("refresh_expires_at", refreshExpiresAt);
+                o.put("device_token", deviceToken);
+                o.put("domain", domain);
+                o.put("enterprise_id", enterpriseId);
+                o.put("region", region);
+            } catch (Exception ignored) {
+            }
+            return o;
+        }
+
+        public boolean usable() {
+            return !accessToken.isEmpty() && !uid.isEmpty();
+        }
+
+        public String label() {
+            String who = nickname.isEmpty() ? uid : nickname;
+            if (who.length() > 8) who = who.substring(who.length() - 4);
+            return realm + "/" + who;
+        }
+    }
+
+    /**
+     * Client identity string. The upstream serves a wider model catalogue to requests that identify
+     * themselves the way the CLI does - measured on /v3/config:
+     *   WorkBuddy/5.5.6 CLI/2.137.1                  -> 68 models (global)
+     *   WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2 -> 68 models (cn)
+     *   WorkBuddy/5.5.4 (old default)                -> 52~55 models
+     */
+    public static String clientUa(boolean global) {
+        return global ? "WorkBuddy/5.5.6 CLI/2.137.1"
+                : "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2";
+    }
+
+    public static String clientUa(String realm) {
+        return clientUa(REALM_GLOBAL.equalsIgnoreCase(realm));
+    }
+
+    public static List<String> bases(String realm) {
+        List<String> out = new ArrayList<>();
+        if (REALM_GLOBAL.equalsIgnoreCase(realm)) {
+            out.add("https://www.workbuddy.ai");
+        } else {
+            out.add("https://www.codebuddy.cn");
+            out.add("https://copilot.tencent.com");
+        }
+        return out;
+    }
+
+    static String primaryBase(String realm, String configured) {
+        if (configured != null) {
+            String b = Upstreams.trimSlash(configured);
+            if (!b.isEmpty()) return b;
+        }
+        return bases(realm).get(0);
+    }
+
+    /**
+     * 把 WorkBuddy 的业务码归类成"该退避"的类别。
+     *
+     * 上游不少限制是 **HTTP 200 + 业务码** 表达的（我们只认 data: 行，所以会走到这里）。
+     * 返回 null 表示"这是真错误"，交给普通异常处理。
+     */
+    private static String bizKind(int code, String msg) {
+        String m = msg == null ? "" : msg.toLowerCase(java.util.Locale.US);
+        if (m.contains("rate") || m.contains("limit") || m.contains("频繁") || m.contains("too many")
+                || m.contains("busy") || code == 11128) {
+            return "rate";
+        }
+        if (m.contains("quota") || m.contains("balance") || m.contains("额度") || m.contains("积分")
+                || m.contains("insufficient") || code == 11129) {
+            return "quota";
+        }
+        if (m.contains("unauthor") || m.contains("expired") || m.contains("login")
+                || m.contains("登录") || code == 401 || code == 403 || code == 11130) {
+            return "auth";
+        }
+        return null;
+    }
+
+    /* -------------------------------------------------------------- headers */
+
+    static Map<String, String> headers(Account acc, String base, String userAgent) {
+        Map<String, String> h = new HashMap<>();
+        boolean global = REALM_GLOBAL.equalsIgnoreCase(acc.realm);
+        String origin = global ? "https://www.workbuddy.ai" : "https://www.codebuddy.cn";
+        h.put("Content-Type", "application/json");
+        h.put("X-CodeBuddy-Request", "1");
+        h.put("Accept-Language", global ? "en-US" : "zh-CN");
+        h.put("Accept", "application/json, */*");
+        h.put("X-Requested-With", "XMLHttpRequest");
+        h.put("Origin", origin);
+        h.put("Referer", origin + "/");
+        h.put("User-Agent", userAgent == null || userAgent.isEmpty() ? clientUa(global) : userAgent);
+        if (!acc.accessToken.isEmpty()) h.put("Authorization", "Bearer " + acc.accessToken);
+        if (!acc.uid.isEmpty()) h.put("X-User-Id", acc.uid);
+        if (!acc.enterpriseId.isEmpty()) {
+            h.put("X-Enterprise-Id", acc.enterpriseId);
+            h.put("X-Tenant-Id", acc.enterpriseId);
+        } else {
+            h.put("X-No-Enterprise-Id", "true");
+        }
+        if (!acc.domain.isEmpty()) h.put("X-Domain", acc.domain);
+        else h.put("X-No-Department-Info", "true");
+        if (!acc.deviceToken.isEmpty()) h.put("X-Device-Token", acc.deviceToken);
+        // 参考实现（workbuddy2api/core/converter.py 的 _client_ip_headers + fingerprint.py）
+        // 在推理请求上还会带这几个头，上游靠它们识别 client / 用途：
+        h.put("X-Agent-Purpose", "conversation");
+        h.put("X-IDE-Name", "WorkBuddy");
+        h.put("X-IDE-Type", "WorkBuddy");
+        h.put("X-Product", "WorkBuddy");
+        if (!acc.uid.isEmpty()) {
+            // 设备指纹：按 uid 派生一个稳定的机器号；会话号每次新建
+            h.put("X-Machine-ID", "wb-" + Integer.toHexString(Math.abs(acc.uid.hashCode())));
+            h.put("X-Session-ID", java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16));
+            h.put("X-Request-ID", java.util.UUID.randomUUID().toString().replace("-", ""));
+        }
+        return h;
+    }
+
+    /* --------------------------------------------------------- token upkeep */
+
+    static Map<String, String> loginHeaders(String base) {
+        Map<String, String> h = new HashMap<>();
+        h.put("Content-Type", "application/json");
+        h.put("Accept", "application/json");
+        h.put("X-CodeBuddy-Request", "1");
+        h.put("X-Requested-With", "XMLHttpRequest");
+        h.put("Origin", base);
+        h.put("Referer", base + "/");
+        // 版本号对齐参考实现（workbuddy2api 的 oauth_login.py 用的是 CLI/2.148.0）：
+        // 上游对版本是敏感的，2.63.2 这种旧号很可能就是"登录完成却一直 11217"的原因之一
+        h.put("User-Agent", "CLI/2.148.0 CodeBuddy/2.148.0");
+        h.put("Accept", "application/json, text/plain, */*");
+        return h;
+    }
+
+    /**
+     * Step 1 of the CLI plugin authorization flow: the upstream hands us a state id plus the URL the
+     * user has to open. Verified live: POST {base}/v2/plugin/auth/state?platform=CLI.
+     */
+    public static JSONObject beginLogin(String realm, String base) throws Exception {
+        String b = primaryBase(realm, base);
+        String body = Upstreams.postJson(b + "/v2/plugin/auth/state?platform=CLI", loginHeaders(b), new JSONObject());
+        JSONObject o = new JSONObject(body);
+        JSONObject data = o.optJSONObject("data");
+        if (data == null) throw new IllegalStateException("上游未返回授权信息：" + Upstreams.shortenPublic(body));
+        JSONObject out = new JSONObject();
+        out.put("state", Proto.optString(data, "state", ""));
+        out.put("authUrl", Proto.optString(data, "authUrl", ""));
+        out.put("base", b);
+        out.put("realm", realm);
+        return out;
+    }
+
+    /**
+     * Step 2: poll until the user finishes logging in. Pending answers arrive as HTTP 200 with the
+     * business code 11217 ("login ing..."), which is exactly the trap this upstream likes to set.
+     */
+    public static JSONObject pollLogin(String realm, String base, String state) throws Exception {
+        String b = primaryBase(realm, base);
+        String url = b + "/v2/plugin/auth/token?state=" + URLEncoder.encode(state, "UTF-8");
+        Map<String, String> h = loginHeaders(b);
+        // 官方在"没有身份字段"的请求上会声明这四个 X-No-*（取值是字符串 true，不是 1）
+        h.put("X-No-Authorization", "true");
+        h.put("X-No-User-Id", "true");
+        h.put("X-No-Enterprise-Id", "true");
+        h.put("X-No-Department-Info", "true");
+        String body = Upstreams.getWithHeaders(url, h);
+        JSONObject o = new JSONObject(body);
+        int code = o.optInt("code", -1);
+        JSONObject data = o.optJSONObject("data");
+        if (data == null && o.opt("data") instanceof String) {
+            try {
+                data = new JSONObject(String.valueOf(o.opt("data")));
+            } catch (Exception ignored) {
+            }
+        }
+        Account probe = accountFromTokenResponse(data, realm);
+        boolean looksDone = probe != null && !probe.accessToken.isEmpty();
+        // 11217 = token 还没好；12151 = account 还没好。两个都算"还在等"，别的码要当错误抛出去
+        boolean pendingCode = code == 11217 || code == 12151 || code == 0;
+        if (!looksDone && !pendingCode) {
+            Log.w("workbuddy 授权返回异常码 " + code + "：" + Upstreams.shortenPublic(body));
+        }
+        if (code != 0 && !looksDone && code != 12151) {
+            Log.i("workbuddy 授权轮询 code=" + code + " msg=" + Proto.optString(o, "msg", ""));
+            JSONObject out = new JSONObject();
+            out.put("status", "pending");
+            out.put("code", code);
+            out.put("msg", Proto.optString(o, "msg", ""));
+            return out;
+        }
+        Account acc = probe;
+        Log.i("workbuddy 授权返回：uid=" + acc.uid + " realm=" + acc.realm + " 原始=" + Upstreams.shortenPublic(body));
+        if (acc == null || acc.accessToken.isEmpty()) {
+            Log.w("workbuddy 授权响应无法解析：" + Upstreams.shortenPublic(body));
+            throw new IllegalStateException("授权已返回但没解析到 access_token，原始响应已写日志：" + Upstreams.shortenPublic(body));
+        }
+        if (acc.uid.isEmpty() || acc.nickname.isEmpty()) {
+            try {
+                Map<String, String> ah = loginHeaders(b);
+                ah.put("X-No-User-Id", "true");
+                ah.put("X-No-Enterprise-Id", "true");
+                ah.put("X-No-Department-Info", "true");
+                if (acc != null && !acc.accessToken.isEmpty()) {
+                    ah.put("Authorization", "Bearer " + acc.accessToken);
+                }
+                String accBody = Upstreams.getWithHeaders(b + "/v2/plugin/login/account?state=" + URLEncoder.encode(state, "UTF-8"), ah);
+                JSONObject ao = new JSONObject(accBody);
+                JSONObject ad = ao.optJSONObject("data");
+                if (ad != null) {
+                    if (acc.uid.isEmpty()) acc.uid = Proto.optString(ad, "uid", Proto.optString(ad, "userId", ""));
+                    if (acc.nickname.isEmpty()) acc.nickname = Proto.optString(ad, "nickname", Proto.optString(ad, "name", Proto.optString(ad, "username", "")));
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (acc.uid.isEmpty()) acc.uid = "wb-" + Math.abs(acc.accessToken.hashCode());
+        JSONObject out = new JSONObject();
+        out.put("status", "done");
+        out.put("account", acc.toJson());
+        return out;
+    }
+
+    /** Tolerant reader for the token response: the exact key set is not documented anywhere. */
+    static Account accountFromTokenResponse(JSONObject data, String realm) {
+        if (data == null) return null;
+        // some realms nest the credential payload one level deeper
+        JSONObject nested = data.optJSONObject("token");
+        if (nested == null) nested = data.optJSONObject("auth");
+        if (nested != null) {
+            JSONObject merged = new JSONObject();
+            try {
+                java.util.Iterator<String> it = data.keys();
+                while (it.hasNext()) {
+                    String k = it.next();
+                    merged.put(k, data.opt(k));
+                }
+                java.util.Iterator<String> it2 = nested.keys();
+                while (it2.hasNext()) {
+                    String k = it2.next();
+                    if (!merged.has(k)) merged.put(k, nested.opt(k));
+                }
+            } catch (Exception ignored) {
+            }
+            data = merged;
+        }
+        Account acc = new Account();
+        acc.realm = realm;
+        acc.accessToken = firstNonEmpty(data, "access_token", "accessToken", "token", "id_token");
+        acc.refreshToken = firstNonEmpty(data, "refresh_token", "refreshToken");
+        acc.uid = firstNonEmpty(data, "uid", "user_id", "userId", "sub", "account_id");
+        acc.nickname = firstNonEmpty(data, "nickname", "name", "username", "display_name");
+        acc.domain = firstNonEmpty(data, "domain");
+        acc.enterpriseId = firstNonEmpty(data, "enterprise_id", "enterpriseId");
+        acc.region = firstNonEmpty(data, "region");
+        acc.deviceToken = firstNonEmpty(data, "device_token", "deviceToken");
+        JSONObject account = data.optJSONObject("account");
+        if (account == null) account = data.optJSONObject("user");
+        if (account != null) {
+            if (acc.uid.isEmpty()) acc.uid = firstNonEmpty(account, "uid", "id", "user_id", "userId");
+            if (acc.nickname.isEmpty()) acc.nickname = firstNonEmpty(account, "nickname", "name", "username");
+        }
+        Integer expiresIn = Proto.optInt(data, "expires_in");
+        if (expiresIn == null) expiresIn = Proto.optInt(data, "expiresIn");
+        long now = System.currentTimeMillis() / 1000;
+        acc.accessExpiresAt = expiresIn == null ? now + 28L * 24 * 3600 : now + expiresIn.intValue() - 30;
+        Integer refreshExpires = Proto.optInt(data, "refresh_expires_in");
+        if (refreshExpires != null) acc.refreshExpiresAt = now + refreshExpires.intValue();
+        // last resort: the access token itself carries the account id in "sub"
+        if (acc.uid.isEmpty() && !acc.accessToken.isEmpty()) {
+            try {
+                String[] parts = acc.accessToken.split("\\.");
+                if (parts.length >= 2) {
+                    byte[] raw = android.util.Base64.decode(parts[1],
+                            android.util.Base64.URL_SAFE | android.util.Base64.NO_WRAP | android.util.Base64.NO_PADDING);
+                    JSONObject claims = new JSONObject(new String(raw, "UTF-8"));
+                    acc.uid = Proto.optString(claims, "sub", "");
+                    if (acc.nickname.isEmpty()) acc.nickname = Proto.optString(claims, "preferred_username", "");
+                    if (acc.enterpriseId.isEmpty()) acc.enterpriseId = Proto.optString(claims, "enterprise_id", "");
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return acc;
+    }
+
+    static String firstNonEmpty(JSONObject o, String... keys) {
+        for (String k : keys) {
+            String v = Proto.optString(o, k, "");
+            if (!v.isEmpty()) return v;
+        }
+        return "";
+    }
+
+    /**
+     * Turns an account blob into a usable channel: create or update a workbuddy provider, pull its
+     * model catalogue, persist. Used by the in-app login and by the authenticated import route.
+     */
+    public static JSONObject registerProvider(JSONObject accountJson) throws Exception {
+        Account acc = Account.fromJson(accountJson);
+        if (!acc.usable()) throw new IllegalStateException("凭据缺少 access_token 或 uid");
+        Config cfg = Gateway.config();
+        Config.Provider target = null;
+        for (Config.Provider p : cfg.providers) {
+            if (!Config.TYPE_WORKBUDDY.equals(p.type)) continue;
+            Account existing = Account.fromJson(p.credentials);
+            if (!existing.uid.isEmpty() && existing.uid.equals(acc.uid)) {
+                target = p;
+                break;
+            }
+        }
+        boolean created = target == null;
+        if (created) {
+            target = new Config.Provider();
+            target.type = Config.TYPE_WORKBUDDY;
+            target.id = Config.newProviderId("wb");
+            String who = acc.nickname;
+            if (who.isEmpty() && acc.uid.length() >= 8) who = acc.uid.substring(0, 8);
+            if (who.isEmpty()) who = REALM_GLOBAL.equalsIgnoreCase(acc.realm) ? "国际版" : "国内版";
+            target.name = Config.nextAccountName("WorkBuddy", target.type);
+            cfg.providers.add(target);
+        }
+        target.credentials = acc.toJson().toString();
+        target.enabled = true;
+        target.lastError = "";
+        target.lastErrorAt = 0;
+        target.badModels.clear();
+        int modelCount = target.models.size();
+        try {
+            java.util.List<String> models = fetchModels(target);
+            target.setModels(models);
+            modelCount = target.models.size();
+        } catch (Exception e) {
+            Log.w("拉取 workbuddy 模型列表失败（不塞默认清单，避免把猜测当成事实）：" + e);
+            if (target.models.isEmpty()) {
+                modelCount = target.models.size();
+            }
+        }
+        // 顺手把积分也拉一次，和模型列表一起落盘。
+        //
+        // 为什么在这里拉：积分原本只在 GatewayService.refreshCreditsInBackground()
+        // 里刷新，而那是**网关启动后 3 秒**才跑的——刚登录完的账号要等到下次启动
+        // 才会有数字（用户看到的是"有模型、没积分"）。登录路径本来就跑在后台线程
+        // （WorkBuddyLoginActivity 用 Threads.io），多这一次网络调用不影响体验，
+        // 却能立刻把积分显示出来。
+        // 失败不抛：积分拿不到不该让登录失败，保留 -1、下次刷新再补。
+        double credits = -1;
+        try {
+            credits = WbTasks.credits(target);
+            if (credits >= 0) {
+                target.credits = credits;
+                target.creditsAt = System.currentTimeMillis() / 1000;
+            }
+        } catch (Throwable t) {
+            Log.w("登录后拉取积分失败（不影响登录，下次启动会重试）：" + t);
+        }
+
+        Gateway.saveNow(Gateway.context());
+        JSONObject out = new JSONObject();
+        out.put("provider", target.name);
+        out.put("created", created);
+        out.put("models", modelCount);
+        out.put("realm", acc.realm);
+        out.put("credits", credits);
+        return out;
+    }
+
+    /**
+     * There is no token-refresh endpoint on this upstream (checked against the live service and
+     * against the reference implementation, which only re-logs in when a session dies). So the
+     * honest behaviour is: use the token while it lives, and say exactly what to do when it dies.
+     */
+    public static Account ensureFresh(Config.Provider p) throws Exception {
+        // 原来是 static synchronized（类级锁）：一个账号走网络刷新 token 时，
+        // 同 Provider 的其他账号全被堵住。现在按账号加锁，各刷各的。
+        synchronized (FreshLocks.forKey(p.name)) {
+            return ensureFreshInner(p);
+        }
+    }
+
+    private static Account ensureFreshInner(Config.Provider p) throws Exception {
+        Account acc = Account.fromJson(p.credentials);
+        if (!acc.usable()) {
+            String hint = p.credentials == null || p.credentials.isEmpty() ? "credentials 为空" : "credentials 里没有 access_token/uid";
+            throw new IllegalStateException("workbuddy 账号不可用：" + hint);
+        }
+        long now = System.currentTimeMillis() / 1000;
+        if (acc.accessExpiresAt > 0 && acc.accessExpiresAt <= now) {
+            throw new IllegalStateException("workbuddy 的 access_token 已过期（上游无刷新接口），请在应用里点『登录 WorkBuddy』重新授权，一次约可用 28 天");
+        }
+        return acc;
+    }
+
+    /* ------------------------------------------------------------- upstream */
+
+    /**
+     * This upstream insists the first message is a system prompt: otherwise it answers
+     * `code 11128 "first message is not system prompt"`, which apps show as
+     * "请求已被安全策略拦截" (blocked by security policy). Clients that send no system prompt
+     * (most of them) get one injected here.
+     */
+    static final String DEFAULT_SYSTEM = "You are a helpful AI assistant.";
+
+    static void ensureSystemFirst(JSONObject body) {
+        try {
+            JSONArray msgs = body.optJSONArray("messages");
+            boolean hasSystemFirst = false;
+            if (msgs != null && msgs.length() > 0) {
+                JSONObject first = msgs.optJSONObject(0);
+                hasSystemFirst = first != null && "system".equals(Proto.optString(first, "role", ""));
+            }
+            if (hasSystemFirst) return;
+            JSONArray fixed = new JSONArray();
+            fixed.put(new JSONObject().put("role", "system").put("content", DEFAULT_SYSTEM));
+            for (int i = 0; msgs != null && i < msgs.length(); i++) fixed.put(msgs.opt(i));
+            body.put("messages", fixed);
+            Log.i("workbuddy：客户端没给 system 提示，已自动补一条（避免 11128）");
+        } catch (Exception e) {
+            Log.w("补 system 提示失败：" + e);
+        }
+    }
+
+    /* ------------------------------------------- 渠道校验：会话标识（4.29.10） */
+
+    /**
+     * 渠道校验的几种"会话标识"形状。shape 0 = 原样，和 4.29.9 之前完全一致。
+     *
+     * 真机（4.29.9 的 detect.log）拿到过 WB4 的**完整**拒绝：
+     *   HTTP400 {"code":11128,"msg":"conversation id missing",
+     *            "displayMsg":{"zh":"请求被拦截，请重新发送"},
+     *            "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端…",
+     *                           "en":"This call failed channel verification, possibly because it was
+     *                                 not sent from an official client."}}
+     * 官方客户端每次对话都在一个会话里，请求自然带着会话标识；网关是无状态转发，
+     * 从来没有这个字段。于是遇到这个错就按几种可能的字段名各试一次——谁通用谁，
+     * 并把结果写进应用日志（探测时同时写 detect.log），成功的那一种可以后续固化成默认形状。
+     *
+     * 为什么不做"记住用那种形状、以后直接带"：另外几个 WorkBuddy 账号（WB3 / WB5）
+     * 用原样就能通，给它们平白加上会话字段属于主动改变出站形状，没有必要。
+     * 代价只是撞上校验的那个账号每次多一次 400 往返（实测 110ms 就回来了）。
+     *
+     * **4.29.10 真机 A/B 结论（别重复做）**：同一个请求形状，同 realm 的 WorkBuddy 3
+     * 能过渠道校验（直接进业务层 `429 Credits exhausted`），WorkBuddy 4 过不去——
+     * 形状无关、**账号/会话被标记**才是原因。两轮形状实验（5 种 body 会话字段 + 5 种 UA 身份，
+     * 含最小头）全部被拒，requestId 恒定。
+     *
+     * 第一轮 5 种"body 会话字段"形状**全部被拒**，
+     * 而且 5 次回包的 `requestId` 一模一样——说明上游这次校验根本不看我们发的 body。
+     * 于是第二轮改成试**客户端身份**（UA 三段式，来自反编译出来的 wb2api 出站头构造），
+     * 因为"渠道校验/不是官方客户端"这句话指向的正是身份，而不是会话字段。
+     *
+     * 上限：某个账号 5 种形状都被拒之后，本进程内**不再重试**（否则每探一次就是 5 次 400 往返），
+     * 但仍保留"原样"那一轮——上游若改回去，原样自己就会通；进程重启后重试标记清空。
+     */
+    /** 5 种形状都被拒过的账号：本进程内不再重试（重启即忘，不是永久拉黑）。 */
+    private static final java.util.Set<String> CONV_HOPELESS =
+            java.util.Collections.newSetFromMap(
+                    new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+
+    static final String[] CONV_SHAPES = {
+            "原样",
+            "UA=WorkBuddy AI 三段式(global)",
+            "UA=WorkBuddy 三段式(cn)",
+            "UA(global 三段式)+body conversationId",
+            "UA(cn 三段式)+body conversationId+X-Device-Token",
+    };
+
+    /**
+     * 官方三段式 UA。
+     *
+     * 来源：把手机上那个能跑通的 wb2api（com.wb.api1.5.0）反编译出来，它的出站头构造里
+     * 明确写着（`eb2.a(ef, realm, auth, z)`）：
+     *   UA = "WorkBuddy/5.5.4 " + (realm=="global" ? "WorkBuddy AI" : "WorkBuddy") + "/5.5.4 CLI/2.137.1"
+     * 也就是说 **global 才带 "WorkBuddy AI"**，cn 是 "WorkBuddy" 重复三段。
+     * 而本网关 `clientUa()` 是"测量目录条数"得来的经验值：global 发的是两段式
+     * `WorkBuddy/5.5.6 CLI/2.137.1`——目录能刷出来，但推理请求可能过不了渠道校验。
+     */
+    private static String officialUa(boolean global) {
+        return global ? "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
+                : "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1";
+    }
+
+    static void applyConvShape(int shape, JSONObject body, Map<String, String> headers,
+                               String cid, Account acc) {
+        boolean global = acc != null && REALM_GLOBAL.equalsIgnoreCase(acc.realm);
+        try {
+            switch (shape) {
+                case 1:
+                    headers.put("User-Agent", officialUa(true));
+                    break;
+                case 2:
+                    headers.put("User-Agent", officialUa(false));
+                    break;
+                case 3:
+                    headers.put("User-Agent", officialUa(global));
+                    body.put("conversationId", cid);
+                    break;
+                case 4:
+                    headers.put("User-Agent", officialUa(global));
+                    body.put("conversationId", cid);
+                    if (acc != null && !acc.deviceToken.isEmpty()) {
+                        headers.put("X-Device-Token", acc.deviceToken);
+                    }
+                    headers.put("X-Session-ID", cid);
+                    break;
+                default:
+                    break;
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 这次失败是不是"渠道校验 / 会话标识"引起的？只认这几种说法，别误伤别的 400。 */
+    static boolean looksLikeConvIdError(Throwable t) {
+        String m = t == null ? "" : String.valueOf(t.getMessage()).toLowerCase(java.util.Locale.US);
+        return m.contains("conversation id") || m.contains("channel verification")
+                || (m.contains("11128") && m.contains("conversation"));
+    }
+
+    /** 每次尝试都重新构造 body：重试绝不能复用被改过的对象。 */
+    private static JSONObject buildBody(String model, Proto.Req req) throws Exception {
+        JSONObject body = Upstreams.openAiBody(model, req, true);
+        /* the upstream rejects non-streaming outright */
+        body.put("stream", true);
+        ensureSystemFirst(body);
+        /* 诊断：在整理**之前**记录客户端发来的原始序列，用来区分
+           (a) 客户端压根没把 tool 结果发回来 与 (b) 发了但被 normalizeToolPairs
+           当"孤立"删掉——之前只在整理之后打过，看不出是哪一种。 */
+        JSONArray wbMsgs = body.optJSONArray("messages");
+        if (wbMsgs != null) Upstreams.normalizeToolPairs(wbMsgs);
+        return body;
+    }
+
+    /** 渠道校验实验结果：进应用日志；探测请求另外写一行 detect.log。 */
+    static void noteConv(Config.Provider p, Proto.Req req, int shape, String outcome, Throwable e) {
+        String tail = e == null ? "" : " · " + Upstreams.shortenPublic(String.valueOf(e.getMessage()));
+        Log.i("workbuddy 渠道校验：" + p.name + " · " + CONV_SHAPES[shape] + " " + outcome + tail);
+        if (req != null && req.ephemeral) {
+            Detect.file("# 渠道校验\t" + p.name + "\t" + CONV_SHAPES[shape] + "\t" + outcome
+                    + (e == null ? "" : "\t" + Upstreams.shortenPublic(String.valueOf(e.getMessage()))));
+        }
+    }
+
+    static final class Up implements Proto.Upstream {
+        private final Config.Provider p;
+
+        Up(Config.Provider p) {
+            this.p = p;
+        }
+
+        @Override
+        public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
+            Account acc = ensureFresh(p);
+            /* UA 走客户端身份画像（第三个参数以前误传了 p.apiKey，等于把网关的 Key
+               当 User-Agent 发给上游；这些账号的 apiKey 字段是空的才一直没暴露）。 */
+            Map<String, String> baseHeaders = headers(acc, primaryBase(acc.realm, p.baseUrl), null);
+            String endpoint = primaryBase(acc.realm, p.baseUrl) + "/v2/chat/completions";
+            String convId = "wb-" + System.currentTimeMillis();
+            Exception convFailed = null;
+            final int shapes = CONV_HOPELESS.contains(p.name) ? 1 : CONV_SHAPES.length;
+            for (int shape = 0; shape < shapes; shape++) {
+            JSONObject body = buildBody(model, req);
+            Map<String, String> headers = new HashMap<>(baseHeaders);
+            if (shape > 0) applyConvShape(shape, body, headers, convId, acc);
+            final TreeMap<Integer, JSONObject> toolAcc = new TreeMap<>();
+            final Proto.Usage usage = new Proto.Usage();
+            final String[] finish = {""};
+            try {
+
+            Upstreams.postStream(endpoint, headers, body, line -> {
+                String t = line == null ? "" : line.trim();
+                if (t.isEmpty() || t.startsWith(":")) return; // heartbeat comments
+                if (!t.startsWith("data:")) return;
+                String data = t.substring(5).trim();
+                if (data.isEmpty() || "[DONE]".equals(data)) return;
+                JSONObject chunk;
+                try {
+                    chunk = new JSONObject(data);
+                } catch (Exception e) {
+                    return;
+                }
+                if (chunk.has("code") && !chunk.has("choices")) {
+                    int code = chunk.optInt("code", -1);
+                    if (code != 0) {
+                        String msg = Proto.optString(chunk, "msg", "upstream business error");
+                        JSONObject display = chunk.optJSONObject("displayMsg");
+                        String zh = display != null ? Proto.optString(display, "zh", "") : "";
+                        String detail = "workbuddy 拒绝：" + code + " " + msg + (zh.isEmpty() ? "" : " / " + zh);
+                        // 上游用业务码（HTTP 200）表达的限流/额度/鉴权要按退避处理，
+                        // 否则连错 3 次就把健康账号打进熔断——那是我们自己的误伤。
+                        String kind = bizKind(code, msg);
+                        if (kind != null) {
+                            int httpCode = "quota".equals(kind) ? 402 : 429;
+                            throw new Throttled(httpCode, Http.defaultBackoffMs(httpCode), kind, detail);
+                        }
+                        throw new IllegalStateException(detail);
+                    }
+                }
+                JSONObject u = chunk.optJSONObject("usage");
+                if (u != null) {
+                    Upstreams.applyUsage(usage, u, "prompt_tokens", "completion_tokens", "cached_tokens");
+                    JSONObject details = u.optJSONObject("prompt_tokens_details");
+                    if (details != null) {
+                        Integer c = Proto.optInt(details, "cached_tokens");
+                        if (c != null) usage.cached = c;
+                    }
+                }
+                JSONArray choices = chunk.optJSONArray("choices");
+                if (choices == null || choices.length() == 0) return;
+                JSONObject c0 = choices.optJSONObject(0);
+                if (c0 == null) return;
+                JSONObject d = c0.optJSONObject("delta");
+                if (d != null) {
+                    String content = Proto.optString(d, "content", "");
+                    if (!content.isEmpty()) sink.text(content);
+                    String rc = Proto.optString(d, "reasoning_content", Proto.optString(d, "reasoning", ""));
+                    if (!rc.isEmpty()) sink.thinking(rc);
+                    JSONArray tcs = d.optJSONArray("tool_calls");
+                    if (tcs != null && tcs.length() > 0) {
+                        for (int i = 0; i < tcs.length(); i++) {
+                            JSONObject tc = tcs.optJSONObject(i);
+                            if (tc == null) continue;
+                            Integer idxObj = Proto.optInt(tc, "index");
+                            int idx = idxObj == null ? 0 : idxObj.intValue();
+                            JSONObject acc2 = toolAcc.get(idx);
+                            if (acc2 == null) {
+                                acc2 = new JSONObject();
+                                acc2.put("id", "");
+                                acc2.put("name", "");
+                                acc2.put("args", "");
+                                toolAcc.put(idx, acc2);
+                            }
+                            String id = Proto.optString(tc, "id", "");
+                            if (!id.isEmpty()) acc2.put("id", id);
+                            JSONObject fn = tc.optJSONObject("function");
+                            if (fn != null) {
+                                String name = Proto.optString(fn, "name", "");
+                                if (!name.isEmpty()) acc2.put("name", name);
+                                String args = Proto.optString(fn, "arguments", "");
+                                if (!args.isEmpty()) acc2.put("args", Proto.optString(acc2, "args", "") + args);
+                            }
+                        }
+                    }
+                }
+                String fr = Proto.optString(c0, "finish_reason", "");
+                if (!fr.isEmpty() && !"null".equals(fr)) finish[0] = fr;
+            });
+
+            // 诊断：把即将转发给客户端的每个工具调用打出来。
+            // 目的：确认"客户端收到的 tool_call id"和"它下一轮带回来的 tool_call_id"
+            // 是不是同一个——对不上，结果就会被当成孤立消息丢掉。
+            for (JSONObject t : toolAcc.values()) {
+                String id = Proto.optString(t, "id", "");
+                boolean invented = false;
+                if (id.isEmpty()) {
+                    id = "call_" + Math.abs(System.nanoTime() % 1000000);
+                    invented = true;
+                }
+                String name = Proto.optString(t, "name", "");
+                if (name.isEmpty()) continue;
+                sink.toolCall(id, name, Proto.optString(t, "args", "{}"));
+            }
+            sink.finish(Proto.canonicalStop(finish[0], !toolAcc.isEmpty()), usage);
+            if (shape > 0) noteConv(p, req, shape, "通过", null);
+            return;
+            } catch (Exception e) {
+                if (!looksLikeConvIdError(e) || shape == shapes - 1) {
+                    if (shape > 0) noteConv(p, req, shape, "仍失败", e);
+                    if (looksLikeConvIdError(e) && shapes > 1) {
+                        CONV_HOPELESS.add(p.name);
+                        Log.w("workbuddy 渠道校验：" + p.name
+                                + " 5 种会话形状都被拒，本进程内不再重试（上游要的是服务端真实会话）");
+                    }
+                    throw e;
+                }
+                /* 渠道校验没过：换下一种会话形状再试。换成别的 400 一律不重试。 */
+                convFailed = e;
+                noteConv(p, req, shape, "被拒", e);
+            }
+            }
+            if (convFailed != null) throw convFailed;
+        }
+    }
+
+    /* ---------------------------------------------------------- model list */
+
+    static List<String> fetchModels(Config.Provider p) throws Exception {
+        Account acc = ensureFresh(p);
+        String base = primaryBase(acc.realm, p.baseUrl);
+        String body = Upstreams.getWithHeaders(base + "/v3/config", headers(acc, base, p.apiKey));
+        JSONObject o = new JSONObject(body);
+        int code = o.optInt("code", 0);
+        if (code != 0) throw new IllegalStateException("workbuddy /v3/config 返回 code=" + code);
+        JSONObject data = o.optJSONObject("data");
+        List<String> out = new ArrayList<>();
+        if (data != null) {
+            JSONArray agents = data.optJSONArray("agents");
+            if (agents != null) {
+                for (int i = 0; i < agents.length(); i++) {
+                    JSONObject agent = agents.optJSONObject(i);
+                    if (agent == null) continue;
+                    JSONArray models = agent.optJSONArray("models");
+                    if (models == null) continue;
+                    for (int k = 0; k < models.length(); k++) {
+                        String m = String.valueOf(models.opt(k));
+                        if (!m.isEmpty() && !out.contains(m)) out.add(m);
+                    }
+                }
+            }
+            JSONArray models = data.optJSONArray("models");
+            if (models != null) {
+                for (int k = 0; k < models.length(); k++) {
+                    Object item = models.opt(k);
+                    String m = item instanceof JSONObject
+                            ? Proto.optString((JSONObject) item, "id", Proto.optString((JSONObject) item, "name", ""))
+                            : String.valueOf(item);
+                    if (!m.isEmpty() && !out.contains(m)) out.add(m);
+                }
+            }
+        }
+        // 实测：CLI 身份换来的"更全目录"里大部分条目账号无权调用（11102），探活后几乎全被隐藏，
+        // 所以这里只认真正接通的那批（data.agents[].models / data.models），不再整份扫。
+        if (out.isEmpty()) throw new IllegalStateException("workbuddy 未返回模型列表");
+        return out;
+    }
+
+    /** Walks every nested "models" array and merges any model name it finds. */
+    static void collectAllModels(Object node, List<String> out, int depth) {
+        if (node == null || depth > 6) return;
+        if (node instanceof JSONObject) {
+            JSONObject o = (JSONObject) node;
+            Object models = o.opt("models");
+            if (models instanceof JSONArray) {
+                JSONArray arr = (JSONArray) models;
+                for (int i = 0; i < arr.length(); i++) {
+                    Object item = arr.opt(i);
+                    String m = null;
+                    if (item instanceof JSONObject) {
+                        JSONObject mo = (JSONObject) item;
+                        m = Proto.optString(mo, "model_name", Proto.optString(mo, "name",
+                                Proto.optString(mo, "id", "")));
+                    } else if (item instanceof String) {
+                        m = (String) item;
+                    }
+                    if (m != null && !m.isEmpty() && !out.contains(m)) out.add(m);
+                }
+            }
+            java.util.Iterator<String> it = o.keys();
+            while (it.hasNext()) {
+                String key = it.next();
+                if ("models".equals(key)) continue;
+                collectAllModels(o.opt(key), out, depth + 1);
+            }
+        } else if (node instanceof JSONArray) {
+            JSONArray arr = (JSONArray) node;
+            for (int i = 0; i < arr.length(); i++) collectAllModels(arr.opt(i), out, depth + 1);
+        }
+    }
+}

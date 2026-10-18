@@ -1,0 +1,18 @@
+# 构建产物（build.sh 每次 rm -rf out 重建）
+out/
+*.apk
+*.apk.idsig
+
+# 签名密钥：绝不入库
+keystore.jks
+*.jks
+*.keystore
+
+# 本地临时
+*.log
+*.tmp
+.DS_Store
+
+# 编辑器
+.idea/
+*.iml
