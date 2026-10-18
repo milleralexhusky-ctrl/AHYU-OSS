@@ -3,9 +3,23 @@
 把多家 AI 服务商的能力聚合到一台 Android 手机上，本机作为网关对外提供 OpenAI 兼容接口。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.30.17**（versionCode 600）
+- 当前版本：**4.30.22**（versionCode 605）
 - 语言：纯 Java，**不使用 Gradle**，构建脚本即 `build.sh`
 - 目标 SDK 35，最低 26
+
+## 下载安装
+
+不想自己编译的话，直接下打包好的 APK：
+
+**[→ 下载最新版 APK](https://github.com/milleralexhusky-ctrl/AHYU-OSS/releases/latest)**
+
+| | |
+|---|---|
+| 当前版本 | 4.30.22 |
+| 要求 | Android 8.0（API 26）及以上 |
+| 签名证书 SHA-256 | `45a99822b5bca88892d6b58b6f758aa246ac3d481e490d85ba5db749a3a223db` |
+
+后续版本沿用同一把签名密钥，可直接覆盖升级，不必卸载重装。
 
 ## 构建
 
@@ -45,16 +59,16 @@ keystore.jks            签名密钥（勿删）
 
 ## 代码规模
 
-94 个 Java 文件，约 3.5 万行。主要文件：
+96 个 Java 文件，约 3.6 万行。主要文件：
 
-| 文件 | 行数 |
-| --- | --- |
-| `core/Server.java` | 3900 |
-| `MainActivity.java` | 1699 |
-| `core/Upstreams.java` | 1320 |
-| `Ui.java` | 1276 |
-| `core/Router.java` | 1011 |
-| `core/Config.java` | 974 |
+| 文件 | 行数 | 职责 |
+| --- | --- | --- |
+| `core/Server.java` | 3962 | HTTP 服务、路由分发、协议转换 |
+| `MainActivity.java` | 1801 | 主界面 |
+| `core/Upstreams.java` | 1320 | 各上游的协议适配 |
+| `Ui.java` | 1276 | 视觉系统（模数、玻璃材质） |
+| `core/Router.java` | 1104 | 选路打分与重试预算 |
+| `core/Config.java` | 990 | 配置模型与落盘 |
 
 ## 版本历史
 
