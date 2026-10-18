@@ -91,8 +91,17 @@ final class DynamicBackdrop extends View {
     private static final double OMEGA_SCALE =
             (2 * Math.PI / TURN_MS) / ((1 + Math.sqrt(5)) / 2);
 
-    /** 最多几层。层数由状态决定，1..MAX_LAYERS 平滑生长。 */
+    /** 最多几层（数组容量）。实际只建 VISIBLE_LAYERS 层。 */
     private static final int MAX_LAYERS = 8;
+
+    /**
+     * 真正参与绘制的层数。
+     *
+     * 与 onDraw 里的 `full` 必须一致：`full` 是"三层常驻"（三条轮廓互相切割、
+     * 谁也数不出完整边界）。这里显式提成常量，是为了让**建骨架**知道
+     * "只需要这么多"，不再按数组容量白建 5 层。
+     */
+    private static final int VISIBLE_LAYERS = 3;
 
     /** 每层最多几重对称。实际 n_i 会按层不同，这里是上限。 */
     private static final int MAX_SEGMENTS = 96;
@@ -177,7 +186,12 @@ final class DynamicBackdrop extends View {
     DynamicBackdrop(Context c) {
         super(c);
         setWillNotDraw(false);
-        setLayerType(LAYER_TYPE_HARDWARE, null);
+        /* 不要 LAYER_TYPE_HARDWARE。
+           这个 View 只有 8 fps，单独挂一个离屏硬件层换来两样坏处：
+             ① 整屏离屏纹理（1280×2772 约 13MB），任何一次 layer 失效都要整张重传；
+             ② Perf 降级后 invalidate 停了、层里的旧内容还在，一旦窗口合成触发该层重整，
+                就会看到"魔法阵消失一下再出来"——用户说的"闪烁"就是它。
+           普通绘制每帧自己画，不存在这个问题。 */
         linePaint.setStyle(Paint.Style.STROKE);
         linePaint.setStrokeJoin(Paint.Join.ROUND);
         linePaint.setStrokeCap(Paint.Cap.ROUND);
@@ -240,6 +254,14 @@ final class DynamicBackdrop extends View {
         removeCallbacks(tick);
     }
 
+    /**
+     * 节拍：走 `postOnAnimationDelayed`（对齐 Choreographer 的帧边界），不再用 `postDelayed`。
+     *
+     * `postDelayed` 相对上一次投递计时，会缓慢漂移、落到跟 VSYNC 无关的时刻，
+     * 于是魔法阵经常和别的动画（列表滑动、按钮果冻）挤在同一帧，表现为"偶发顿一下"。
+     *
+     * 顺带把骨架重建也从 onDraw 挪到这里 —— 见 advanceAndRebuild()。
+     */
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
@@ -255,13 +277,45 @@ final class DynamicBackdrop extends View {
              */
             if (gap > FRAME_MS * 2) lateStreak++;
             else if (lateStreak > 0) lateStreak--;
+
             long next = lateStreak >= 2 ? FRAME_SLOW_MS : FRAME_MS;
 
-            // 性能吃紧时停在当前帧：阵静止时仍是完整图案，只是不转
-            if (!Perf.degraded()) invalidate();
-            postDelayed(this, next);
+            if (Perf.degraded()) {
+                /* 性能吃紧：停在当前帧，阵仍是完整图案，只是不转。
+                   这里不再 invalidate —— 内容没变，重画一遍毫无意义。 */
+            } else {
+                advanceAndRebuild();
+                invalidate();
+            }
+            postOnAnimationDelayed(this, next);
         }
     };
+
+    /**
+     * 把 onDraw 里原本那两件"重活"挪到绘制之外：
+     *   ① `complex` 的缓慢追赶（纯算术，便宜）
+     *   ② M 跨过整数时重建骨架（昂贵：几条 Path、上千次 moveTo/lineTo）
+     *
+     * 以前都在 onDraw 中途做，于是"M 变化的那一帧"必然是长帧 ——
+     * 用户感知就是"矩阵变化时会卡一下"。现在它掉的是这次 tick 的时间，
+     * 而不是某一帧的合成时间。
+     */
+    private void advanceAndRebuild() {
+        int w = getWidth();
+        int h = getHeight();
+        if (w <= 0 || h <= 0) return;
+
+        double busy = Math.min(1.0, Math.max(0.0,
+                sLoad * 0.50 + sThroughput * 0.38 + sLatency * 0.12));
+        double targetM = 3.0 + (DRIFT_N - 4) * busy;
+        complex += (targetM - complex) * 0.02;
+
+        int wantM = (int) Math.floor(complex);
+        boolean need = layerPath == null || builtW != w || builtH != h || wantM != builtM;
+        if (!need) return;
+        builtM = wantM;
+        ensureSkeleton(w, h);
+    }
 
     @Override
     protected void onDraw(Canvas canvas) {
@@ -308,7 +362,7 @@ final class DynamicBackdrop extends View {
          * 三层常驻才有三条轮廓互相切割，谁也数不出完整边界。
          * 负载不再改层数，改为改每层的 M（曲线族的形态）。
          */
-        final int full = 3;
+        final int full = VISIBLE_LAYERS;
         final float frac = 0f;
 
         /*
@@ -322,15 +376,9 @@ final class DynamicBackdrop extends View {
          * 负载只调整这条曲线的**目标值**，实际位置慢慢追过去，
          * 所以突发流量不会让形态突然崩开，而是缓缓化开。
          */
-        double targetM = 3.0 + (DRIFT_N - 4) * busy;   // 负载决定目标形态
-        complex += (targetM - complex) * 0.02;         // 缓慢追赶
-
-        /* M 是整数，但用"离散步进"重建：只有跨过 1 才需要重建一次几何。 */
-        int wantM = (int) Math.floor(complex);
-        if (layerPath == null || wantM != builtM) {
-            builtM = wantM;
-            layerPath = null;
-        }
+        /* M 的推进与骨架重建已经挪到 advanceAndRebuild()（tick 里、绘制之外）。
+           这里**只读** complex，不做任何状态推进 —— onDraw 里推进状态会让
+           "M 跨整数"和"这一帧的合成"耦合在同一帧，那正是卡顿的来源。 */
 
         /*
          * 尺寸：直径约屏幕短边的 2.5 倍，阵心推到屏幕外上方。
@@ -571,8 +619,11 @@ final class DynamicBackdrop extends View {
         builtW = w;
         builtH = h;
 
+        /* 只建**会被画到**的那几层。
+           以前按 MAX_LAYERS(8) 全建，可 onDraw 里 full 恒为 3 —— 每次 M 跨整数都白建 5 层
+           （每层上千次 moveTo/lineTo），这是"M 一变就卡"的主要开销。 */
         Path[] ps = new Path[MAX_LAYERS];
-        for (int i = 0; i < MAX_LAYERS; i++) {
+        for (int i = 0; i < VISIBLE_LAYERS; i++) {
             ps[i] = buildLayer(i);
         }
         layerPath = ps;

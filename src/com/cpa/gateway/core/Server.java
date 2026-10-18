@@ -1987,6 +1987,20 @@ public final class Server {
     }
 
     private void writeError(OutputStream out, String path, int status, String message) throws Exception {
+        writeError(out, path, status, message, null);
+    }
+
+    /**
+     * 带失败类别的错误响应。
+     *
+     * 为什么要多带一个字段：客户端拿到的错误以前只有 message + type=api_error，
+     * 于是"渠道校验被拒（要换号）""额度用完（要充值）""被限流（等一会儿）"在客户端看来
+     * 完全一样 —— 都是"重连失败"。上游明明给了不同的判定，我们在最后一公里把它抹平了。
+     * 现在把 kind（rate\/quota\/auth\/channel\/local…）一并放出来，
+     * 客户端和用户都能据此决定"等、换、还是充值"。
+     */
+    private void writeError(OutputStream out, String path, int status, String message, String kind)
+            throws Exception {
         JSONObject o = new JSONObject();
         if (path.startsWith("/v1/messages")) {
             JSONObject e = new JSONObject();
@@ -2005,6 +2019,7 @@ public final class Server {
             e.put("message", message);
             e.put("type", status == 401 ? "authentication_error" : "api_error");
             e.put("code", status == 401 ? "invalid_api_key" : "error");
+            if (kind != null && !kind.isEmpty()) e.put("kind", kind);
             o.put("error", e);
         }
         writeJson(out, status, o.toString());
@@ -2532,8 +2547,16 @@ public final class Server {
         return model;
     }
 
+    /** 「这一批候选被上游挡住」的判定结果。 */
+    static final class ConfirmedBlock {
+        /** 需要挡住的时长（毫秒）；0 表示**不要挡**。 */
+        long until;
+        /** 挡住的原因是不是"渠道校验拒绝"（不是限流，等也没用）。 */
+        boolean channel;
+    }
+
     /**
-     * 全部候选都被上游**明确告知**要等到某个时刻 —— 别再去撞了，直接快速失败。
+     * 全部候选是不是都被上游**明确判定**过了 —— 是的话就别再去撞。
      *
      * 为什么值得单独做：上游写了确切恢复时刻时（WorkBuddy 的 code 6004 就是这样，正文里
      * 带"将在 2026-10-16 05:00:11 UTC+8 重置"），在到点之前的每一次重试都是注定 429 的
@@ -2544,24 +2567,54 @@ public final class Server {
      * 按估的值拒绝，可能把一个其实已经恢复的账号挡在门外，而"全冷却时仍要能发"原本是
      * 刻意的设计。上游给了确切时刻就不一样了 —— 那时按它拒绝只是省掉一次必输的往返。
      *
-     * @return 需要拦时返回最近的恢复时刻；只要有**一个**候选没被确认限流就返回 0（放行）
+     * 渠道校验（channel）是特例：它的"回避"是我们自己给的长暂避（上游并不给时刻），
+     * 所以这里单独认 —— 但只在这批候选**全都**是 channel 时才挡，任何一个还能发就放行。
      */
-    long confirmedBlockUntil(List<Config.Provider> cands, String model, int tries) {
-        long latest = 0L;
+    ConfirmedBlock confirmedBlock(List<Config.Provider> cands, String model, int tries) {
+        ConfirmedBlock out = new ConfirmedBlock();
         int n = Math.min(tries, cands == null ? 0 : cands.size());
+        if (n == 0) return out;
+        long latest = 0L;
+        boolean allChannel = true;
         for (int i = 0; i < n; i++) {
             Config.Provider p = cands.get(i);
             String um = upstreamModel(p, model);
-            long at = Router.confirmedThrottleUntil(p.name + "/" + um);
-            if (at <= 0L) return 0L;          // 有一个能用，就别拦
+            String key = p.name + "/" + um;
+            long at = Router.confirmedThrottleUntil(key);
+            if (!Router.isChannelBlocked(key)) allChannel = false;
+            if (at <= 0L) {
+                /* 有一个能用（或只是我们自己估的退避）：不挡，照常发。 */
+                if (!allChannel) return out;
+                latest = Math.max(latest, Router.throttleUntil(key));
+                continue;
+            }
             if (at > latest) latest = at;
         }
-        return n == 0 ? 0L : latest;
+        if (latest <= System.currentTimeMillis()) return out;
+        out.until = latest;
+        out.channel = allChannel;
+        return out;
     }
 
-    /** 上游确认限流时的快速失败响应：429 + 一句能看懂的话（带恢复时刻）。 */
+    /**
+     * 全部候选都被上游**明确判定**后的快速失败。
+     *
+     * 以前一律当"限流"写 429 + "预计 MM-dd HH:mm 恢复"，但其中有一类根本不是限流：
+     * **渠道校验拒绝**（WorkBuddy 的 11128，"这次调用没通过渠道校验"）——上游看的是
+     * 账号/会话是否被标记，等多久都不会自己好。把它说成"预计几点恢复"是错的，
+     * 用户会照着等，而正确答案是"换号或重新登录"。
+     * 这里按类别分开写：channel → 403 + 明确指引；其余仍按限流处理。
+     */
     private void writeAllThrottled(OutputStream out, String path, String model,
-                                   long until, int tries) throws Exception {
+                                   long until, int tries, boolean channel) throws Exception {
+        if (channel) {
+            Log.w("请求 " + model + "：候选账号都被上游渠道校验拒绝，本次不向上游发起请求"
+                    + "（改请求形状无效，需要换号或重新登录）");
+            writeError(out, path, 403,
+                    "该模型的候选账号都被上游渠道校验拒绝（上游要求官方客户端，改请求形状无效）；"
+                            + "请换一个账号或重新登录该账号，等下去不会自己恢复", "channel");
+            return;
+        }
         String ts = "";
         try {
             ts = new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US)
@@ -2571,7 +2624,7 @@ public final class Server {
         Log.w("请求 " + model + "：全部 " + tries + " 个候选都被上游确认限流到 " + ts
                 + "，本次不向上游发起请求（省掉 " + tries + " 次注定 429 的往返）");
         writeError(out, path, 429, "该模型的候选账号都被上游限流，预计 " + ts
-                + " 恢复，本次未向上游发起请求；可改用 auto 或其它模型");
+                + " 恢复，本次未向上游发起请求；可改用 auto 或其它模型", "rate");
     }
 
     /* ------------------------------------------------------- model liveness */
@@ -3000,10 +3053,10 @@ public final class Server {
         int tries = Router.budget(cands, req.model);
 
         /* 全部候选都被上游**明确告知**要等到某个时刻时，别去撞墙了。
-           详见 confirmedBlockUntil 的说明。 */
-        long blockedUntil = confirmedBlockUntil(cands, req.model, tries);
-        if (blockedUntil > 0L) {
-            writeAllThrottled(out, r.path, req.model, blockedUntil, tries);
+           详见 confirmedBlock 的说明。 */
+        ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
+        if (block.until > 0L) {
+            writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
             return;
         }
         if (req.stream) {
@@ -3518,10 +3571,10 @@ public final class Server {
         int tries = Router.budget(cands, req.model);
 
         /* 全部候选都被上游**明确告知**要等到某个时刻时，别去撞墙了。
-           详见 confirmedBlockUntil 的说明。 */
-        long blockedUntil = confirmedBlockUntil(cands, req.model, tries);
-        if (blockedUntil > 0L) {
-            writeAllThrottled(out, r.path, req.model, blockedUntil, tries);
+           详见 confirmedBlock 的说明。 */
+        ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
+        if (block.until > 0L) {
+            writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
             return;
         }
         if (req.stream) {
@@ -3604,10 +3657,10 @@ public final class Server {
         int tries = Router.budget(cands, effective);
 
         /* 全部候选都被上游**明确告知**要等到某个时刻时，别去撞墙了。
-           详见 confirmedBlockUntil 的说明。 */
-        long blockedUntil = confirmedBlockUntil(cands, effective, tries);
-        if (blockedUntil > 0L) {
-            writeAllThrottled(out, r.path, effective, blockedUntil, tries);
+           详见 confirmedBlock 的说明。 */
+        ConfirmedBlock block = confirmedBlock(cands, effective, tries);
+        if (block.until > 0L) {
+            writeAllThrottled(out, r.path, effective, block.until, tries, block.channel);
             return;
         }
         if (stream) {
@@ -3740,10 +3793,10 @@ public final class Server {
         int tries = Router.budget(cands, req.model);
 
         /* 全部候选都被上游**明确告知**要等到某个时刻时，别去撞墙了。
-           详见 confirmedBlockUntil 的说明。 */
-        long blockedUntil = confirmedBlockUntil(cands, req.model, tries);
-        if (blockedUntil > 0L) {
-            writeAllThrottled(out, r.path, req.model, blockedUntil, tries);
+           详见 confirmedBlock 的说明。 */
+        ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
+        if (block.until > 0L) {
+            writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
             return;
         }
         Config.Provider p = cands.get(0);

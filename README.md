@@ -3,7 +3,7 @@
 把多家 AI 服务商的能力聚合到一台 Android 手机上，本机作为网关对外提供 OpenAI 兼容接口。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.30.22**（versionCode 605）
+- 当前版本：**4.31.2**（versionCode 609）
 - 语言：纯 Java，**不使用 Gradle**，构建脚本即 `build.sh`
 - 目标 SDK 35，最低 26
 
@@ -15,7 +15,7 @@
 
 | | |
 |---|---|
-| 当前版本 | 4.30.22 |
+| 当前版本 | 4.31.2 |
 | 要求 | Android 8.0（API 26）及以上 |
 | 签名证书 SHA-256 | `45a99822b5bca88892d6b58b6f758aa246ac3d481e490d85ba5db749a3a223db` |
 

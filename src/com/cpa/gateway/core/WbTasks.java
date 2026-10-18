@@ -312,6 +312,90 @@ public final class WbTasks {
         return -1;
     }
 
+    /**
+     * 只读余额快照，给账号页显示"还剩多少 / 哪个包先到期"。
+     *
+     * 为什么值得单独做：4.31.1 实测同一批 global 账号的推理回包里都写着
+     * `14018 Credits exhausted`，但 `get-user-resource` 一看就有余额 ——
+     * WB4 的 Bonus Pack 剩 15.57、另一个账号剩整整 100。也就是说"耗尽"只是
+     * **还没动过的那张包没被动用**，真正该看的是"哪张包有余额、什么时候到期"。
+     * 界面只有一个数字（而且还是个总数）时，用户完全无法判断该等还是该换号。
+     *
+     * 全只读：只调 `get-user-resource`（POST 但语义是查询），不签到、不领奖。
+     *
+     * @return {ok, total, packs:[{name,size,used,remain,end}], soonest:{name,remain,end}}
+     *         拿不到时 ok=false，并在 error 里写原因（不抛异常，界面不该被它拖崩）
+     */
+    public static JSONObject balance(Config.Provider p) {
+        JSONObject out = new JSONObject();
+        try {
+            JSONObject o = call(p, "/v2/billing/meter/get-user-resource", "POST", new JSONObject());
+            JSONObject data = o.optJSONObject("data");
+            JSONObject resp = data == null ? null : data.optJSONObject("Response");
+            JSONObject inner = resp == null ? null : resp.optJSONObject("Data");
+            if (inner == null) inner = data;
+            if (inner == null) {
+                out.put("ok", false);
+                out.put("error", "上游没有返回 data");
+                return out;
+            }
+            JSONArray src = inner.optJSONArray("Accounts");
+            JSONArray packs = new JSONArray();
+            /* 先尝试上游给的总数（TotalDosage），拿不到再用各包剩余之和 */
+            Double upstreamTotal = Proto.optDouble(inner, "TotalDosage");
+            double total = 0;
+            JSONObject soonest = null;
+            long soonestAt = Long.MAX_VALUE;
+            for (int i = 0; src != null && i < src.length(); i++) {
+                JSONObject a = src.optJSONObject(i);
+                if (a == null) continue;
+                JSONObject row = new JSONObject();
+                row.put("name", a.optString("PackageName", "资源包"));
+                row.put("size", num(a, "CapacitySizePrecise", "CapacitySize"));
+                row.put("used", num(a, "CapacityUsedPrecise", "CapacityUsed"));
+                double remain = num(a, "CapacityRemainPrecise", "CapacityRemain");
+                row.put("remain", remain);
+                row.put("end", a.optString("CycleEndTime", ""));
+                packs.put(row);
+                if (remain > 0) {
+                    total += remain;
+                    /* 到期时间形如 "2026-10-22T.." 或 "2026-10-22 ..."；只取前 10 位比较 */
+                    String end = a.optString("CycleEndTime", "");
+                    long at = end.length() >= 10 ? parseDayMs(end.substring(0, 10)) : Long.MAX_VALUE;
+                    if (at < soonestAt) {
+                        soonestAt = at;
+                        soonest = row;
+                    }
+                }
+            }
+            out.put("ok", true);
+            /* 上游给的 TotalDosage 是它自己算的可用总额（含还没被动用的包），
+               比"把每个包剩余加起来"更可信；拿不到才回落。 */
+            double shown = upstreamTotal != null && upstreamTotal.doubleValue() > 0
+                    ? upstreamTotal.doubleValue() : total;
+            out.put("total", Math.round(shown * 100) / 100.0);
+            out.put("packs", packs);
+            if (soonest != null) out.put("soonest", soonest);
+        } catch (Throwable t) {
+            try {
+                out.put("ok", false);
+                out.put("error", Upstreams.shortenPublic(String.valueOf(t.getMessage())));
+            } catch (Throwable ignored) {
+            }
+        }
+        return out;
+    }
+
+    /** "2026-10-22" → epoch 毫秒；解析不了给 Long.MAX_VALUE（当作最晚到期）。 */
+    private static long parseDayMs(String ymd) {
+        try {
+            return new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                    .parse(ymd).getTime();
+        } catch (Throwable t) {
+            return Long.MAX_VALUE;
+        }
+    }
+
     /* --------------------------------------------------- checkin activity */
 
     /**

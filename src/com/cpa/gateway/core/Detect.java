@@ -398,8 +398,12 @@ public final class Detect {
                     @Override
                     public void run() {
                         if (P.cancel) return;
-                        /* 仅目录账号：目录已经存过，没必要每轮再拉一遍（省一次上游往返）。 */
-                        if (p.catalogOnly) {
+                        /* 仅目录账号：目录已经存过，没必要每轮再拉一遍（省一次上游往返）。
+                           4.31.1：只 *只在目录非空时* 跳过。目录为空说明这个账号的模型
+                           列表从来没成功写过（新建账号、或上次刷新失败留下的空表），
+                           此时跳过等于让它永远没有目录 —— 它既不派人也不参与探测，
+                           在界面上就永远"没有可用模型"，连手动选都选不到。 */
+                        if (p.catalogOnly && p.models != null && !p.models.isEmpty()) {
                             try {
                                 synchronized (row) {
                                     row.put("refresh", "ok");

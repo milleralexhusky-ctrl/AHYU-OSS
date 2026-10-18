@@ -140,6 +140,8 @@ public final class Router {
          * 账号挡在门外；按上游明说的时刻拒绝，只是省掉一次注定 429 的往返。
          */
         long throttleResetAt;
+        /** 最近一次回避的原因（rate / quota / auth / channel / local），供"该不该拦"判断用。 */
+        String throttleKind;
 
         /**
          * 连续被限流的次数（成功一次就清零），用来做限流退避的指数递增。
@@ -289,7 +291,14 @@ public final class Router {
         if (fromUpstreamClock && retryAfterMs > cap) {
             Log.w("上游给的恢复时刻超过 " + (cap / 3_600_000L) + " 小时，按上限回避 → " + key);
         }
-        if ("quota".equals(kind)) {
+        if ("channel".equals(kind)) {
+            /* 渠道校验（WorkBuddy 的 11128）：退避多长都没用——上游看的是账号/会话有没有被标记，
+               不是"现在别来"。所以给一个固定的长回避（省掉白跑的来回），
+               并在日志里说清"换号或重新登录"，别让它读起来像限流。 */
+            ms = Math.max(ms, 6 * 3_600_000L);
+            Log.w("上游渠道校验拒绝（改请求形状无效，要换号或重新登录）：暂避 "
+                    + (ms / 3_600_000L) + " 小时 → " + key);
+        } else if ("quota".equals(kind)) {
             ms = Math.max(ms, 30 * 60_000L);
             Log.w("上游额度耗尽：暂避 " + (ms / 60000) + " 分钟 → " + key);
         } else if ("auth".equals(kind)) {
@@ -304,6 +313,7 @@ public final class Router {
         // 返回后光秃秃地改字段，多线程并发时会丢更新。
         synchronized (STATS) {
             s.throttleUntil = System.currentTimeMillis() + ms;
+            s.throttleKind = kind;
             s.throttleResetAt = (fromUpstreamClock && resetAtMs > 0L) ? resetAtMs : 0L;
             if (fromUpstreamClock) {
                 s.throttleStreak = 0;
@@ -312,6 +322,33 @@ public final class Router {
             }
             // 半开试探若遇到 429，放掉 probingAt 标记，等 throttleUntil 到点后还能继续试探
             if (s.probingAt > 0) s.probingAt = 0;
+        }
+    }
+
+    /**
+     * 这个"账号/模型"当前被暂避到什么时候（**不区分**是否上游明说）。
+     *
+     * 只给 {@link Server#confirmedBlock} 用来判断渠道校验那种"我们自己给的长暂避"；
+     * 对外展示"上游确认的恢复时刻"仍用 {@link #confirmedThrottleUntil}，别混用。
+     */
+    public static long throttleUntil(String key) {
+        if (key == null || key.isEmpty()) return 0L;
+        Stat s = STATS.get(key);
+        if (s == null) return 0L;
+        long at;
+        synchronized (STATS) {
+            at = s.throttleUntil;
+        }
+        return at;
+    }
+
+    /** 这个"账号/模型"最近一次被挡住的原因是不是渠道校验（11128）。 */
+    public static boolean isChannelBlocked(String key) {
+        if (key == null || key.isEmpty()) return false;
+        Stat s = STATS.get(key);
+        if (s == null) return false;
+        synchronized (STATS) {
+            return "channel".equals(s.throttleKind);
         }
     }
 
