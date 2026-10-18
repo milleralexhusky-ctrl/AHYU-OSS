@@ -1685,8 +1685,15 @@ public class MainActivity extends Activity {
          * 并把状态刷成真值）；写着「停止网关/正在停止」才执行停止。用户的意图
          * 由他自己看到的那行字表达，不能被后台悄悄变化的状态翻转。
          */
-        final String label = primaryButton == null ? "" : String.valueOf(primaryButton.getText());
-        final boolean uiSaysRunning = label.contains("停止");
+        /*
+         * 4.30.19 这里靠"读按钮上的中文字 + 比对实时状态"，因为那时没有可靠的状态源：
+         * 保活任务会绕过界面把网关拉起来，isRunning() 和按钮文案谁新谁旧说不清。
+         *
+         * 4.30.22 起有 GatewayState 了，意图可以直接从状态推出：
+         * 只要不是"在服务/正在启动"，这一下就是启动意图。不再需要读文案，
+         * 也不会因为后台抢跑而把用户的意思翻转成相反的操作。
+         */
+        final boolean uiSaysRunning = Gateway.state().isAlive();
         final boolean actuallyRunning = Gateway.isRunning();
 
         if (uiSaysRunning == actuallyRunning) {

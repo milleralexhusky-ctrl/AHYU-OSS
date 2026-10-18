@@ -1,4 +1,4 @@
-# 构建产物（build.sh 每次 rm -rf out 重建）
+# 构建产物（build.sh 每次会 rm -rf out 重建）
 out/
 *.apk
 *.apk.idsig

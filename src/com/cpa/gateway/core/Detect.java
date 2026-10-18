@@ -670,6 +670,30 @@ public final class Detect {
      *
      * 分类规则要和 classify() 的措辞保持一致（同一个来源，改一处要改两处）。
      */
+    /**
+     * 带异常对象的版本：**优先读结构化的原因**，读不到再退回文本匹配。
+     *
+     * 为什么要有这个重载：{@code isTransient(String)} 只拿到一句摊平的中文，
+     * 于是只能靠 {@code w.contains("并发已满")} 这类字面量去猜"是不是我们自己造成的"。
+     * 那是把原因先翻译成文案、再从文案反解原因 —— 改一个词就静默失效。
+     *
+     * 现在凡是手里还有异常对象的地方都走这里：Throttled 带 LocalReason 的直接判定，
+     * 只有真正来自上游的错误（TextKind 那几条）才落到文本匹配。
+     */
+    static boolean isTransient(Throwable t) {
+        if (t == null) return false;
+        /* 本地原因：并发满 / 熔断 / 网关没起 / 探测超时…… 与账号无关，绝不扣坏标记。 */
+        for (Throwable cur = t; cur != null; cur = cur.getCause() == cur ? null : cur.getCause()) {
+            if (cur instanceof Throttled) {
+                Throttled th = (Throttled) cur;
+                if (th.local != null) return true;
+                break;
+            }
+        }
+        String m = t.getMessage();
+        return m != null && !m.isEmpty() && isTransient(m);
+    }
+
     static boolean isTransient(String why) {
         if (why == null || why.isEmpty()) return false;
         String w = why.toLowerCase(java.util.Locale.US);
@@ -698,8 +722,17 @@ public final class Detect {
         if (w.contains("interrupt")) return true;
         /* 风控 / 静默拒答是一段时间的状态，会自己解除 */
         if (w.contains("没有返回任何内容") || w.contains("风控")) return true;
-        /* 本地原因：并发已满、本地限额、网关没跑、熔断回避…… 这些跟上游、跟账号
-           都没关系，同样不该给模型盖"坏"章（4.29.7 补）。 */
+        /*
+         * 本地原因：并发已满、本地限额、网关没跑、熔断回避…… 这些跟上游、跟账号
+         * 都没关系，同样不该给模型盖"坏"章（4.29.7 补）。
+         *
+         * ---- 这一段的定位变了（4.30.22）----
+         * 主路径现在是 {@link #isTransient(Throwable)}：只要调用方手里还有异常对象，
+         * 本地原因就直接由 Throttled.local 这个枚举判定，不看文案。
+         * 这里保留字面量只是**兜底**，给那些异常早已被摊平成字符串的调用点用
+         * （典型：probeWithTimeout 超时后返回一句说明文字）。
+         * 改进顺序：能传异常的调用点都传异常；传不了的不必强求。
+         */
         return w.contains("并发已满") || w.contains("本地限额") || w.contains("网关未运行")
                 || w.contains("熔断") || w.contains("暂避");
     }

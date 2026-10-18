@@ -70,18 +70,14 @@ public class GatewayService extends Service {
         ensureBatteryWhitelist();
         String action = intent == null ? ACTION_START : intent.getAction();
         if (ACTION_STOP.equals(action)) {
-            Gateway.stop();
-            KeepAliveJobService.cancel(this);
             /*
-             * 记下"这是用户主动关的"。不记的话，保活 Job 只看 !isRunning()，
-             * 过一会儿就把网关又拉起来，用户看到的是"停止无效"。
+             * 用 stopByUser 而不是 stop()：前者把状态置为 STOPPED_BY_USER，
+             * 保活任务据此不再自动拉起。这就是 4.30.19 里那个 Config.userStopped
+             * 的作用，现在由状态机表达，不再需要一个独立的布尔字段
+             * （也就不会出现 userStopped=true 而网关仍在跑的矛盾组合）。
              */
-            try {
-                Gateway.config().userStopped = true;
-                Gateway.config().save(getApplicationContext());
-            } catch (Throwable t) {
-                Log.w("记录主动停止标记失败（不影响本次停止）：" + t);
-            }
+            Gateway.stopByUser();
+            KeepAliveJobService.cancel(this);
             notifyStatus("已停止");
             stopForeground(true);
             stopSelf();
@@ -94,18 +90,10 @@ public class GatewayService extends Service {
         startForeground(NOTIF_ID, buildNotification("正在启动"));
         Gateway.init(this);
         /*
-         * 网关要起来了，就把"用户主动停止"的标记清掉 —— 否则保活任务会一直
-         * 认为"是用户自己关的，别管"，下次意外掉线就不会自动拉回来了。
-         * 放在 init 之后：init 可能刚从磁盘重读配置，先清会被读回来的旧值盖掉。
+         * 不需要再清 Config.userStopped 了：Gateway.start() 会把状态推到
+         * STARTING → RUNNING，而"用户主动停止"这个意图由 STOPPED_BY_USER 表达，
+         * 一旦进入 STARTING 就自然失效。少一次磁盘写、也少一处不一致的来源。
          */
-        try {
-            if (Gateway.config().userStopped) {
-                Gateway.config().userStopped = false;
-                Gateway.config().save(getApplicationContext());
-            }
-        } catch (Throwable t) {
-            Log.w("清除主动停止标记失败（不影响启动）：" + t);
-        }
         try {
             Gateway.start(this);
             Log.i("service started, port " + Gateway.config().port);
@@ -580,7 +568,8 @@ public class GatewayService extends Service {
     /** What the notification should say right now. */
     /** Deliberately one short word: the notification must stay readable at a glance. */
     private String runningText() {
-        return Gateway.isRunning() ? "运行中" : "未运行";
+        /* 通知文案统一从状态取，和磁贴、指示灯用同一个词源。 */
+        return Gateway.state().label();
     }
 
     /** Re-posts the foreground notification so it shows the live state instead of "starting". */
@@ -637,12 +626,34 @@ public class GatewayService extends Service {
         return rv;
     }
 
-    /** Indicator light: green = serving, amber = starting, red = failed, grey = anything else. */
-    private int dotFor(String state) {
-        String s = state == null ? "" : state;
-        if (s.contains("运行中")) return R.drawable.notif_dot_green;
-        if (s.contains("启动") || s.contains("正在")) return R.drawable.notif_dot_amber;
+    /**
+     * 指示灯：绿=在服务、琥珀=启动中、红=失败、灰=其它。
+     *
+     * 以前这里靠 {@code s.contains("运行中")} 从**中文文案**反推状态：
+     * 状态先被编码成一句话，再靠子串猜回颜色。改一个字（"运行中"→"正在运行"）
+     * 灯就变灰，而编译器不会提醒。
+     *
+     * 现在优先读 {@link GatewayState}；文本只用于**非状态类**的提示
+     * （例如"重启失败：..." 这种临时消息，它们不对应某个稳定状态）。
+     */
+    private int dotFor(String text) {
+        com.cpa.gateway.core.GatewayState st = Gateway.state();
+        if (st != null && text != null && text.equals(st.label())) {
+            switch (st) {
+                case RUNNING:
+                    return R.drawable.notif_dot_green;
+                case STARTING:
+                    return R.drawable.notif_dot_amber;
+                case FAILED:
+                    return R.drawable.notif_dot_red;
+                default:
+                    return R.drawable.notif_dot_gray;
+            }
+        }
+        /* 临时消息（"重启失败：xxx" / "启动失败：xxx"）没有对应的稳定状态，按词判。 */
+        String s = text == null ? "" : text;
         if (s.contains("失败") || s.contains("错误")) return R.drawable.notif_dot_red;
+        if (s.contains("启动") || s.contains("正在")) return R.drawable.notif_dot_amber;
         return R.drawable.notif_dot_gray;
     }
 

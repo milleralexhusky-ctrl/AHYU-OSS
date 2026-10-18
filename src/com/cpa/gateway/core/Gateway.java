@@ -7,6 +7,15 @@ public final class Gateway {
 
     private static volatile Config config;
     private static Server server;
+
+    /**
+     * 网关状态的**唯一**权威表述。
+     *
+     * 所有"在不在跑 / 要不要自动拉起 / 界面显示什么"的问题都从这里取答案，
+     * 不再各自去看 server != null、Server.running、按钮文案……
+     * 写入只发生在 start()/stop() 和标记失败的那一处，见 {@link #state(GatewayState)}。
+     */
+    private static volatile GatewayState state = GatewayState.STOPPED_IDLE;
     private static android.content.Context appCtx;
 
     private Gateway() {}
@@ -348,8 +357,43 @@ public final class Gateway {
         }
     }
 
-    public static synchronized boolean isRunning() {
-        return server != null && server.isRunning();
+    /**
+     * 对外是否可服务。
+     *
+     * 语义没变（调用点二十余处，一行都不用改），但实现从"看 server 字段"
+     * 变成"看唯一状态"——两者不一致这件事从此不成立了。
+     */
+    public static boolean isRunning() {
+        return state.isServing();
+    }
+
+    /** 当前状态（只读）。想判断要不要自动拉起用 {@link GatewayState#shouldAutoStart()}。 */
+    public static GatewayState state() {
+        return state;
+    }
+
+    /**
+     * 唯一的写入点。
+     *
+     * 之所以集中到一处：以前 userStopped / instance / server 各自被改，
+     * 能组出"用户已停止但网关在跑"这种不可能的状态。
+     */
+    private static synchronized void state(GatewayState next) {
+        GatewayState prev = state;
+        if (prev == next) return;
+        state = next;
+        Log.i("网关状态：" + prev + " → " + next);
+    }
+
+    /** 用户主动停止（保活不许拉回来）。 */
+    public static synchronized void markStoppedByUser() {
+        state(GatewayState.STOPPED_BY_USER);
+    }
+
+    /** 非用户原因停下（意外掉线等，保活应该拉回来）。 */
+    public static synchronized void markStoppedIdle() {
+        if (state == GatewayState.STOPPED_BY_USER) return;   /* 用户意图优先 */
+        state(GatewayState.STOPPED_IDLE);
     }
 
     /** 当前运行的 Server 实例（core 包内做"进程内探测"要用）。 */
@@ -380,11 +424,40 @@ public final class Gateway {
 
     public static synchronized void start(Context ctx) throws Exception {
         if (isRunning()) return;
-        server = new Server(config());
-        server.start();
+        state(GatewayState.STARTING);
+        try {
+            server = new Server(config());
+            server.start();
+            state(GatewayState.RUNNING);
+        } catch (Exception e) {
+            /* 启动失败要留下痕迹：以前只是 server 字段指向一个没跑起来的实例，
+               从外部看和"没启动"一模一样，看门狗和保活都不知道该不该重试。 */
+            server = null;
+            state(GatewayState.FAILED);
+            throw e;
+        }
     }
 
+    /** 停止网关（程序原因：重启、销毁、看门狗）。状态归到 STOPPED_IDLE，保活可再拉。 */
     public static synchronized void stop() {
+        stop(false);
+    }
+
+    /** 用户主动停止。状态归到 STOPPED_BY_USER，保活**不许**再拉。 */
+    public static synchronized void stopByUser() {
+        stop(true);
+    }
+
+    private static synchronized void stop(boolean byUser) {
+        /*
+         * 状态先落定，再停实例。
+         *
+         * 即使 server 已经是 null 也要改状态：用户点停止时网关可能本来就没跑，
+         * 但"用户意图"必须被记住，否则保活过一会儿又把它拉起来（4.30.19 的坑）。
+         */
+        if (byUser) state(GatewayState.STOPPED_BY_USER);
+        else if (state != GatewayState.STOPPED_BY_USER) state(GatewayState.STOPPED_IDLE);
+
         Server s = server;
         if (s == null) return;
         /*

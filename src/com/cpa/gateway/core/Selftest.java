@@ -633,6 +633,23 @@ public final class Selftest {
         if (!Detect.isTransient(rate)) return "限流没算成暂时失败";
         if (Detect.isTransient(conv)) return "conversation id missing 被算成暂时失败";
         if (!Detect.isTransient("并发已满")) return "本地原因（并发已满）不该给模型扣坏标记";
+        /*
+         * 本地原因现在由 LocalReason 表达，文案可以随便改。
+         * 这里用一句**故意和旧文案不同**的文字，验证判断走的是枚举而不是字面量：
+         * 如果哪天有人把 Throttled.local 删了、只剩下中文匹配，这条会失败。
+         */
+        if (!Detect.isTransient(new Throttled(429, 5000L, 0L, "local",
+                LocalReason.BUSY, "当前并发已到上限，请稍候"))) {
+            return "本地原因（LocalReason.BUSY）没有按枚举判定，仍在依赖中文文案";
+        }
+        if (!Detect.isTransient(new Throttled(429, 60000L, 0L, "local",
+                LocalReason.QUOTA, "今天的额度用完了"))) {
+            return "本地原因（LocalReason.QUOTA）没有按枚举判定";
+        }
+        /* 反例：普通异常（没有 local）仍应走文本匹配，不能一律当暂时失败。 */
+        if (Detect.isTransient(new IllegalStateException("conversation id missing"))) {
+            return "没有 local 标记的异常被误判成暂时失败";
+        }
         if (Detect.isTransient("upstream HTTP403 {\"msg\":\"invalid token\"}")) {
             return "鉴权失效不该只算暂时（否则模型被反复探测，掩盖了账号要重新登录这件事）";
         }
@@ -659,6 +676,37 @@ public final class Selftest {
     }
 
     /** 渠道校验重试：形状写入 + 只认"会话标识"这一类错误。 */
+    /**
+     * 状态机语义：几条"绝不允许"的组合必须不成立。
+     *
+     * 这些断言守的是 4.30.18–4.30.21 三轮修复的结论——那时靠散落的布尔与中文文案
+     * 表达状态，出现过"用户已停止但网关在跑"这种矛盾组合。收成枚举后，
+     * 这类组合应该在类型层面就不存在；这条检查防止有人再把独立的布尔加回来。
+     */
+    private static String checkGatewayState() {
+        if (GatewayState.STOPPED_BY_USER.shouldAutoStart()) {
+            return "用户主动停止的状态仍允许自动拉起，停止会被保活任务反复推翻";
+        }
+        if (!GatewayState.STOPPED_IDLE.shouldAutoStart()) {
+            return "非用户原因停止的状态不允许自动拉起，意外掉线后不会自愈";
+        }
+        if (!GatewayState.FAILED.shouldAutoStart()) {
+            return "启动失败后不允许自动重试";
+        }
+        if (GatewayState.RUNNING.shouldAutoStart() || GatewayState.STARTING.shouldAutoStart()) {
+            return "运行中/启动中的状态允许自动拉起，会造成重复实例";
+        }
+        if (!GatewayState.RUNNING.isServing() || GatewayState.STARTING.isServing()) {
+            return "isServing 语义错了：只有 RUNNING 才算在服务";
+        }
+        for (GatewayState st : GatewayState.values()) {
+            if (st.label() == null || st.label().isEmpty()) {
+                return "状态 " + st + " 没有界面文案";
+            }
+        }
+        return null;
+    }
+
     private static String checkConvRetry() {
         if (!WorkBuddy.looksLikeConvIdError(new IllegalStateException(
                 "upstream HTTP 400 {\"code\":11128,\"msg\":\"conversation id missing\"}"))) {

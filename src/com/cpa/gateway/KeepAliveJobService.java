@@ -97,16 +97,17 @@ public class KeepAliveJobService extends JobService {
         try {
             Config cfg = Config.load(this);
             /*
-             * 三个条件缺一不可：
-             *   keepAlive    —— 用户在设置里开着保活；
-             *   !userStopped —— 用户**没有主动**按过停止。这一条是关键：
-             *                   以前只看 !Gateway.isRunning()，分不清"掉了"和"用户自己关的"，
-             *                   于是用户点停止、十几分钟后又被拉起来（表现为"停止无效"）；
-             *                   反过来 App 刚打开时被积压的任务先跑，抢在用户之前把网关起来
-             *                   （表现为"第一次按启动无效、按第二次才成功"）。
-             *   !isRunning   —— 确实没在跑，才需要拉。
+             * 只问两件事：
+             *   keepAlive —— 用户偏好（设置里的开关）
+             *   state.shouldAutoStart() —— 状态是否允许被自动拉起
+             *
+             * 后者把原来散在这里的三个判断收进状态机：
+             *   !isRunning()   → 状态不是 RUNNING/STARTING
+             *   !userStopped   → 状态不是 STOPPED_BY_USER（用户主动停的，不许拉）
+             * 于是这里不会再出现"拼条件拼漏一条"的情况，也不会读一个和实际状态
+             * 可能矛盾的独立布尔（4.30.19 的 userStopped 就是那种布尔）。
              */
-            boolean shouldRun = cfg.keepAlive && !cfg.userStopped && !Gateway.isRunning();
+            boolean shouldRun = cfg.keepAlive && Gateway.state().shouldAutoStart();
             boolean expeditedRun = params != null && params.getJobId() == PULL_JOB_ID;
             if (shouldRun) {
                 Log.w("保活任务：检测到网关未运行，重新拉起"
@@ -114,7 +115,7 @@ public class KeepAliveJobService extends JobService {
                 Intent svc = new Intent(this, GatewayService.class).setAction(GatewayService.ACTION_START);
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svc);
                 else startService(svc);
-            } else if (cfg.userStopped) {
+            } else if (Gateway.state() == com.cpa.gateway.core.GatewayState.STOPPED_BY_USER) {
                 Log.i("保活任务：用户已主动停止网关，跳过自动拉起");
             }
             // 周期任务里如果发现网关没跑，光靠它自己起不来（Android 12+ 禁止后台起 FGS），

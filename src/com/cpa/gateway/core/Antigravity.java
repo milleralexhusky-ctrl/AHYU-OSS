@@ -48,18 +48,14 @@ public final class Antigravity {
     };
     static final String DAILY_API_BASE = "https://daily-cloudcode-pa.googleapis.com";
     static final String USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json";
-    /*
-     * Google OAuth 客户端凭据。
-     *
-     * Client ID 是公开标识（它本来就会出现在授权 URL 里），所以留在这里。
-     *
+    static final String CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+    /**
      * Client Secret **不随源码分发**：它是真正的秘密，写进公开仓库等于把一个
-     * 第三方应用的密钥交出去。开源版留空，运行时从环境变量或配置补：
-     *   AHYU_AG_CLIENT_SECRET 环境变量，或 gateway.json 的 antigravityClientSecret。
+     * 第三方应用的密钥交出去。开源版留空，运行时从环境变量取：
+     * AHYU_AG_CLIENT_SECRET。
      * 需要它的人可以从自己安装的 Antigravity 桌面客户端资源里取到同一个值；
      * 缺失时明确报错，而不是发出一个注定 401 的请求。
      */
-    static final String CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
     static final String CLIENT_SECRET = "";
 
     /** 取 Client Secret：源码里没有，就从环境变量补。 */

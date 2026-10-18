@@ -2826,12 +2826,15 @@ public final class Server {
         final String blocked = Limits.explainBlocked(p, estTokens);
         if (blocked != null) {
             Log.w("本地限额跳过 " + p.name + "：" + blocked);
-            throw new Throttled(429, blocked.contains("今日") ? 3_600_000L : 60_000L, "local", blocked);
+            /* 带上 LocalReason：这条是我们自己拦下来的，不是上游拒的。
+               下游（Detect）据此判断"不该给账号扣坏标记"，不必再读中文文案。 */
+            throw new Throttled(429, blocked.contains("今日") ? 3_600_000L : 60_000L, 0L,
+                    "local", LocalReason.QUOTA, blocked);
         }
         final Limits.Slot slot = Limits.acquire(p);
         if (slot == null) {
             Log.w("并发已满，跳过 " + p.name + "（上限 " + p.maxConcurrent + "）");
-            throw new Throttled(429, 5_000L, "rate", "并发已满");
+            throw new Throttled(429, 5_000L, 0L, "local", LocalReason.BUSY, "并发已满");
         }
         final String routeKey = (p == null ? "" : p.name)
                 + (upstreamModel == null || upstreamModel.isEmpty() ? "" : "/" + upstreamModel);
@@ -2947,7 +2950,9 @@ public final class Server {
             // 记一次 429 就让账号挂 30 分钟"不可用"，下次成功又清掉——
             // 表现出来就是"账号一会好一会坏"，用户以为坏了。
             // 真机实测：同一批 12 账号连跑三轮，失败数 2 / 0 / 1，变动的全是免费池的 429。
-            if (Detect.isTransient(why)) {
+            /* 传异常对象而不是只看文本：Throttled 上挂着 LocalReason 时直接判定，
+               不必再靠中文字面量猜"这是不是我们自己造成的"。 */
+            if (Detect.isTransient(e) || Detect.isTransient(why)) {
                 Log.i("上游暂时失败，不标记账号不可用：" + p.name + " · " + why);
             } else {
                 p.lastError = why;

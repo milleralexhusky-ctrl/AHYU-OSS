@@ -28,14 +28,29 @@ final class Throttled extends IOException {
      */
     final long resetAtMs;
 
+    /**
+     * 这是我们自己造成的（并发满 / 熔断 / 网关没起…），null 表示与本地无关。
+     *
+     * 有了它，判断"该不该给账号扣坏标记"就不用再读中文文案了 ——
+     * 见 {@link Detect#isTransient(Throwable)}。展示给用户的仍然是 message。
+     */
+    final LocalReason local;
+
     Throttled(int code, long retryAfterMs, String kind, String message) {
-        this(code, retryAfterMs, 0L, kind, message);
+        this(code, retryAfterMs, 0L, kind, null, message);
     }
 
     Throttled(int code, long retryAfterMs, long resetAtMs, String kind, String message) {
+        this(code, retryAfterMs, resetAtMs, kind, null, message);
+    }
+
+    /** 本地原因版本：由我们自己抛出（并发满 / 熔断 / 网关没起…）。 */
+    Throttled(int code, long retryAfterMs, long resetAtMs, String kind, LocalReason local,
+              String message) {
         super(message);
         this.code = code;
         this.kind = kind;
+        this.local = local;
         /* 在**构造函数里**解析"上游说的恢复时刻"，而不是只在某一个出口解析。
            原因：构造 Throttled 的地方不止一处 —— 除了 Http.upstreamError，
            各家原生上游（WorkBuddy 的 code 6004、Kimi、Trae…）也会自己 new 一个。
