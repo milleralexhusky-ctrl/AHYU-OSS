@@ -91,8 +91,23 @@ cp $OUT/unsigned.apk $OUT/aligned.apk
 echo "[6/6] sign"
 KS=$ROOT/keystore.jks
 if [ ! -f $KS ]; then
-  keytool -genkeypair -keystore $KS -alias cpa -keyalg RSA -keysize 2048 -validity 10000 \
-    -storepass ***REMOVED*** -keypass ***REMOVED*** -dname "CN=CPA Gateway, O=Local, C=CN" >/dev/null 2>&1
+  cat >&2 <<KEYMSG
+[错误] 找不到签名密钥：$KS
+
+签名密钥不随源码分发（.gitignore 已排除 *.jks），所以从仓库 clone 下来的工程
+默认没有它。缺少密钥时这里是直接退出，而不是自动生成一把新的 —— 因为自动生成
+出来的密钥签出的包，签名与原版不同，装不到已有安装的手机会报「应用未安装」，
+而且构建过程看起来完全正常，非常容易误判成代码问题。
+
+三种选择：
+  1) 只想用 App：直接下载 Release 里的 APK，不要自己编译。
+  2) 本地调试自用：显式造一把密钥，并清楚它和原版签名不同：
+       keytool -genkeypair -keystore keystore.jks -alias cpa -keyalg RSA \
+         -keysize 2048 -validity 10000 -storepass ***REMOVED*** -keypass ***REMOVED*** \
+         -dname "CN=CPA Gateway, O=Local, C=CN"
+  3) 要发布可覆盖升级的包：使用原作者的 keystore.jks 与之配套口令。
+KEYMSG
+  exit 1
 fi
 apksigner sign --ks $KS --ks-pass pass:***REMOVED*** --key-pass pass:***REMOVED*** --out $ROOT/cpa-gateway.apk $OUT/aligned.apk 2>&1 | grep -v WARNING || true
 apksigner verify --print-certs $ROOT/cpa-gateway.apk 2>&1 | grep -v WARNING | head -6
