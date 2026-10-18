@@ -145,6 +145,24 @@ public final class WorkBuddy {
         return out;
     }
 
+    /**
+     * `/v3/config` 里上游自己写明的基址（data.endpoint）。
+     *
+     * 4.31.1 实测：global 账号的 config 写的是 **https://www.codebuddy.ai**，
+     * 而我们（以及参考实现 wb2api）一直打 www.workbuddy.ai。两个域名鉴权、目录、错误码
+     * 完全一致，所以它不是 11128 的原因；但官方客户端是照这个字段走的，
+     * 没有理由比它更"自己猜"。这里按账号名缓存，拿不到就回落到 {@link #primaryBase}。
+     */
+    private static final java.util.Map<String, String> ENDPOINT_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 真基址：优先用上游 config 里的 endpoint，其次用户配置，最后按 realm 的默认值。 */
+    static String endpointFor(Config.Provider p, Account acc) {
+        String cached = p == null ? null : ENDPOINT_CACHE.get(p.name);
+        if (cached != null && !cached.isEmpty()) return cached;
+        return primaryBase(acc == null ? REALM_CN : acc.realm, p == null ? null : p.baseUrl);
+    }
+
     static String primaryBase(String realm, String configured) {
         if (configured != null) {
             String b = Upstreams.trimSlash(configured);
@@ -161,12 +179,20 @@ public final class WorkBuddy {
      */
     private static String bizKind(int code, String msg) {
         String m = msg == null ? "" : msg.toLowerCase(java.util.Locale.US);
+        /* 11128 是**渠道校验**，不是限流（4.31.1 起单独归一类）。
+           以前把它算进 rate，于是被上游标记的账号每次都在"退避 429"，既退避不掉、
+           又让界面显示成"限流"。它换号才有用，退避没有意义。 */
+        if (code == 11128 || m.contains("channel verification") || m.contains("request illegal")) {
+            return "channel";
+        }
         if (m.contains("rate") || m.contains("limit") || m.contains("频繁") || m.contains("too many")
-                || m.contains("busy") || code == 11128) {
+                || m.contains("busy")) {
             return "rate";
         }
+        /* credits 用完时上游回 HTTP429 + code 14018「Credits exhausted…purchase add-on packs」
+           （4.31.1 实测，WB3/WB4 都是这条），说明是额度这类，不是限流。 */
         if (m.contains("quota") || m.contains("balance") || m.contains("额度") || m.contains("积分")
-                || m.contains("insufficient") || code == 11129) {
+                || m.contains("credits exhausted") || code == 14018 || code == 11129) {
             return "quota";
         }
         if (m.contains("unauthor") || m.contains("expired") || m.contains("login")
@@ -200,7 +226,10 @@ public final class WorkBuddy {
         }
         if (!acc.domain.isEmpty()) h.put("X-Domain", acc.domain);
         else h.put("X-No-Department-Info", "true");
-        if (!acc.deviceToken.isEmpty()) h.put("X-Device-Token", acc.deviceToken);
+        /* 官方客户端（wb2api 1.6.3 的 ae2.a()）只要登录态里 device_token 有值就带；
+           我们这批账号登录取不到它，所以这里带**空串**而不是不带——
+           上游对"缺头"和"空头"的处理不一定一样，带上更像官方客户端。 */
+        h.put("X-Device-Token", acc.deviceToken == null ? "" : acc.deviceToken);
         // 参考实现（workbuddy2api/core/converter.py 的 _client_ip_headers + fingerprint.py）
         // 在推理请求上还会带这几个头，上游靠它们识别 client / 用途：
         h.put("X-Agent-Purpose", "conversation");
@@ -653,8 +682,9 @@ public final class WorkBuddy {
             Account acc = ensureFresh(p);
             /* UA 走客户端身份画像（第三个参数以前误传了 p.apiKey，等于把网关的 Key
                当 User-Agent 发给上游；这些账号的 apiKey 字段是空的才一直没暴露）。 */
-            Map<String, String> baseHeaders = headers(acc, primaryBase(acc.realm, p.baseUrl), null);
-            String endpoint = primaryBase(acc.realm, p.baseUrl) + "/v2/chat/completions";
+            String base = endpointFor(p, acc);
+            Map<String, String> baseHeaders = headers(acc, base, null);
+            String endpoint = base + "/v2/chat/completions";
             String convId = "wb-" + System.currentTimeMillis();
             Exception convFailed = null;
             final int shapes = CONV_HOPELESS.contains(p.name) ? 1 : CONV_SHAPES.length;
@@ -690,7 +720,11 @@ public final class WorkBuddy {
                         // 否则连错 3 次就把健康账号打进熔断——那是我们自己的误伤。
                         String kind = bizKind(code, msg);
                         if (kind != null) {
-                            int httpCode = "quota".equals(kind) ? 402 : 429;
+                            /* 渠道校验不是"过一会儿再来"：上游看的是账号/会话状态，
+                               所以 HTTP 码按 403（不属于限流）报，kind 仍然是 channel，
+                               Router 会给固定长回避并提示换号。 */
+                            int httpCode = "quota".equals(kind) ? 402
+                                    : ("channel".equals(kind) ? 403 : 429);
                             throw new Throttled(httpCode, Http.defaultBackoffMs(httpCode), kind, detail);
                         }
                         throw new IllegalStateException(detail);
@@ -786,7 +820,7 @@ public final class WorkBuddy {
 
     static List<String> fetchModels(Config.Provider p) throws Exception {
         Account acc = ensureFresh(p);
-        String base = primaryBase(acc.realm, p.baseUrl);
+        String base = endpointFor(p, acc);
         String body = Upstreams.getWithHeaders(base + "/v3/config", headers(acc, base, p.apiKey));
         JSONObject o = new JSONObject(body);
         int code = o.optInt("code", 0);
@@ -805,6 +839,21 @@ public final class WorkBuddy {
                         String m = String.valueOf(models.opt(k));
                         if (!m.isEmpty() && !out.contains(m)) out.add(m);
                     }
+                }
+            }
+            /* 记下上游自报的 endpoint（只认同 realm 的 host，防止一个坏配置把流量带到别处）。 */
+            String reported = Upstreams.trimSlash(Proto.optString(data, "endpoint", ""));
+            if (!reported.isEmpty()) {
+                boolean sameRealm = REALM_GLOBAL.equalsIgnoreCase(acc.realm)
+                        ? reported.contains("codebuddy.ai") || reported.contains("workbuddy.ai")
+                        : reported.contains(".cn") || reported.contains("tencent.com");
+                if (sameRealm) {
+                    String prev = ENDPOINT_CACHE.put(p.name, reported);
+                    if (prev == null || !prev.equals(reported)) {
+                        Log.i("workbuddy 基址跟随上游 config.endpoint：" + p.name + " → " + reported);
+                    }
+                } else {
+                    Log.w("workbuddy config.endpoint 与 realm 不匹配，忽略：" + reported);
                 }
             }
             JSONArray models = data.optJSONArray("models");

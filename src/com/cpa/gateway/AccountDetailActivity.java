@@ -92,6 +92,12 @@ public class AccountDetailActivity extends Activity {
             /* 到点了但还没成功过一次：不显示"限流中"（时间已过），也不主动清——
                真正清掉由"成功一次"负责，避免上游提前恢复时误报。 */
         }
+        TextView balanceHint = Ui.label(this, "");
+        balanceHint.setTextColor(0xFF7FD1A0);
+        balanceHint.setTextSize(12.5f);
+        balanceHint.setSingleLine(false);
+        root.addView(balanceHint, Ui.lp(this, 8));
+        fillBalanceHint(balanceHint);
         root.addView(meta, Ui.lp(this, 12));
         if (provider.baseUrl != null && !provider.baseUrl.isEmpty()) {
             TextView where = Ui.label(this, "地址：" + provider.baseUrl);
@@ -176,6 +182,55 @@ public class AccountDetailActivity extends Activity {
             if (n.startsWith(prefix)) n = n.substring(prefix.length());
         }
         return n;
+    }
+
+    /**
+     * 额度构成里最该被看见的一行：**还有余额但推理仍报"耗尽"**。
+     *
+     * 4.31.1 实测：同一批 global 账号推理统一回 `14018 Credits exhausted`，可
+     * `get-user-resource` 明明显示某张包还剩 100 credits（另一张用完了）。也就是说
+     * "耗尽"指的是**当前被计费的那张包**，不是整个账号。用户只看得到"额度不足"这句话，
+     * 自然会去充值 —— 而正确答案往往是"换号"或"等那张没动过的包生效"。
+     *
+     * 只读：查询接口，不签到、不领奖。查不到（非 WorkBuddy \/ 凭证过期 \/ 断网）就返回空串，
+     * 不抛异常 —— 这行是锦上添花，不该把账号页拖崩。
+     */
+    private void fillBalanceHint(TextView view) {
+        view.setVisibility(android.view.View.GONE);
+        if (!com.cpa.gateway.core.Config.TYPE_WORKBUDDY.equals(provider.type)) return;
+        Threads.io(() -> {
+            String hint = "";
+            try {
+                org.json.JSONObject b = com.cpa.gateway.core.WbTasks.balance(provider);
+                if (b.optBoolean("ok") && b.optDouble("total", 0) > 0) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("上游仍显示有 ").append(Math.round(b.optDouble("total", 0)))
+                            .append(" credits 可用");
+                    org.json.JSONObject soon = b.optJSONObject("soonest");
+                    if (soon != null) {
+                        String end = soon.optString("end", "");
+                        sb.append("（先到期：").append(soon.optString("name", "资源包"))
+                                .append(" 剩 ").append(Math.round(soon.optDouble("remain", 0)));
+                        if (end.length() >= 10) sb.append("，到 ").append(end.substring(0, 10));
+                        sb.append('）');
+                    }
+                    /* 只有当它正在被上游拒的时候，这句才是"反直觉"的、值得提醒的 */
+                    if (provider.throttleUntil > System.currentTimeMillis() / 1000L
+                            && provider.throttleNote != null && provider.throttleNote.contains("额度")) {
+                        sb.append("；但推理仍被判「额度耗尽」——通常是被计费的那张包用完了，")
+                                .append("换号比充值更快见效");
+                    }
+                    hint = sb.toString();
+                }
+            } catch (Throwable ignored) {
+            }
+            final String text = hint;
+            if (text.isEmpty()) return;
+            runOnUiThread(() -> {
+                view.setText("💰 " + text);
+                view.setVisibility(android.view.View.VISIBLE);
+            });
+        });
     }
 
     /** 从凭据里挑一个能认出"这是哪个账号"的字段。 */

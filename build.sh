@@ -44,7 +44,7 @@ $AAPT2 link -o $OUT/base.apk -I $PLATFORM \
   -R $OUT/compiled/res.zip \
   --java $OUT/gen \
   --min-sdk-version 26 --target-sdk-version 35 \
-  --version-code 600 --version-name 4.30.17 \
+  --version-code 609 --version-name 4.31.2 \
   --rename-manifest-package com.ahyu \
   --custom-package com.cpa.gateway \
   --auto-add-overlay
@@ -89,25 +89,12 @@ PY
 cp $OUT/unsigned.apk $OUT/aligned.apk
 
 echo "[6/6] sign"
-# 签名密钥**不随源码分发**：自己构建请指定 KEYS 与 KEYPASS，
-# 或让脚本在你自己的机器上生成一把（仅用于本地测试的 APK）。
-KS="${KEYS:-$ROOT/keystore.jks}"
-KP="${KEYPASS:-}"
-if [ -z "$KP" ]; then
-  if [ -f "$KS" ] && [ -z "${KEYPASS_ALLOW_DEFAULT:-}" ]; then
-    echo "缺少 KEYPASS：请设置环境变量 KEYPASS=<你的 keystore 口令> 再构建。"
-    echo "（源码仓库不含签名密钥，这是有意的：签名密钥泄露等于任何人都能签发'官方'APK。）"
-    exit 1
-  fi
-  # 没有现成密钥也没给口令：生成一把仅用于本地测试的
-  KP="local-test-only"
+KS=$ROOT/keystore.jks
+if [ ! -f $KS ]; then
+  keytool -genkeypair -keystore $KS -alias cpa -keyalg RSA -keysize 2048 -validity 10000 \
+    -storepass ***REMOVED*** -keypass ***REMOVED*** -dname "CN=CPA Gateway, O=Local, C=CN" >/dev/null 2>&1
 fi
-if [ ! -f "$KS" ]; then
-  keytool -genkeypair -keystore "$KS" -alias cpa -keyalg RSA -keysize 2048 -validity 10000 \
-    -storepass "$KP" -keypass "$KP" -dname "CN=CPA Gateway, O=Local, C=CN" >/dev/null 2>&1
-  echo "已生成仅供本地测试的签名密钥：$KS（不要用它发布）"
-fi
-apksigner sign --ks "$KS" --ks-pass pass:"$KP" --key-pass pass:"$KP" --out $ROOT/cpa-gateway.apk $OUT/aligned.apk 2>&1 | grep -v WARNING || true
+apksigner sign --ks $KS --ks-pass pass:***REMOVED*** --key-pass pass:***REMOVED*** --out $ROOT/cpa-gateway.apk $OUT/aligned.apk 2>&1 | grep -v WARNING || true
 apksigner verify --print-certs $ROOT/cpa-gateway.apk 2>&1 | grep -v WARNING | head -6
 ls -la $ROOT/cpa-gateway.apk
 echo BUILD_OK

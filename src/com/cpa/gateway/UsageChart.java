@@ -23,6 +23,12 @@ final class UsageChart extends android.view.View {
     private final List<Long> values = new ArrayList<>();
     private final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /**
+     * 复用的矩形。以前在 onDraw 的循环里 `new RectF(...)`，每帧每根柱子一个 ——
+     * 滚动或面板刷新时就是持续的小对象分配，GC 一抖就是掉帧。
+     * RectF 本来就是可变对象，一个字段够用。
+     */
+    private final RectF rect = new RectF();
     private long max = 1;
 
     UsageChart(Context c, LinkedHashMap<String, Long> data) {
@@ -60,9 +66,9 @@ final class UsageChart extends android.view.View {
             float cx = slot * i + slot / 2f;
             long v = values.get(i);
             float bh = max <= 0 ? 0 : (bottom - top) * ((float) v / max);
-            RectF r = new RectF(cx - barW / 2f, bottom - bh, cx + barW / 2f, bottom);
+            rect.set(cx - barW / 2f, bottom - bh, cx + barW / 2f, bottom);
             float radius = Ui.dp(c, 4);
-            canvas.drawRoundRect(r, radius, radius, bar);
+            canvas.drawRoundRect(rect, radius, radius, bar);
             canvas.drawText(String.valueOf(v), cx, bottom - bh - Ui.dp(c, 4), label);
             canvas.drawText(labels.get(i), cx, h - Ui.dp(c, 4), label);
         }

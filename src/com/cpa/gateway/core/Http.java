@@ -61,11 +61,23 @@ public final class Http {
         }
     }
 
-    /** 分类：凭证失效 / 额度耗尽 / 普通限流。 */
+    /** 分类：凭证失效 / 额度耗尽 / 渠道校验 / 普通限流。 */
     static String kindOf(int code, String body) {
         if (code == 401 || code == 403) return "auth";
         if (code == 402 || quota(body)) return "quota";
+        /* 渠道校验（WorkBuddy 的 11128 "channel verification"）：账号/会话被上游标记，
+           退避没有意义、换号才有用 —— 单列一类，别混进"限流"。 */
+        if (channel(body)) return "channel";
         return "rate";
+    }
+
+    /** 正文是不是"渠道校验"这类拒绝（不看 HTTP 码，只看上游原话）。 */
+    static boolean channel(String body) {
+        if (body == null) return false;
+        String b = body.length() > 4000 ? body.substring(0, 4000) : body;
+        b = b.toLowerCase(java.util.Locale.US);
+        return b.contains("channel verification") || b.contains("可能不是官方客户端")
+                || (b.contains("11128") && b.contains("request illegal"));
     }
 
     /* ================================================== 失败原因分类（凭证健康度） */

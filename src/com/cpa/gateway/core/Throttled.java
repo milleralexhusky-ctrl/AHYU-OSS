@@ -15,7 +15,11 @@ final class Throttled extends IOException {
 
     final int code;
     final long retryAfterMs;
-    /** "rate"=限流、"quota"=额度/计费耗尽、"auth"=凭证失效（重试没意义）。 */
+    /**
+     * "rate"=限流、"quota"=额度/计费耗尽、"auth"=凭证失效、"channel"=渠道校验拒绝
+     * （WorkBuddy 11128：上游要求官方客户端，账号/会话被标记，退避无效、换号才有效）。
+     * 除 rate 外都不是"等一会儿就好"，重试没意义。
+     */
     final String kind;
     /**
      * 上游**明说的**恢复时刻（epoch 毫秒），0 = 上游没说。
