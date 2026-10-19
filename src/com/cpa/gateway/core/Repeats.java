@@ -82,6 +82,23 @@ public final class Repeats {
         }
     }
 
+    /**
+     * 这条请求在窗口内被发过几次（4.35.0）。
+     *
+     * 和 check() 的区别：check() 只在超过容忍次数时才返回非空（用来拦），
+     * 这里返回**原始次数**——第 2 次就说明"用户又发了一遍"，
+     * 那是最真实的"这次回答不行"信号，不该等到第 3 次才记。
+     */
+    static int seenCount(Proto.Req req) {
+        if (req == null || req.ephemeral) return 0;
+        String fp = fingerprint(req);
+        if (fp == null) return 0;
+        synchronized (SEEN) {
+            Rec e = SEEN.get(fp);
+            return e == null ? 0 : e.count;
+        }
+    }
+
     /** 内容指纹。取整段对话的哈希，所以"一模一样重发"才会命中。 */
     private static String fingerprint(Proto.Req req) {
         StringBuilder sb = new StringBuilder();

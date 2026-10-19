@@ -163,6 +163,19 @@ public final class WorkBuddy {
         return primaryBase(acc == null ? REALM_CN : acc.realm, p == null ? null : p.baseUrl);
     }
 
+    /**
+     * 按**指定 realm** 取基址：{@code keepCached} 为真时沿用上游 config.endpoint 的缓存
+     * （realm 没变时就是正常路径），为假时忽略缓存——缓存是从"账号自己的 realm"那次
+     * {@code /v3/config} 里学来的，换个区域身份就不能再信它，必须回落到该 realm 的默认基址。
+     */
+    static String endpointFor(Config.Provider p, Account acc, String realm, boolean keepCached) {
+        String own = acc == null ? REALM_CN : acc.realm;
+        if (keepCached || REALM_GLOBAL.equalsIgnoreCase(own) == REALM_GLOBAL.equalsIgnoreCase(realm)) {
+            return endpointFor(p, acc);
+        }
+        return primaryBase(realm, p == null ? null : p.baseUrl);
+    }
+
     static String primaryBase(String realm, String configured) {
         if (configured != null) {
             String b = Upstreams.trimSlash(configured);
@@ -205,8 +218,22 @@ public final class WorkBuddy {
     /* -------------------------------------------------------------- headers */
 
     static Map<String, String> headers(Account acc, String base, String userAgent) {
+        return headers(acc, acc == null ? REALM_CN : acc.realm, base, userAgent);
+    }
+
+    /**
+     * 指定 realm 的出站头（{@code realm} 与 {@code acc.realm} 可以是同一个，也可以用来"按国际版身份重发一次"）。
+     *
+     * 为什么需要这个重载：11128 的官方解释是"这次调用没通过渠道校验，可能不是官方客户端"，
+     * 而 WorkBuddy 有**两个区域体系**（codebuddy.cn 与 workbuddy.ai），两侧的渠道校验不是同一套。
+     * 实测本机账号池里国际版号能过、国内版号常年 11128（见 4.31.1），但国内号在
+     * **国际版身份**下能不能过从来没试过——因为以前 realm 只会来自账号本身。
+     * 这里只让"身份相关"的三样东西跟着 realm 走（UA、Origin/Referer、Accept-Language），
+     * 鉴权、企业、部门、设备指纹仍取账号自身的值。
+     */
+    static Map<String, String> headers(Account acc, String realm, String base, String userAgent) {
         Map<String, String> h = new HashMap<>();
-        boolean global = REALM_GLOBAL.equalsIgnoreCase(acc.realm);
+        boolean global = REALM_GLOBAL.equalsIgnoreCase(realm);
         String origin = global ? "https://www.workbuddy.ai" : "https://www.codebuddy.cn";
         h.put("Content-Type", "application/json");
         h.put("X-CodeBuddy-Request", "1");
@@ -222,25 +249,25 @@ public final class WorkBuddy {
             h.put("X-Enterprise-Id", acc.enterpriseId);
             h.put("X-Tenant-Id", acc.enterpriseId);
         } else {
-            h.put("X-No-Enterprise-Id", "true");
+            h.put("X-No-Enterprise-Id", "1");
         }
         if (!acc.domain.isEmpty()) h.put("X-Domain", acc.domain);
-        else h.put("X-No-Department-Info", "true");
-        /* 官方客户端（wb2api 1.6.3 的 ae2.a()）只要登录态里 device_token 有值就带；
-           我们这批账号登录取不到它，所以这里带**空串**而不是不带——
-           上游对"缺头"和"空头"的处理不一定一样，带上更像官方客户端。 */
-        h.put("X-Device-Token", acc.deviceToken == null ? "" : acc.deviceToken);
-        // 参考实现（workbuddy2api/core/converter.py 的 _client_ip_headers + fingerprint.py）
-        // 在推理请求上还会带这几个头，上游靠它们识别 client / 用途：
-        h.put("X-Agent-Purpose", "conversation");
-        h.put("X-IDE-Name", "WorkBuddy");
-        h.put("X-IDE-Type", "WorkBuddy");
-        h.put("X-Product", "WorkBuddy");
+        else h.put("X-No-Department-Info", "1");
+        /* 官方客户端（wb2api 1.6.3 `eb2.a()`）：device_token 非空才带这个头，
+           为空时**整个头都不出现**（源码 `if (Z(device_token)) return;`）。
+           4.36.x 之前这里塞空串，形态与官方相反。 */
+        if (acc.deviceToken != null && !acc.deviceToken.isEmpty()) {
+            h.put("X-Device-Token", acc.deviceToken);
+        }
+        /* 4.36.5：删掉官方客户端（wb2api 1.6.3 `eb2.a()`）根本不发的 4 个声明头和
+           X-Request-ID——多出来的头本身就是"非官方"特征。
+           设备标识改用官方同一套派生：SHA-256("wb2a:<kind>:<uid>") 前 18 字节 base64url。
+           注意 X-Session-ID 官方也是**按 uid 固定**的，不是每次随机。 */
         if (!acc.uid.isEmpty()) {
-            // 设备指纹：按 uid 派生一个稳定的机器号；会话号每次新建
-            h.put("X-Machine-ID", "wb-" + Integer.toHexString(Math.abs(acc.uid.hashCode())));
-            h.put("X-Session-ID", java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16));
-            h.put("X-Request-ID", java.util.UUID.randomUUID().toString().replace("-", ""));
+            String machine = wb2aId("machine", acc.uid);
+            String session = wb2aId("session", acc.uid);
+            if (!machine.isEmpty()) h.put("X-Machine-ID", machine);
+            if (!session.isEmpty()) h.put("X-Session-ID", session);
         }
         return h;
     }
@@ -581,10 +608,58 @@ public final class WorkBuddy {
      * 上限：某个账号 5 种形状都被拒之后，本进程内**不再重试**（否则每探一次就是 5 次 400 往返），
      * 但仍保留"原样"那一轮——上游若改回去，原样自己就会通；进程重启后重试标记清空。
      */
-    /** 5 种形状都被拒过的账号：本进程内不再重试（重启即忘，不是永久拉黑）。 */
+    /** 5 种形状都被拒过的账号；持久化到 gateway.json，重启不再从头试一遍。 */
     private static final java.util.Set<String> CONV_HOPELESS =
             java.util.Collections.newSetFromMap(
                     new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+
+    /* 4.36.6：这两个"已经试到底了"的标记以前只活在内存里，进程重启就清空，
+       于是每次开机又对同一个号重打 10 次 400。现在落到 Config 里长期记住。
+       清了也没关系——只会多试一次，不会错。 */
+    private static void rememberHopeless(String name, boolean conv) {
+        java.util.Set<String> set = conv ? CONV_HOPELESS : INTL_HOPELESS;
+        if (!set.add(name)) return;
+        try {
+            Config.markHopeless(name, conv ? "conv" : "intl");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 按**国际版身份**重发也被拒过的账号：本进程内不再试（重启即忘）。
+     *
+     * 为什么要这条"国际版重发"：
+     *   - WorkBuddy 是两个区域体系（codebuddy.cn / workbuddy.ai），渠道校验实现不同；
+     *     本机账号池里**国际版号能过、国内号常年 11128**（4.31.1 实测），说明 11128 未必
+     *     是"这个账号被永久标记"，也可能只是"在以国内版身份调用时被拒"。
+     *   - 4.31.1 试过的那些形状（缺头、UA 三段式、conversation_id、prompt_cache_key、
+     *     codebuddy.ai 域名、极简头）全都在**同一个区域体系内**变化，没有一条换过区域身份。
+     *   - 所以这条是"唯一没试过的那一类变量"，代价可控：只在第一次撞上渠道校验时多一次往返，
+     *     被拒就整进程记住，不再重复。
+     *
+     * 关掉的办法：配置项 WorkBuddy 下 intl_fallback=false（见 {@link #intlFallbackFor}）。
+     */
+    private static final java.util.Set<String> INTL_HOPELESS =
+            java.util.Collections.newSetFromMap(
+                    new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+
+    /**
+     * 这个账号这次要不要给"国际版身份重发"一次机会。
+     *
+     * 只有国内区域账号、且没被本进程拉黑、且用户没关这个开关时才走。
+     * 国际版账号自己就是 global，重发等于把同一请求打第二遍，纯浪费——所以跳过。
+     */
+    static boolean intlFallbackFor(Config.Provider p, Account acc) {
+        if (p == null || acc == null) return false;
+        if (REALM_GLOBAL.equalsIgnoreCase(acc.realm)) return false;
+        if (INTL_HOPELESS.contains(p.name)) return false;
+        String flag = Proto.optString(p.options, "intl_fallback", "true");
+        return !"false".equalsIgnoreCase(flag);
+    }
+
+    /** 4.31.1/4.36.5 实测：几种形状全被 11128 拒，且 requestId 恒定 —— 形状不是变量。
+     *  置 true 后遇到渠道校验直接收手（只保留"原样"那一轮，上游若改回去原样自己会通）。 */
+    private static final boolean CONV_HOPELESS_SHAPES_KNOWN = true;
 
     static final String[] CONV_SHAPES = {
             "原样",
@@ -607,6 +682,100 @@ public final class WorkBuddy {
     private static String officialUa(boolean global) {
         return global ? "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
                 : "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1";
+    }
+
+    /**
+     * 官方客户端（wb2api 1.6.3 `eb2.a()` + `ln1.z()`）的设备标识派生：
+     *   SHA-256("wb2a:" + kind + ":" + uid) 取前 18 字节，Base64 URL-safe 无填充。
+     * kind 是 "machine"（固定）或 "session"（官方也是固定的，不随机）。
+     * 与官方对不上号的头值会被上游当成"非官方客户端"，所以这里照抄算法。
+     */
+    private static String wb2aId(String kind, String uid) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(("wb2a:" + kind + ":" + uid).getBytes("UTF-8"));
+            byte[] head = new byte[18];
+            System.arraycopy(d, 0, head, 0, 18);
+            return android.util.Base64.encodeToString(head,
+                    android.util.Base64.URL_SAFE | android.util.Base64.NO_PADDING | android.util.Base64.NO_WRAP);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** Base64 URL-safe、无填充。 */
+    private static String b64url(byte[] b, int len) {
+        byte[] head = new byte[len];
+        System.arraycopy(b, 0, head, 0, len);
+        return android.util.Base64.encodeToString(head,
+                android.util.Base64.URL_SAFE | android.util.Base64.NO_PADDING | android.util.Base64.NO_WRAP);
+    }
+
+    /**
+     * 官方客户端的 conversation_id 派生（wb2api 1.6.3 `mn.java:793-841`）：
+     *   拼串 = 每条 system 的 content + "|" ，再拼**第一条** user 的 content + "|"（最多 4000 字符）
+     *   conversation_id = "d-" + Base64URL(SHA-256(拼串)[0..7])   —— 8 字节，共 11 字符
+     * 没有可拼内容时官方不发这个字段，这里同样返回空串（交由调用方跳过）。
+     */
+    static String officialConversationId(org.json.JSONArray msgs) {
+        if (msgs == null || msgs.length() == 0) return "";
+        try {
+            StringBuilder sb = new StringBuilder();
+            boolean gotUser = false;
+            for (int i = 0; i < msgs.length(); i++) {
+                JSONObject m = msgs.optJSONObject(i);
+                if (m == null) continue;
+                String role = Proto.optString(m, "role", "");
+                if ("system".equals(role)) {
+                    sb.append("system:").append(textOf(m.opt("content"))).append('|');
+                } else if ("user".equals(role) && !gotUser) {
+                    sb.append("user:").append(textOf(m.opt("content"))).append('|');
+                    gotUser = true;
+                }
+                if (sb.length() > 4000) break;
+            }
+            if (sb.length() == 0) return "";
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(sb.toString().getBytes("UTF-8"));
+            return "d-" + b64url(d, 8);
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** content 既可能是字符串，也可能是 [{"type":"text","text":"…"}] 数组。 */
+    private static String textOf(Object content) {
+        if (content == null) return "";
+        if (content instanceof String) return (String) content;
+        if (content instanceof JSONArray) {
+            StringBuilder sb = new StringBuilder();
+            JSONArray a = (JSONArray) content;
+            for (int i = 0; i < a.length(); i++) {
+                Object it = a.opt(i);
+                if (it instanceof JSONObject) {
+                    String t = Proto.optString((JSONObject) it, "text", "");
+                    if (!t.isEmpty()) sb.append(t);
+                } else if (it != null) {
+                    sb.append(String.valueOf(it));
+                }
+            }
+            return sb.toString();
+        }
+        return String.valueOf(content);
+    }
+
+    /**
+     * 官方客户端的 prompt_cache_key 派生（wb2api 1.6.3 `tl1.java:59-75`）：
+     *   "wb2a-" + Base64URL(SHA-256("cache:" + uid + ":" + model)[0..11])
+     */
+    static String officialCacheKey(String uid, String model) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(("cache:" + uid + ":" + model).getBytes("UTF-8"));
+            return "wb2a-" + b64url(d, 12);
+        } catch (Throwable t) {
+            return "";
+        }
     }
 
     static void applyConvShape(int shape, JSONObject body, Map<String, String> headers,
@@ -647,7 +816,7 @@ public final class WorkBuddy {
     }
 
     /** 每次尝试都重新构造 body：重试绝不能复用被改过的对象。 */
-    private static JSONObject buildBody(String model, Proto.Req req) throws Exception {
+    private static JSONObject buildBody(String model, Proto.Req req, String uid) throws Exception {
         JSONObject body = Upstreams.openAiBody(model, req, true);
         /* the upstream rejects non-streaming outright */
         body.put("stream", true);
@@ -657,6 +826,21 @@ public final class WorkBuddy {
            当"孤立"删掉——之前只在整理之后打过，看不出是哪一种。 */
         JSONArray wbMsgs = body.optJSONArray("messages");
         if (wbMsgs != null) Upstreams.normalizeToolPairs(wbMsgs);
+        /* 4.36.7：官方客户端**每次**都会带这两个由内容派生的字段（wb2api 1.6.3
+           mn.java:793 / tl1.java:59），而这里以前要么不发、要么发的是
+           "wb-" + 时间戳 这种形态完全不同的值。上游若按"conversation_id 必须是
+           d- 前缀的内容哈希"判断客户端真伪，形状实验再多种也过不了。 */
+        try {
+            if (body.opt("conversation_id") == null || Proto.optString(body, "conversation_id", "").isEmpty()) {
+                String cid0 = officialConversationId(body.optJSONArray("messages"));
+                if (!cid0.isEmpty()) body.put("conversation_id", cid0);
+            }
+            if (body.opt("prompt_cache_key") == null || Proto.optString(body, "prompt_cache_key", "").isEmpty()) {
+                String ck = officialCacheKey(uid == null ? "" : uid, model);
+                if (!ck.isEmpty()) body.put("prompt_cache_key", ck);
+            }
+        } catch (Throwable ignored) {
+        }
         return body;
     }
 
@@ -680,140 +864,190 @@ public final class WorkBuddy {
         @Override
         public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
             Account acc = ensureFresh(p);
-            /* UA 走客户端身份画像（第三个参数以前误传了 p.apiKey，等于把网关的 Key
-               当 User-Agent 发给上游；这些账号的 apiKey 字段是空的才一直没暴露）。 */
-            String base = endpointFor(p, acc);
-            Map<String, String> baseHeaders = headers(acc, base, null);
-            String endpoint = base + "/v2/chat/completions";
-            String convId = "wb-" + System.currentTimeMillis();
-            Exception convFailed = null;
+            /* 渠道校验的两条路：先按账号自己的区域身份，再（可选）按国际版身份重发一次。 */
+            final boolean tryIntl = intlFallbackFor(p, acc);
+            final int passes = tryIntl ? 2 : 1;
             final int shapes = CONV_HOPELESS.contains(p.name) ? 1 : CONV_SHAPES.length;
-            for (int shape = 0; shape < shapes; shape++) {
-            JSONObject body = buildBody(model, req);
-            Map<String, String> headers = new HashMap<>(baseHeaders);
-            if (shape > 0) applyConvShape(shape, body, headers, convId, acc);
-            final TreeMap<Integer, JSONObject> toolAcc = new TreeMap<>();
-            final Proto.Usage usage = new Proto.Usage();
-            final String[] finish = {""};
-            try {
-
-            Upstreams.postStream(endpoint, headers, body, line -> {
-                String t = line == null ? "" : line.trim();
-                if (t.isEmpty() || t.startsWith(":")) return; // heartbeat comments
-                if (!t.startsWith("data:")) return;
-                String data = t.substring(5).trim();
-                if (data.isEmpty() || "[DONE]".equals(data)) return;
-                JSONObject chunk;
-                try {
-                    chunk = new JSONObject(data);
-                } catch (Exception e) {
-                    return;
-                }
-                if (chunk.has("code") && !chunk.has("choices")) {
-                    int code = chunk.optInt("code", -1);
-                    if (code != 0) {
-                        String msg = Proto.optString(chunk, "msg", "upstream business error");
-                        JSONObject display = chunk.optJSONObject("displayMsg");
-                        String zh = display != null ? Proto.optString(display, "zh", "") : "";
-                        String detail = "workbuddy 拒绝：" + code + " " + msg + (zh.isEmpty() ? "" : " / " + zh);
-                        // 上游用业务码（HTTP 200）表达的限流/额度/鉴权要按退避处理，
-                        // 否则连错 3 次就把健康账号打进熔断——那是我们自己的误伤。
-                        String kind = bizKind(code, msg);
-                        if (kind != null) {
-                            /* 渠道校验不是"过一会儿再来"：上游看的是账号/会话状态，
-                               所以 HTTP 码按 403（不属于限流）报，kind 仍然是 channel，
-                               Router 会给固定长回避并提示换号。 */
-                            int httpCode = "quota".equals(kind) ? 402
-                                    : ("channel".equals(kind) ? 403 : 429);
-                            throw new Throttled(httpCode, Http.defaultBackoffMs(httpCode), kind, detail);
+            Throttled channelFail = null;
+            for (int pass = 0; pass < passes; pass++) {
+                String realm = pass == 0 ? acc.realm : REALM_GLOBAL;
+                boolean cross = pass > 0;
+                String base = endpointFor(p, acc, realm, !cross);
+                Map<String, String> baseHeaders = headers(acc, realm, base, null);
+                String endpoint = base + "/v2/chat/completions";
+                String convId = "wb-" + System.currentTimeMillis();
+                for (int shape = 0; shape < shapes; shape++) {
+                    JSONObject body = buildBody(model, req, acc.uid);
+                    Map<String, String> hh = new HashMap<>(baseHeaders);
+                    if (shape > 0) applyConvShape(shape, body, hh, convId, acc);
+                    try {
+                        send(endpoint, hh, body, sink, model, req, acc);
+                        if (shape > 0 || cross) {
+                            noteConv(p, req, shape, cross ? "通过（国际版身份）" : "通过", null);
                         }
-                        throw new IllegalStateException(detail);
-                    }
-                }
-                JSONObject u = chunk.optJSONObject("usage");
-                if (u != null) {
-                    Upstreams.applyUsage(usage, u, "prompt_tokens", "completion_tokens", "cached_tokens");
-                    JSONObject details = u.optJSONObject("prompt_tokens_details");
-                    if (details != null) {
-                        Integer c = Proto.optInt(details, "cached_tokens");
-                        if (c != null) usage.cached = c;
-                    }
-                }
-                JSONArray choices = chunk.optJSONArray("choices");
-                if (choices == null || choices.length() == 0) return;
-                JSONObject c0 = choices.optJSONObject(0);
-                if (c0 == null) return;
-                JSONObject d = c0.optJSONObject("delta");
-                if (d != null) {
-                    String content = Proto.optString(d, "content", "");
-                    if (!content.isEmpty()) sink.text(content);
-                    String rc = Proto.optString(d, "reasoning_content", Proto.optString(d, "reasoning", ""));
-                    if (!rc.isEmpty()) sink.thinking(rc);
-                    JSONArray tcs = d.optJSONArray("tool_calls");
-                    if (tcs != null && tcs.length() > 0) {
-                        for (int i = 0; i < tcs.length(); i++) {
-                            JSONObject tc = tcs.optJSONObject(i);
-                            if (tc == null) continue;
-                            Integer idxObj = Proto.optInt(tc, "index");
-                            int idx = idxObj == null ? 0 : idxObj.intValue();
-                            JSONObject acc2 = toolAcc.get(idx);
-                            if (acc2 == null) {
-                                acc2 = new JSONObject();
-                                acc2.put("id", "");
-                                acc2.put("name", "");
-                                acc2.put("args", "");
-                                toolAcc.put(idx, acc2);
+                        return;
+                    } catch (Throttled t) {
+                        if (!"channel".equals(t.kind) || !looksLikeConvIdError(t)) {
+                            if (shape > 0 || cross) {
+                                noteConv(p, req, shape, cross ? "国际版身份仍失败" : "仍失败", t);
                             }
-                            String id = Proto.optString(tc, "id", "");
-                            if (!id.isEmpty()) acc2.put("id", id);
-                            JSONObject fn = tc.optJSONObject("function");
-                            if (fn != null) {
-                                String name = Proto.optString(fn, "name", "");
-                                if (!name.isEmpty()) acc2.put("name", name);
-                                String args = Proto.optString(fn, "arguments", "");
-                                if (!args.isEmpty()) acc2.put("args", Proto.optString(acc2, "args", "") + args);
-                            }
+                            throw t;
                         }
+                        channelFail = t;
+                        noteConv(p, req, shape, cross ? "国际版身份被拒" : "被拒", t);
+                        /* 4.36.6：渠道校验是**账号级**判定，不随 body/UA 形状变（4.31.1 两轮
+                           实验里 5 次回包 requestId 恒定就是证据）。形状已经在历史上被
+                           驳倒过，就不必为了"再确认一次"每次白打 5 次 400：
+                           本进程内只要记住这个号，直接跳到下一轮/下一个账号。 */
+                        if (CONV_HOPELESS_SHAPES_KNOWN) {
+                            if (shapes > 1) rememberHopeless(p.name, true);
+                            throw t;
+                        }
+                    } catch (Exception e) {
+                        if (shape > 0 || cross) {
+                            noteConv(p, req, shape, cross ? "国际版身份仍失败" : "仍失败", e);
+                        }
+                        throw e;
                     }
                 }
-                String fr = Proto.optString(c0, "finish_reason", "");
-                if (!fr.isEmpty() && !"null".equals(fr)) finish[0] = fr;
-            });
-
-            // 诊断：把即将转发给客户端的每个工具调用打出来。
-            // 目的：确认"客户端收到的 tool_call id"和"它下一轮带回来的 tool_call_id"
-            // 是不是同一个——对不上，结果就会被当成孤立消息丢掉。
-            for (JSONObject t : toolAcc.values()) {
-                String id = Proto.optString(t, "id", "");
-                boolean invented = false;
-                if (id.isEmpty()) {
-                    id = "call_" + Math.abs(System.nanoTime() % 1000000);
-                    invented = true;
-                }
-                String name = Proto.optString(t, "name", "");
-                if (name.isEmpty()) continue;
-                sink.toolCall(id, name, Proto.optString(t, "args", "{}"));
-            }
-            sink.finish(Proto.canonicalStop(finish[0], !toolAcc.isEmpty()), usage);
-            if (shape > 0) noteConv(p, req, shape, "通过", null);
-            return;
-            } catch (Exception e) {
-                if (!looksLikeConvIdError(e) || shape == shapes - 1) {
-                    if (shape > 0) noteConv(p, req, shape, "仍失败", e);
-                    if (looksLikeConvIdError(e) && shapes > 1) {
-                        CONV_HOPELESS.add(p.name);
-                        Log.w("workbuddy 渠道校验：" + p.name
-                                + " 5 种会话形状都被拒，本进程内不再重试（上游要的是服务端真实会话）");
+                if (shapes > 1) rememberHopeless(p.name, true);
+                if (pass < passes - 1) {
+                    Log.i("workbuddy 渠道校验：" + p.name + " 账号区域身份不通过，改按国际版身份重试一次");
+                    if (req != null && req.ephemeral) {
+                        Detect.file("# 渠道校验\t" + p.name + "\t国际版身份重发");
                     }
-                    throw e;
+                } else if (passes > 1) {
+                    rememberHopeless(p.name, false);
+                    Log.w("workbuddy 渠道校验：" + p.name
+                            + " 国际版身份也过不去，本进程内不再尝试（只按账号自己的区域身份发）");
                 }
-                /* 渠道校验没过：换下一种会话形状再试。换成别的 400 一律不重试。 */
-                convFailed = e;
-                noteConv(p, req, shape, "被拒", e);
             }
-            }
-            if (convFailed != null) throw convFailed;
+            if (channelFail != null) throw channelFail;
         }
+    }
+
+    /**
+     * 真正把一次请求发出去：解析流、累计工具调用、把文本/思考/工具调用交给 sink。
+     *
+     * 从 {@code chat()} 里拆出来（4.36.x），因为 4.36 起 {@code chat()} 要跑两轮
+     * （账号自己的区域身份 → 国际版身份），把发送逻辑抽成方法才能保证"每一轮都重新构造
+     * body 与头"，不会复用被改过的对象。行为与原内联版本逐行一致。
+     */
+    static void send(String endpoint, Map<String, String> headers, JSONObject body,
+                      Proto.Sink sink, String model, Proto.Req req, Account acc) throws Exception {
+        final TreeMap<Integer, JSONObject> toolAcc = new TreeMap<>();
+        final Proto.Usage usage = new Proto.Usage();
+        final String[] finish = {""};
+        final boolean[] idReported = {false};
+
+        Upstreams.postStream(endpoint, headers, body, line -> {
+            String t = line == null ? "" : line.trim();
+            if (t.isEmpty() || t.startsWith(":")) return; // heartbeat comments
+            if (!t.startsWith("data:")) return;
+            String data = t.substring(5).trim();
+            if (data.isEmpty() || "[DONE]".equals(data)) return;
+            JSONObject chunk;
+            try {
+                chunk = new JSONObject(data);
+            } catch (Exception e) {
+                return;
+            }
+            /* 4.36.0：把上游的 requestId 报上去。
+               业务错误（尤其 11128 渠道校验）整条都挂在这个 id 上，
+               以前只进日志、重启即失，排查时每次都得重新抓包。 */
+            if (!idReported[0]) {
+                String rid = Proto.optString(chunk, "requestId", "");
+                if (rid.isEmpty()) rid = Proto.optString(chunk, "request_id", "");
+                if (rid.isEmpty()) rid = Proto.optString(chunk, "id", "");
+                if (!rid.isEmpty()) {
+                    idReported[0] = true;
+                    sink.responseId(rid);
+                }
+            }
+            if (chunk.has("code") && !chunk.has("choices")) {
+                int code = chunk.optInt("code", -1);
+                if (code != 0) {
+                    String msg = Proto.optString(chunk, "msg", "upstream business error");
+                    JSONObject display = chunk.optJSONObject("displayMsg");
+                    String zh = display != null ? Proto.optString(display, "zh", "") : "";
+                    String detail = "workbuddy 拒绝：" + code + " " + msg + (zh.isEmpty() ? "" : " / " + zh);
+                    /* 上游用业务码（HTTP 200）表达的限流/额度/鉴权要按退避处理，
+                       否则连错 3 次就把健康账号打进熔断——那是我们自己的误伤。 */
+                    String kind = bizKind(code, msg);
+                    if (kind != null) {
+                        /* 渠道校验不是"过一会儿再来"：上游看的是账号/会话状态，
+                           所以 HTTP 码按 403（不属于限流）报，kind 仍然是 channel，
+                           Router 会给固定长回避并提示换号。 */
+                        int httpCode = "quota".equals(kind) ? 402
+                                : ("channel".equals(kind) ? 403 : 429);
+                        throw new Throttled(httpCode, Http.defaultBackoffMs(httpCode), kind, detail);
+                    }
+                    throw new IllegalStateException(detail);
+                }
+            }
+            JSONObject u = chunk.optJSONObject("usage");
+            if (u != null) {
+                Upstreams.applyUsage(usage, u, "prompt_tokens", "completion_tokens", "cached_tokens");
+                JSONObject details = u.optJSONObject("prompt_tokens_details");
+                if (details != null) {
+                    Integer c = Proto.optInt(details, "cached_tokens");
+                    if (c != null) usage.cached = c;
+                }
+            }
+            JSONArray choices = chunk.optJSONArray("choices");
+            if (choices == null || choices.length() == 0) return;
+            JSONObject c0 = choices.optJSONObject(0);
+            if (c0 == null) return;
+            JSONObject d = c0.optJSONObject("delta");
+            if (d != null) {
+                String content = Proto.optString(d, "content", "");
+                if (!content.isEmpty()) sink.text(content);
+                String rc = Proto.optString(d, "reasoning_content", Proto.optString(d, "reasoning", ""));
+                if (!rc.isEmpty()) sink.thinking(rc);
+                JSONArray tcs = d.optJSONArray("tool_calls");
+                if (tcs != null && tcs.length() > 0) {
+                    for (int i = 0; i < tcs.length(); i++) {
+                        JSONObject tc = tcs.optJSONObject(i);
+                        if (tc == null) continue;
+                        Integer idxObj = Proto.optInt(tc, "index");
+                        int idx = idxObj == null ? 0 : idxObj.intValue();
+                        JSONObject acc2 = toolAcc.get(idx);
+                        if (acc2 == null) {
+                            acc2 = new JSONObject();
+                            acc2.put("id", "");
+                            acc2.put("name", "");
+                            acc2.put("args", "");
+                            toolAcc.put(idx, acc2);
+                        }
+                        String id = Proto.optString(tc, "id", "");
+                        if (!id.isEmpty()) acc2.put("id", id);
+                        JSONObject fn = tc.optJSONObject("function");
+                        if (fn != null) {
+                            String name = Proto.optString(fn, "name", "");
+                            if (!name.isEmpty()) acc2.put("name", name);
+                            String args = Proto.optString(fn, "arguments", "");
+                            if (!args.isEmpty()) acc2.put("args", Proto.optString(acc2, "args", "") + args);
+                        }
+                    }
+                }
+            }
+            String fr = Proto.optString(c0, "finish_reason", "");
+            if (!fr.isEmpty() && !"null".equals(fr)) finish[0] = fr;
+        });
+
+        // 诊断：把即将转发给客户端的每个工具调用打出来。
+        // 目的：确认"客户端收到的 tool_call id"和"它下一轮带回来的 tool_call_id"
+        // 是不是同一个——对不上，结果就会被当成孤立消息丢掉。
+        for (JSONObject t : toolAcc.values()) {
+            String id = Proto.optString(t, "id", "");
+            if (id.isEmpty()) {
+                id = "call_" + Math.abs(System.nanoTime() % 1000000);
+            }
+            String name = Proto.optString(t, "name", "");
+            if (name.isEmpty()) continue;
+            sink.toolCall(id, name, Proto.optString(t, "args", "{}"));
+        }
+        sink.finish(Proto.canonicalStop(finish[0], !toolAcc.isEmpty()), usage);
     }
 
     /* ---------------------------------------------------------- model list */

@@ -296,7 +296,7 @@ public final class Router {
                不是"现在别来"。所以给一个固定的长回避（省掉白跑的来回），
                并在日志里说清"换号或重新登录"，别让它读起来像限流。 */
             ms = Math.max(ms, 6 * 3_600_000L);
-            Log.w("上游渠道校验拒绝（改请求形状无效，要换号或重新登录）：暂避 "
+            Log.w("上游渠道校验拒绝（账号与国际版身份都试过，要换号或重新登录）：暂避 "
                     + (ms / 3_600_000L) + " 小时 → " + key);
         } else if ("quota".equals(kind)) {
             ms = Math.max(ms, 30 * 60_000L);
@@ -609,6 +609,41 @@ public final class Router {
     private static final double HIST_K = 4.0;
 
     /**
+     * 把「进程内计数」和「历史种子」合成一个成功率。**这是唯一的一份实现。**
+     *
+     * 为什么单独抽出来：以前 score() / failRate() / failRateKey() 各抄了一份，
+     * 三份代码里的 hist 都是 `seed == null ? 0.5 : seed.ok` —— 也就是说**没考虑样本量**。
+     *
+     * 那个漏洞的具体后果（真机数据）：一个只有 2 笔样本、恰好全成功的组合，
+     * seed.ok = 1.0，于是 hist 被当成 1.0，和一个 2352 笔样本、成功率 0.999 的
+     * WorkBuddy 1 几乎等价。弱样本渠道因此被系统性高估 —— 而它恰好延迟是对方的四倍。
+     *
+     * 现在：历史成功率本身也做一次同样的贝叶斯收缩，
+     *     hist = (w·ok + K·PRIOR) / (w + K)
+     * w 是 Stats.Seed.w（有效样本数，已经过时间衰减）。2 笔样本会把它拉回先验附近，
+     * 200 笔才会让它说话 —— 和延迟估计用的 trust = w/(w+HIST_K) 是同一个思路，
+     * 之前只有延迟享受了这个待遇，成功率没有。
+     */
+    private static double smoothedRate(int ok, int fail, Stats.Seed seed) {
+        int n = ok + fail;
+        if (n == 0 && seed == null) return 0.5;
+        double hist = seed == null ? PRIOR_RATE : shrunk(seed);
+        return (ok + HIST_K * hist) / (n + HIST_K);
+    }
+
+    /** 无任何证据时的先验成功率。 */
+    private static final double PRIOR_RATE = 0.5;
+
+    /** 历史成功率按样本量向先验收缩。 */
+    private static double shrunk(Stats.Seed seed) {
+        double w = Math.max(0.0, seed.w);
+        if (w <= 0.0) return PRIOR_RATE;
+        /* seed.w 是衰减权重和，量级≈有效样本数；2 笔≈2，200 笔≈200。
+           分母用 HIST_K 让「样本很少」明显回到先验。 */
+        return (w * seed.ok + HIST_K * PRIOR_RATE) / (w + HIST_K);
+    }
+
+    /**
      * 打分。
      *
      * 相比原来"只有运行时成功率"的版本，这里多吃了三份证据，都来自 usage.tsv 的历史种子
@@ -633,10 +668,8 @@ public final class Router {
         }
         int n = ok + fail;
         Stats.Seed seed = Stats.get(c.provider.name, c.model);
-        double hist = seed == null ? 0.5 : seed.ok;
-        /* n 小的时候历史权重大，n 大了历史自动退位 */
-        double rate = (ok + HIST_K * hist) / (n + HIST_K);
-        if (n == 0 && seed == null) rate = 0.5;
+        /* n 小的时候历史权重大，n 大了历史自动退位；历史自己也按样本量收缩 */
+        double rate = smoothedRate(ok, fail, seed);
         double err = 1.0 - rate;
         double v = 100
                 + rate * 30
@@ -774,11 +807,8 @@ public final class Router {
             ok = s.ok;
             fail = s.fail;
         }
-        int n = ok + fail;
         Stats.Seed seed = Stats.get(provider, model);
-        double hist = seed == null ? 0.5 : seed.ok;
-        double rate = (ok + HIST_K * hist) / (n + HIST_K);
-        if (n == 0 && seed == null) return 0.5;
+        double rate = smoothedRate(ok, fail, seed);
         return Math.max(0, Math.min(1, 1.0 - rate));
     }
 
@@ -796,11 +826,8 @@ public final class Router {
             ok = s.ok;
             fail = s.fail;
         }
-        int n = ok + fail;
         Stats.Seed seed = Stats.get(c.provider.name, c.model);
-        double hist = seed == null ? 0.5 : seed.ok;
-        double rate = (ok + HIST_K * hist) / (n + HIST_K);
-        if (n == 0 && seed == null) return 0.5;
+        double rate = smoothedRate(ok, fail, seed);
         return Math.max(0, Math.min(1, 1.0 - rate));
     }
 

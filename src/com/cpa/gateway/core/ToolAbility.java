@@ -23,8 +23,36 @@ final class ToolAbility {
     private ToolAbility() {
     }
 
+    /**
+     * 判定阈值：坏样本占比超过它就算 BAD，好样本占比超过它才算 NATIVE。
+     *
+     * 为什么不能只看"最近一次"：旧实现里 note() 一次成功就把模型从 toolBad 挪走，
+     * 于是一个 9 次打嘴炮、1 次蒙对的模型会变成 NATIVE，之后被优先派去干工具活 ——
+     * 而它下一次大概率还是把调用写在正文里。
+     */
+    private static final double BAD_RATIO = 0.25;
+    private static final double NATIVE_RATIO = 0.75;
+    /** 少于这么多次观测就仍然当未知：1 次成功说明不了"会调工具"。 */
+    private static final int MIN_OBS = 2;
+
     static int state(Config.Provider p, String model) {
         if (p == null || model == null || model.isEmpty()) return UNKNOWN;
+        int[] c;
+        synchronized (p) {
+            c = p.toolStats.get(model);
+        }
+        if (c != null) {
+            int good = c[0], bad = c[1];
+            int n = good + bad;
+            if (n >= MIN_OBS) {
+                double badRatio = (double) bad / n;
+                if (badRatio >= BAD_RATIO) return BAD;
+                if ((double) good / n >= NATIVE_RATIO) return NATIVE;
+                /* 中间地带（例如 3 好 2 坏）：既不该当 native 派活，也不该当 bad 封杀 */
+                return UNKNOWN;
+            }
+        }
+        /* 计数还没攒够：退回旧的布尔名单（旧配置里存的就是这个） */
         if (p.toolNative.contains(model)) return NATIVE;
         if (p.toolBad.contains(model)) return BAD;
         return UNKNOWN;
@@ -35,6 +63,14 @@ final class ToolAbility {
         if (p == null || model == null || model.isEmpty()) return;
         boolean changed = false;
         synchronized (p) {
+            /* 先攒计数：这份证据不会被后来的单次结果覆盖掉 */
+            int[] c = p.toolStats.get(model);
+            if (c == null) {
+                c = new int[]{0, 0};
+                p.toolStats.put(model, c);
+            }
+            if (nativeOk) c[0]++; else c[1]++;
+            changed = true;
             if (nativeOk) {
                 changed = p.toolBad.remove(model) || p.toolNative.add(model);
                 if (changed) Log.i("工具画像：" + p.name + "/" + model + " → native（真会调）");

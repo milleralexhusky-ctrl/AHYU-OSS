@@ -5,6 +5,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -94,7 +96,23 @@ public final class Config {
     /** Minimum seconds between two automatic sweeps. */
     public long autoDetectInterval = 21600L;
 
-    public String apiKey = "sk-cpa-local-" + Integer.toHexString((int) (System.currentTimeMillis() & 0xffffff));
+    /**
+     * 本机回环访问 Key。**默认空串＝不校验**。
+     *
+     * 以前这里是 `"sk-cpa-local-" + 时间戳低 24 位`，本意是"开箱有个 Key 更安全"，
+     * 实际造成两个都不想要的后果：
+     *   1. 构造时就生成，第一次保存就落进 gateway.json，于是这个"随机默认值"被当成
+     *      用户**自己设过**的 Key 一直被读回来——用户在设置页清空再保存也没用，
+     *      因为下次启动 fromJson 又从文件里读到它（真机实测：清完仍是 sk-cpa-local-xxxxxx）。
+     *   2. 用户本来就不想用 Key（本机回环、只给自己用），却被 401 挡在外面，
+     *      日志表现成"客户端 Key 与服务端不一致"，看着像客户端配错了。
+     *
+     * 现在的语义（与 {@link #acceptsKey} 和 Server.route 对应）：
+     *   · 空串 → 本机模式下不校验，客户端不填 Key 也能直连；
+     *   · 局域网模式（lanAccess）仍**强制**要求 Key，没有就 401 拒绝整个请求——
+     *     那条判断在 Server 里，不依赖这个默认值。
+     */
+    public String apiKey = "";
     /** Older client keys stay valid, so changing the key never locks a working client out. */
     public final List<String> apiKeyAliases = new ArrayList<>();
     /**
@@ -156,6 +174,19 @@ public final class Config {
          * 就没了"，因为下一次自动巡检、下一次拉取、甚至只是点一次编辑保存，
          * 都会用上游目录把手写的内容盖掉。
          */
+        /**
+         * 账号级的布尔开关（键 → true/false 字符串）。
+         *
+         * 目前只有一个：
+         *   - `intl_fallback`：WorkBuddy 国内区域账号撞上渠道校验（11128）后，
+         *     要不要再按**国际版身份**（UA \/ Origin \/ Accept-Language \/ workbuddy.ai）
+         *     重发一次。缺省 true；设成 "false" 就完全不试。
+         *
+         * 为什么不硬编码在代码里：这是"行为形状"上的主动变更，不同账号池表现不同，
+         * 用户得能在不改代码的前提下关掉（重建配置时这个字段会跟着 options 走）。
+         */
+        public final JSONObject options = new JSONObject();
+
         public final List<String> manualModels = new ArrayList<>();
         /**
          * manualModels 是否已经确定过。
@@ -287,8 +318,28 @@ public final class Config {
         public final List<String> toolNative = new ArrayList<>();
         /** 实测"打嘴炮"的模型：把 tool_call 写在正文里，不吐结构化调用。 */
         public final List<String> toolBad = new ArrayList<>();
+        /**
+         * 工具调用画像的**计数**（4.32.0）：模型 → [native 次数, bad 次数]。
+         *
+         * 为什么要它：toolNative / toolBad 是布尔名单，note() 是**覆盖式**写入 ——
+         * 一次成功就把一个坏模型从 toolBad 移除、挪进 toolNative。偶发一次蒙对，
+         * 一个系统性打嘴炮的模型就被洗白了，之后它会被优先选去干工具活。
+         *
+         * 有了计数就能看比例而不仅是"最近一次"：3 次 bad + 1 次 native 仍然该按 bad 算。
+         * 两个 List 保留不动（旧配置、界面都在用），这里只是多一份证据。
+         */
+        public final Map<String, int[]> toolStats = new LinkedHashMap<>();
         /** Last failure reason, for the "unusable accounts" screen. */
         public String lastError = "";
+        /**
+         * 渠道校验已试到底的两类标记（"conv"=5 种形状都试过，"intl"=国际版身份也试过）。
+         *
+         * 为什么落盘：这两个标记原来只在 WorkBuddy 的内存 Set 里，进程重启就清空 ——
+         * 于是每次开机、每次升级后又对同一个号重打最多 10 次 400，客户端看到的是
+         * "卡一秒、报错、再卡一秒、再报错"。上游若改回去，客户端的"原样"第一轮
+         * 仍然会去试，所以记住它不会让我们错过恢复。
+         */
+        public final java.util.Set<String> hopeless = new java.util.LinkedHashSet<>();
         /**
          * 限流状态：上游说什么时候恢复（epoch 秒），0 = 当前不在限流中。
          *
@@ -368,6 +419,8 @@ public final class Config {
             o.put("apiKeyAliases", aliases);
                 o.put("enabled", enabled);
             o.put("catalogOnly", catalogOnly);
+                /* 账号级开关（目前只有 intl_fallback）。空对象不写，保持老配置形状不变。 */
+                if (options.length() > 0) o.put("options", options);
                 o.put("credentials", credentials);
                 o.put("credits", credits);
                 o.put("creditsAt", creditsAt);
@@ -388,6 +441,11 @@ public final class Config {
                 // 为什么不合并成一个对象数组：老版本的 reader 会把对象读成
                 // 空串，等于把用户的坏名单整个丢掉。分开存＝老版本读新配置
                 // 仍然能拿到名字，只是丢时间（这是我们能接受的降级）。
+                if (!hopeless.isEmpty()) {
+                    JSONArray hp = new JSONArray();
+                    for (String v : hopeless) if (v != null && !v.isEmpty()) hp.put(v);
+                    o.put("hopeless", hp);
+                }
                 if (!badSince.isEmpty()) {
                     JSONObject bs = new JSONObject();
                     for (java.util.Map.Entry<String, Long> e : badSince.entrySet()) {
@@ -423,6 +481,14 @@ public final class Config {
                 JSONArray tb = new JSONArray();
                 for (String m : new java.util.LinkedHashSet<>(toolBad)) tb.put(m);
                 o.put("toolBad", tb);
+                if (!toolStats.isEmpty()) {
+                    JSONObject ts = new JSONObject();
+                    for (Map.Entry<String, int[]> e : toolStats.entrySet()) {
+                        int[] v = e.getValue();
+                        ts.put(e.getKey(), new JSONArray().put(v[0]).put(v[1]));
+                    }
+                    o.put("toolStats", ts);
+                }
                 o.put("lastError", lastError == null ? "" : lastError);
                 if (throttleUntil > 0) o.put("throttleUntil", throttleUntil);
                 if (throttleNote != null && !throttleNote.isEmpty()) o.put("throttleNote", throttleNote);
@@ -444,6 +510,17 @@ public final class Config {
             p.apiKey = Proto.optString(o, "apiKey", "");
             p.enabled = o.optBoolean("enabled", true);
         p.catalogOnly = o.optBoolean("catalogOnly", false);
+            JSONObject opts = o.optJSONObject("options");
+            if (opts != null) {
+                java.util.Iterator<String> oit = opts.keys();
+                while (oit.hasNext()) {
+                    String ok = oit.next();
+                    try {
+                        p.options.put(ok, opts.opt(ok));
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
             p.credentials = Proto.optString(o, "credentials", "");
             Double cr = Proto.optDouble(o, "credits");
             p.credits = cr == null ? -1 : cr.doubleValue();
@@ -459,6 +536,22 @@ public final class Config {
                 for (int i = 0; i < tb0.length(); i++) {
                     String m = tb0.optString(i, "");
                     if (!m.isEmpty() && !p.toolBad.contains(m)) p.toolBad.add(m);
+                }
+            }
+            JSONObject ts0 = o.optJSONObject("toolStats");
+            if (ts0 != null) {
+                for (java.util.Iterator<String> it = ts0.keys(); it.hasNext(); ) {
+                    String k = it.next();
+                    JSONArray v = ts0.optJSONArray(k);
+                    if (v == null || v.length() < 2) continue;
+                    p.toolStats.put(k, new int[]{v.optInt(0, 0), v.optInt(1, 0)});
+                }
+            }
+            JSONArray hp = o.optJSONArray("hopeless");
+            if (hp != null) {
+                for (int i = 0; i < hp.length(); i++) {
+                    String v = hp.optString(i, "");
+                    if (!v.isEmpty()) p.hopeless.add(v);
                 }
             }
             JSONArray bad = o.optJSONArray("badModels");
@@ -645,7 +738,17 @@ public final class Config {
              · 文件里 apiKey 是空串 → 就是"不校验本机 Key"（局域网模式仍强制要求 Key，见 Server.route）；
              · 文件里没有 apiKey 字段（老配置）→ 才用默认值生成一个。 */
         if (o.has("apiKey")) {
-            c.apiKey = Proto.optString(o, "apiKey", "");
+            String stored = Proto.optString(o, "apiKey", "");
+            /* 密文解不开时（Keystore 重建 \/ 换机恢复），以前会拿到空串 ——
+               而空串在这里表示"用户主动清空了 Key、不校验"。于是一次解密失败会被
+               当成用户的意图**写回磁盘**，Key 就真的永久丢了，而且客户端从此不再有鉴权。
+               现在：解不开就保留内存里已有的值，并在日志里明确说一句"这个字段没读出来"。 */
+            if (Secret.isSealed(stored) && Secret.open(stored).isEmpty()) {
+                Log.w("配置里的客户端 Key 解不开（Keystore 可能已重建），本次沿用内存中的值，"
+                        + "没有把它当成已清空写回磁盘");
+            } else {
+                c.apiKey = stored;
+            }
         }
         JSONArray aliases = o.optJSONArray("apiKeyAliases");
         if (aliases != null) {
@@ -670,6 +773,22 @@ public final class Config {
         File dir = ctx.getFilesDir();
         if (dir == null) dir = ctx.getDir("files", Context.MODE_PRIVATE);
         return new File(dir, "gateway.json");
+    }
+
+    /** 记住某账号"渠道校验已试到底"（conv / intl），并择机落盘（合并写，不占请求线程）。 */
+    public static void markHopeless(String providerName, String kind) {
+        try {
+            Config c = Gateway.config();
+            if (c == null || providerName == null) return;
+            Config.Provider target = null;
+            for (Config.Provider p : c.providers) {
+                if (providerName.equals(p.name)) { target = p; break; }
+            }
+            if (target == null) return;
+            if (!target.hopeless.add(kind)) return;
+            Gateway.persistSoon();
+        } catch (Throwable ignored) {
+        }
     }
 
     public static Config load(Context ctx) {
@@ -749,6 +868,21 @@ public final class Config {
             for (int i = keep; i < files.length; i++) files[i].delete();
         } catch (Exception ignored) {
         }
+    }
+
+    /**
+     * 这个配置到底要不要校验客户端 Key。
+     *
+     * 只有"设了 Key 或还有旧 Key 别名"才算要校验；两者都空就是不校验（本机模式）。
+     * 单独抽出来，是为了让"设置页的空输入框不该被自动填回一个 Key"这件事有个
+     * 唯一判据，而不是各处去比字符串。
+     */
+    public boolean keyRequired() {
+        if (apiKey != null && !apiKey.isEmpty()) return true;
+        for (String a : apiKeyAliases) {
+            if (a != null && !a.isEmpty()) return true;
+        }
+        return false;
     }
 
     /** Keys the gateway accepts: the current one plus any kept aliases. */

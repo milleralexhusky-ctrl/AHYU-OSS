@@ -9,7 +9,7 @@ keystore.jks
 *.keystore
 
 # 签名口令与任何本地凭据：绝不入库
-#（build.sh 从 .env 或环境变量读口令，源码里不再出现明文）
+# （build.sh 从这个文件/环境变量读口令，源码里不再出现明文）
 .env
 .env.*
 *.secrets

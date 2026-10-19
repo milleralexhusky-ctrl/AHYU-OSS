@@ -70,6 +70,7 @@ public final class Selftest {
         add(out, "检测失败归类（业务码里的数字不算 HTTP 状态码）", Selftest::checkDetectClassify);
         add(out, "检测采样跳过非聊天模型", Selftest::checkDetectSampling);
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
+        add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         return out;
     }
 
@@ -614,16 +615,16 @@ public final class Selftest {
         String channel = "upstream HTTP400 {\"code\":11128,\"msg\":\"conversation id missing\","
                 + "\"displayTips\":{\"en\":\"This call failed channel verification, possibly because it was "
                 + "not sent from an official client.\"}}";
-        if (!"渠道校验拒绝（上游要求官方客户端，改请求形状无效）".equals(Detect.classify(channel))) {
+        if (!"渠道校验拒绝（上游要求官方客户端；已试过国际版身份，仍被拒就换号或重新登录）".equals(Detect.classify(channel))) {
             return "渠道校验没被单独归类：" + Detect.classify(channel);
         }
         String illegal = "upstream HTTP400 {\"code\":11128,\"msg\":\"request illegal\","
                 + "\"displayTips\":{\"en\":\"This call failed channel verification\"}}";
-        if (!"渠道校验拒绝（上游要求官方客户端，改请求形状无效）".equals(Detect.classify(illegal))) {
+        if (!"渠道校验拒绝（上游要求官方客户端；已试过国际版身份，仍被拒就换号或重新登录）".equals(Detect.classify(illegal))) {
             return "request illegal 变体没归到渠道校验：" + Detect.classify(illegal);
         }
         String conv = "upstream HTTP400 {\"code\":11128,\"msg\":\"conversation id missing\"}";
-        if (!"渠道校验拒绝（上游要求官方客户端，改请求形状无效）".equals(Detect.classify(conv))) {
+        if (!"渠道校验拒绝（上游要求官方客户端；已试过国际版身份，仍被拒就换号或重新登录）".equals(Detect.classify(conv))) {
             return "11128+conversation id missing 应归渠道校验：" + Detect.classify(conv);
         }
         if (!"上游拒绝这个请求（参数 / 能力不匹配）".equals(
@@ -736,6 +737,80 @@ public final class Selftest {
         if (!"wb-4".equals(body.optString("conversationId")) || !"wb-4".equals(h.get("X-Session-ID"))) {
             return "shape4 没写 conversationId / X-Session-ID";
         }
+        /* 国际版身份重发：只切换"身份相关"的头，鉴权仍用账号自己的。 */
+        WorkBuddy.Account gacc = new WorkBuddy.Account();
+        gacc.realm = WorkBuddy.REALM_CN;
+        gacc.accessToken = "tok";
+        gacc.uid = "uid1";
+        gacc.deviceToken = "dev1";
+        java.util.Map<String, String> cn = WorkBuddy.headers(gacc, "https://www.codebuddy.cn", null);
+        java.util.Map<String, String> gl = WorkBuddy.headers(gacc, WorkBuddy.REALM_GLOBAL,
+                "https://www.workbuddy.ai", null);
+        if (!"https://www.codebuddy.cn".equals(cn.get("Origin"))
+                || !"zh-CN".equals(cn.get("Accept-Language"))) {
+            return "国内版身份头不对：" + cn.get("Origin") + " / " + cn.get("Accept-Language");
+        }
+        if (!"https://www.workbuddy.ai".equals(gl.get("Origin"))
+                || !"en-US".equals(gl.get("Accept-Language"))) {
+            return "国际版身份没切 Origin / Accept-Language";
+        }
+        if (!"Bearer tok".equals(gl.get("Authorization")) || !"uid1".equals(gl.get("X-User-Id"))
+                || !"dev1".equals(gl.get("X-Device-Token"))) {
+            return "国际版身份把账号鉴权字段改掉了（只应切身份相关头）";
+        }
+        if (WorkBuddy.REALM_GLOBAL.equals(cn.get("User-Agent")) || cn.get("User-Agent").isEmpty()) {
+            return "国内版身份没有 UA";
+        }
         return null;
+    }
+
+    /** 国际版重发的开关与跳过条件。 */
+    private static String checkIntlFallback() {
+        Config.Provider p = new Config.Provider();
+        p.name = "WB-selftest";
+        WorkBuddy.Account cn = new WorkBuddy.Account();
+        cn.realm = WorkBuddy.REALM_CN;
+        if (!WorkBuddy.intlFallbackFor(p, cn)) return "国内号默认应该允许国际版身份重发一次";
+        WorkBuddy.Account gl = new WorkBuddy.Account();
+        gl.realm = WorkBuddy.REALM_GLOBAL;
+        if (WorkBuddy.intlFallbackFor(p, gl)) return "国际版号不该再按国际版身份重发（等于打两遍）";
+        try {
+            p.options.put("intl_fallback", "false");
+        } catch (Exception ignored) {
+        }
+        if (WorkBuddy.intlFallbackFor(p, cn)) return "intl_fallback=false 没关掉重发";
+        return checkOfficialBody();
+    }
+
+    /**
+     * 4.36.7：出站 body 必须带官方那两个内容派生字段（wb2api 1.6.3 mn.java:793 / tl1.java:59）。
+     * 这是"渠道校验"里唯一还没被形状实验覆盖过的变量，所以单独钉一条自检。
+     */
+    private static String checkOfficialBody() {
+        try {
+        org.json.JSONArray msgs = new org.json.JSONArray();
+        msgs.put(new org.json.JSONObject().put("role", "system").put("content", "sys"));
+        msgs.put(new org.json.JSONObject().put("role", "user").put("content", "hi"));
+        String cid = WorkBuddy.officialConversationId(msgs);
+        // 官方形态：d- 前缀 + 8 字节 base64url（无填充 = 11 字符）→ 共 13
+        if (cid.length() != 13 || !cid.startsWith("d-")) {
+            return "conversation_id 形态不对（应 d- + 11 字符 = 13）：" + cid;
+        }
+        String cid2 = WorkBuddy.officialConversationId(msgs);
+        if (!cid.equals(cid2)) return "conversation_id 不稳定（同一内容应得同一值）";
+        // 换掉 system 内容必须变，否则说明没把 system 拼进去
+        msgs.optJSONObject(0).put("content", "sys2");
+        if (cid.equals(WorkBuddy.officialConversationId(msgs))) {
+            return "conversation_id 没跟着 system 内容变（拼串漏了 system）";
+        }
+        String ck = WorkBuddy.officialCacheKey("uid1", "deepseek-v4.1-flash");
+        // wb2a- + 12 字节 base64url（无填充 = 16 字符）→ 共 21
+        if (!ck.startsWith("wb2a-") || ck.length() != 21) {
+            return "prompt_cache_key 形态不对（应 wb2a- + 16 字符 = 21）：" + ck;
+        }
+        return null;
+        } catch (Throwable t) {
+            return "body 派生字段自检异常：" + t;
+        }
     }
 }

@@ -53,6 +53,19 @@ public final class Fronts {
             return text.toString();
         }
 
+        /**
+         * 把已累积的正文换掉（4.32.0）。
+         *
+         * 只给工具补偿用：模型把 tool_call 写在正文里时，那段 JSON 已经进了 text，
+         * 转成真正的调用之后必须把它抹掉 —— 否则客户端会同时收到
+         * "一段带 JSON 的解释 + 一个调用"，内容重复，而且模型下一轮读到自己那份
+         * 正文会以为是它已经说过的话，容易开始自问自答。
+         */
+        public void replaceText(String s) {
+            text.setLength(0);
+            if (s != null && !s.isEmpty()) text.append(s);
+        }
+
         @Override
         public void text(String delta) {
             delta = stripper.clean(delta);              // 去掉"我是 XX 模型"
@@ -170,8 +183,20 @@ public final class Fronts {
                                     fn == null ? "{}" : Proto.optString(fn, "arguments", "{}")));
                         }
                     }
-                    if ("tool".equals(role) && cm.parts.isEmpty()) {
-                        cm.add(Proto.Part.toolResult(Proto.optString(m, "tool_call_id", ""), "", ""));
+                    /* tool 消息必须保留 tool_call_id —— 无论正文是不是空的。
+                       原来只在 parts 为空时才补一个 toolResult，content 非空时
+                       id 直接就丢了，上游于是报：
+                         An assistant message with 'tool_calls' must be followed by
+                         tool messages responding to each 'tool_call_id'.
+                         Unexpected tool_call_id:
+                       表现是整轮空回复（Trae 上很典型）。 */
+                    if ("tool".equals(role)) {
+                        String callId = Proto.optString(m, "tool_call_id", "");
+                        String toolName = Proto.optString(m, "name", "");
+                        String toolBody = contentToText(m.opt("content"));
+                        /* 清掉普通 text，改成一个带 id 的 toolResult */
+                        cm.parts.clear();
+                        cm.add(Proto.Part.toolResult(callId, toolName, toolBody));
                     }
                     if (cm.parts.isEmpty()) cm.add(Proto.Part.text(""));
                     req.messages.add(cm);

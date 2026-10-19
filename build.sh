@@ -44,7 +44,7 @@ $AAPT2 link -o $OUT/base.apk -I $PLATFORM \
   -R $OUT/compiled/res.zip \
   --java $OUT/gen \
   --min-sdk-version 26 --target-sdk-version 35 \
-  --version-code 609 --version-name 4.31.2 \
+  --version-code 628 --version-name 4.36.8 \
   --rename-manifest-package com.ahyu \
   --custom-package com.cpa.gateway \
   --auto-add-overlay
@@ -93,11 +93,10 @@ KS=${KS_PATH:-$ROOT/keystore.jks}
 # 口令从环境变量读，**不写进这个文件**。
 #
 # 以前这里硬编码了口令明文，而这个文件是公开仓库的一部分 ——
-# 等于把签名密钥的钥匙挂在门上：谁拿到 keystore.jks，再从这里读到口令，
-# 就能签出同签名的包冒充升级。口令和密钥必须分开存放。
+# 等于把签名密钥的钥匙挂在门上：谁拿到 keystore.jks（私库历史里有过），
+# 再从这里读到口令，就能签出同签名的包冒充升级。口令和密钥必须分开存放。
 #
-# 本地使用：构建前 export KS_STOREPASS / KS_KEYPASS
-#（或放进未跟踪的 .env 再 source，.gitignore 已排除）。
+# 本地使用：在构建前 export KS_STOREPASS / KS_KEYPASS（或放进未跟踪的 .env 再 source）。
 if [ -z "${KS_STOREPASS:-}" ]; then
   cat >&2 <<PASSMSG
 [错误] 没有提供签名密钥口令。
@@ -107,6 +106,10 @@ if [ -z "${KS_STOREPASS:-}" ]; then
     export KS_STOREPASS='你的口令'
     export KS_KEYPASS='你的口令'     # 与 storepass 相同可省略
     ./build.sh
+
+或写进未跟踪的本地文件（.gitignore 已排除 .env）：
+
+    echo "KS_STOREPASS=..." >> .env && . ./.env && ./build.sh
 PASSMSG
   exit 1
 fi
@@ -125,9 +128,9 @@ if [ ! -f "$KS" ]; then
   1) 只想用 App：直接下载 Release 里的 APK，不要自己编译。
   2) 本地调试自用：显式造一把密钥，并清楚它和原版签名不同：
        keytool -genkeypair -keystore keystore.jks -alias cpa -keyalg RSA \
-         -keysize 2048 -validity 10000 -storepass "\$KS_STOREPASS" -keypass "\$KS_KEYPASS" \
-         -dname "CN=CPA Gateway, O=Local, C=CN"
-  3) 要发布可覆盖升级的包：使用你自己的 keystore.jks 与对应口令（只存本地）。
+         -keysize 2048 -validity 10000 -storepass "\$KS_STOREPASS" \
+         -keypass "\$KS_KEYPASS" -dname "CN=CPA Gateway, O=Local, C=CN"
+  3) 要发布可覆盖升级的包：使用你自己的 keystore.jks 与对应口令（口令只存在本地）。
 KEYMSG
   exit 1
 fi

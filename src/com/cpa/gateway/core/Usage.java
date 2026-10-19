@@ -22,9 +22,97 @@ import java.util.Map;
  */
 public final class Usage {
 
-    /** 一行：时间戳(秒) \t 接口 \t 模型 \t 渠道 \t 耗时ms \t 成功(1/0) \t 输入tok \t 输出tok \t Key标签 */
+    /**
+     * 一行：时间戳(秒) \t 接口 \t 模型 \t 渠道 \t 耗时ms \t 成功(1/0) \t 输入tok \t 输出tok \t Key标签
+     *       \t 输出字符数 \t 工具调用(1/0) \t 结束原因
+     *
+     * 后三列是 4.32.0 加的，原因是：前九列里没有一列能回答"这次回答**内容上**行不行"。
+     * 那个「成功」只反映传输层（路由没抛异常、有渠道、HTTP 没报错），
+     * 模型回一句"抱歉我不能"、输出被 max_tokens 截成半句话、返回空串 —— 全都记成功。
+     *
+     * 为什么选这三样：
+     *   · 输出字符数 —— 上游普遍不返回 usage（中转站尤其），tokOut 长期是 0；
+     *     但 Sink 的 text(delta) 是逐字过来的，自己数字符不依赖上游。
+     *   · 工具调用   —— sawToolCall() 本来就在观察，只是没落到数据里。
+     *   · 结束原因   —— stopReason 在 tap 里收到就丢了，于是 length（截断）和
+     *     stop（正常）在数据里没有任何区别，截断彻底不可见。
+     *
+     * 三样都是**零成本**：全部来自已有的回调点，不额外请求、不改协议、不改上游。
+     * 旧行只有 9 列，读取端按长度判断，缺列当 0/空处理。
+     */
     private static final String FILE = "usage.tsv";
     private static final long KEEP_MS = 30L * 24 * 3600 * 1000;
+
+    /**
+     * 一次请求的观测上下文（4.33.0）。
+     *
+     * 这不是"再多记几个数字"，而是补上**从请求到响应**的完整链路观测：
+     * 我们发了什么 → 上游回了什么形态 → 我们怎么处理的。
+     * 缺任一环，"模型的工具调用逻辑"就只能靠猜。
+     */
+    public static final class Obs {
+        /** 来源：user=真实用户流量，probe=探活，detect=检测，unknown=不知道。 */
+        public String source = "unknown";
+        /** 这次请求带了多少个工具定义（0=没带）。 */
+        public int tools;
+        /**
+         * 上游响应的形态：
+         *   native  —— 结构化 tool_calls（正常）
+         *   text    —— 工具调用写在正文里（DSML / <tool_call> / fn(...)）
+         *   empty   —— 什么都没吐
+         *   error   —— 上游报错
+         *   plain   —— 纯文本回答，本来就没打算调工具
+         */
+        public String shape = "";
+        /**
+         * 我们的解析结果：
+         *   none    —— 无需解析（上游给的就是结构化调用，或本来没调用）
+         *   ok      —— 从正文里成功提取并转成了 tool_call
+         *   fail    —— 看起来是调用但没提取出来
+         *   fixed   —— 参数坏，ToolFix 修好了
+         *   dropped —— 参数坏到修不了，丢弃
+         */
+        public String parse = "";
+        /** 对话历史里是否已含工具调用/工具结果（多轮工具循环的第 2 轮及以后）。 */
+        public boolean hasToolHistory;
+        /**
+         * 结果质量（4.35.0）：ok / empty / cut / off / retry。
+         *
+         * 这是唯一一列**判断回答本身行不行**的：前面几列都只描述传输和形态。
+         * 判据全部是结构性的（空、截断、跑题、用户重发），不碰语义——
+         * 因为"答得好不好"需要品味，写不进代码，判错比不判更糟。
+         */
+        public String quality = "";
+        /**
+         * 上游返回的响应 ID（4.36.0）。
+         *
+         * 和上游对账的唯一键。Trae 报 11128 那次，就是靠"五次回包的 requestId
+         * 一模一样"断定上游不看我们发的东西——但当时这个 ID 只在日志里，
+         * 重启就没了。现在落盘。
+         */
+        public String responseId = "";
+        /** 会话标识：把同一轮的多跳请求串起来（多轮工具循环尤其需要）。 */
+        public String conversationId = "";
+        /**
+         * 错误归类（4.36.1）：rate / quota / auth / channel / badreq /
+         * timeout / net / empty / other。空表示没出错。
+         *
+         * 和 quality 的区别：quality 说"结果能不能用"，
+         * errorKind 说"为什么不能用"。两者的正确应对完全不同——
+         * 限流等一会儿就好，额度耗尽换号，请求非法换号更没用。
+         */
+        public String errorKind = "";
+        /**
+         * 工具名清单（4.36.1），逗号分隔。
+         *
+         * 以前只记工具个数。数量对上不代表定义对上——
+         * 某个特定工具名或参数 schema 可能正是上游拒绝的原因。
+         * 只记名字不记完整 schema：schema 太长，落盘会把用量文件撑爆。
+         */
+        public String toolNames = "";
+
+        public static final Obs EMPTY = new Obs();
+    }
 
     private static final Object LOCK = new Object();
     private static final List<String> pending = new ArrayList<>();
@@ -46,11 +134,55 @@ public final class Usage {
     /** 记一次请求：网关线程上只做入队，落盘在后台攒批。 */
     public static void record(String api, String model, String provider, long ms,
                               boolean ok, int tokIn, int tokOut, String keyLabel) {
+        record(api, model, provider, ms, ok, tokIn, tokOut, keyLabel, 0, false, "");
+    }
+
+    /** 带内容信号的版本（4.32.0）。旧调用签名仍然有效，等价于「这三个信号未知」。 */
+    public static void record(String api, String model, String provider, long ms,
+                              boolean ok, int tokIn, int tokOut, String keyLabel,
+                              int outChars, boolean toolCall, String stopReason) {
+        record(api, model, provider, ms, ok, tokIn, tokOut, keyLabel,
+                outChars, toolCall, stopReason, Obs.EMPTY);
+    }
+
+    /**
+     * 完整版本（4.33.0）：再带上「这次请求的观测上下文」。
+     *
+     * 为什么要加这四组数据（这是想弄清"模型的工具调用逻辑"必须补的观测缺口）：
+     *
+     *   来源 source    —— 这条是真实用户流量、探活、还是检测？以前全靠"渠道名为空"
+     *                     猜，今天 22 条全是 2~22ms 的本地即拒探活，却和真实失败混在一起。
+     *   工具请求 tools —— 这次请求带没带工具、带几个。没有它就无法区分
+     *                     "模型不想调工具"和"我们根本没给它工具"。
+     *   响应形态 shape —— 结构化 tool_calls / 正文里的文本标记 / 空 / 报错。
+     *                     这三者在旧数据里全都表现为"没调工具"。
+     *   解析结果 parse —— 我们自己有没有接住（ToolFix 修复、ToolCallText 提取）。
+     *                     解析失败和模型没调是两回事，混在一起永远查不清。
+     */
+    public static void record(String api, String model, String provider, long ms,
+                              boolean ok, int tokIn, int tokOut, String keyLabel,
+                              int outChars, boolean toolCall, String stopReason,
+                              Obs obs) {
         if (!isInference(api)) return;
+        Obs o = obs == null ? Obs.EMPTY : obs;
         String line = (System.currentTimeMillis() / 1000) + "\t" + clean(api) + "\t" + clean(model)
                 + "\t" + clean(provider) + "\t" + ms + "\t" + (ok ? 1 : 0)
                 + "\t" + Math.max(0, tokIn) + "\t" + Math.max(0, tokOut)
-                + "\t" + clean(keyLabel);
+                + "\t" + clean(keyLabel)
+                + "\t" + Math.max(0, outChars)
+                + "\t" + (toolCall ? 1 : 0)
+                + "\t" + clean(stopReason)
+                /* 第 13 列起：观测上下文（4.33.0） */
+                + "\t" + clean(o.source)
+                + "\t" + o.tools
+                + "\t" + clean(o.shape)
+                + "\t" + clean(o.parse)
+                + "\t" + (o.hasToolHistory ? 1 : 0)
+                + "\t" + clean(o.quality)
+                + "\t" + clean(o.responseId)
+                + "\t" + clean(o.conversationId)
+                + "\t" + clean(o.errorKind)
+                + "\t" + clean(o.toolNames);
         synchronized (LOCK) {
             pending.add(line);
             if (pending.size() >= 20 || System.currentTimeMillis() - lastWrite > 60000) {

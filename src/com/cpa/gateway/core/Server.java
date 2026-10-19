@@ -238,6 +238,111 @@ public final class Server {
     }
 
     /** 统计的「成功」指这次请求向客户端交付了正常响应，而不是「代码没有抛异常」。 */
+    /**
+     * 工具补偿（4.32.0）：把写在正文里的工具调用换成真正的 tool_call。
+     *
+     * 解决的问题：弱模型（和一部分中转站的降级实现）不会吐结构化 tool_calls，
+     * 而是输出 `{"name":"x","arguments":{…}}` 或者 `<tool_call>…</tool_call>` 这样的正文。
+     * 客户端拿到这种文本没法执行 —— 以前只能判成"打嘴炮"、换模型重来，
+     * 模型那份意图白费，用户那边表现为"这个模型不支持工具"。
+     *
+     * 判据刻意保守（换错的代价比漏换大得多）：
+     *   · 请求必须真的声明了 tools（否则正文里出现 JSON 是正常回答，不能碰）；
+     *   · 模型没有吐出任何结构化 tool_call（否则它是正常的，不要覆盖）；
+     *   · 提取到的名字必须在客户端声明的工具名里；
+     *   · 正文很短（< 2000 字符）：一封长信里出现一个 JSON 多半不是调用意图。
+     *
+     * 成功替换时会把正文清空 —— 否则客户端会同时收到"一段解释 + 一个调用"，
+     * 而那段解释里往往还带着那段 JSON，重复且容易让模型自问自答。
+     */
+    private static void compensateToolCall(Proto.Req req, Fronts.Collector col) {
+        if (req == null || req.tools == null || req.tools.isEmpty()) return;
+        if (col == null || col.sawToolCall()) return;
+        String body = col.seenText();
+        if (body == null || body.isEmpty() || body.length() > 2000) return;
+        if (!ToolAbility.looksLikeToolCall(body)) return;
+
+        java.util.Set<String> allowed = new java.util.LinkedHashSet<>();
+        for (Proto.Tool t : req.tools) {
+            if (t != null && t.name != null && !t.name.isEmpty()) allowed.add(t.name);
+        }
+        if (allowed.isEmpty()) return;
+
+        ToolCallText.Hit hit = ToolCallText.extract(body, allowed);
+        if (hit == null) return;
+
+        String args = hit.args == null || hit.args.isEmpty() ? "{}" : hit.args;
+        String id = "call_" + Math.abs(System.nanoTime() % 1000000);
+        col.toolCall(id, hit.name, args);
+        col.replaceText("");
+        /* 结束原因改成 tool_calls：客户端据此决定继续循环，
+           留成 stop 会让它以为这轮结束了。 */
+        if (col.stop == null || "stop".equals(col.stop)) col.stop = "tool_calls";
+        Log.i("工具补偿：正文里的调用已转换为 tool_call（" + hit.name + "）");
+    }
+
+    /**
+     * 判定这次上游响应属于哪种形态（4.33.0）。
+     *
+     * 为什么必须单独记：在旧数据里，"模型返回了结构化调用"、"模型把调用写进正文"、
+     * "模型什么都没说"三者全都表现为「工具=0」。而这三件事的含义完全相反——
+     * 第一种是我们接住了，第二种是需要解析，第三种是上游真没给。
+     */
+    /** 本次请求的工具名清单，逗号分隔（只记名字，不含 schema）。 */
+    private static String toolNameList(Proto.Req req) {
+        if (req == null || req.tools == null || req.tools.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (Proto.Tool t : req.tools) {
+            if (t == null || t.name == null || t.name.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(',');
+            sb.append(t.name);
+            if (sb.length() > 300) break;      // 别让超长清单撑爆一行
+        }
+        return sb.toString();
+    }
+
+    /** 最后一条用户消息的正文（判"答非所问"时和回答对照）。 */
+    private static String lastUserText(Proto.Req req) {
+        if (req == null || req.messages == null) return "";
+        for (int i = req.messages.size() - 1; i >= 0; i--) {
+            Proto.Msg m = req.messages.get(i);
+            if (m == null || m.parts == null) continue;
+            if (!"user".equals(m.role)) continue;
+            StringBuilder sb = new StringBuilder();
+            for (Proto.Part p : m.parts) {
+                if (p != null && Proto.Part.TEXT.equals(p.type) && p.text != null) sb.append(p.text);
+            }
+            if (sb.length() > 0) return sb.toString();
+        }
+        return "";
+    }
+
+    /** 历史里是否已经含工具调用或工具结果（多轮工具循环的第 2 轮及以后）。 */
+    private static boolean hasToolHistory(Proto.Req req) {
+        if (req == null || req.messages == null) return false;
+        for (Proto.Msg m : req.messages) {
+            if (m == null || m.parts == null) continue;
+            for (Proto.Part part : m.parts) {
+                if (part == null) continue;
+                if (Proto.Part.TOOL_CALL.equals(part.type)
+                        || Proto.Part.TOOL_RESULT.equals(part.type)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static String shapeOf(Conn c) {
+        if (c == null) return "";
+        if (c.responseShape != null && !c.responseShape.isEmpty()) return c.responseShape;
+        if (c.responseFailed) return "error";
+        if (c.sawToolCall) return "native";
+        if (c.outChars <= 0) return "empty";
+        /* 正文里有调用标记但我们没转出来 —— 这就是"上游用了另一种语法"。
+           直接复用 ToolAbility 的识别器（它认 <tool_call> / <invoke> / function_call 等）。 */
+        if (c.seenTextHint != null && ToolAbility.looksLikeToolCall(c.seenTextHint)) return "text";
+        return "plain";
+    }
+
     static boolean usageSuccess(boolean routeOk, boolean hadProvider, boolean responseFailed) {
         return routeOk && hadProvider && !responseFailed;
     }
@@ -355,6 +460,39 @@ public final class Server {
         volatile boolean responseFailed;
         volatile int tokIn;
         volatile int tokOut;
+        /* 4.32.0 内容信号：三样都不依赖上游返回 usage，全从 Sink 回调里数出来。
+           为什么需要它们见 Usage 的列说明——前九列没有一列能反映"回答内容行不行"。 */
+        /** 本次响应流给客户端的正文字符数（增量累加）。 */
+        volatile int outChars;
+        /** 本次有没有真吐出结构化 tool_calls。 */
+        volatile boolean sawToolCall;
+        /** 上游给的结束原因（stop / length / tool_calls …）；空 = 不知道。 */
+        volatile String stopReason = "";
+        /* 4.33.0 观测上下文：把"发了什么 → 回了什么形态 → 怎么处理的"串起来。
+           没有这三样，"模型会不会调工具"就只能靠猜（见 Usage.Obs 的说明）。 */
+        /** 本次请求带了多少个工具定义。 */
+        volatile int toolsSent;
+        /** 对话历史里是否已含工具调用／工具结果。 */
+        volatile boolean hasToolHistory;
+        /** 我们自己的解析结果：none / ok / fail / fixed / dropped。 */
+        volatile String parseOutcome = "none";
+        /** 上游响应形态：native / text / empty / error / plain。 */
+        volatile String responseShape = "";
+        /** 正文前若干字符，仅供判定"是不是把调用写进了正文"。截断保存，不占内存。 */
+        volatile String seenTextHint = "";
+        /* 4.35.0 结果质量：请求侧留一份正文样本（判跑题用），
+           以及客户端是否立刻重发过（最真实的"用户觉得不行"信号）。 */
+        volatile String askedHint = "";
+        volatile boolean clientRetried;
+        /* 4.36.0 可追溯标识：
+           responseId 是上游给的 requestId（和上游对账的唯一键）；
+           conversationId 是我们自己的会话标识，用来把同一轮多跳串起来。 */
+        volatile String upstreamResponseId = "";
+        volatile String conversationId = "";
+        /** 本次工具名清单（逗号分隔）。只记名字：完整 schema 太长会撑爆用量文件。 */
+        volatile String toolNames = "";
+        /** 本次错误的类别（4.36.1）。catch 里和 writeError 里都可能写。 */
+        volatile String errorKind = "";
         /** 最近一次心跳真的写出去了的时间；写被阻塞时它就不动了。 */
         volatile long lastPing = System.currentTimeMillis();
         java.util.concurrent.ScheduledFuture<?> pinger;
@@ -742,11 +880,15 @@ public final class Server {
                     }
                 }
                 boolean reqOk = true;
+                String errKind = ErrorKind.NONE;
                 try {
                     route(r, out, s);
                 } catch (Throwable routeError) {
                     reqOk = false;
                     conn.responseFailed = true;
+                    /* 4.36.1：记下"为什么失败"。混成一种的话，
+                       就没法知道该重试、该换号、还是该改代码。 */
+                    errKind = ErrorKind.of(routeError);
                     Log.w("request failed (" + r.method + " " + r.path + "): " + routeError);
                     failResponse(out, r.path, String.valueOf(routeError.getMessage()));
                     if (!conn.sse) conn.keepAlive = false;
@@ -763,14 +905,69 @@ public final class Server {
                     // 没走到上游的推理请求（比如"虚拟模型现在没有可用候选"）在用户眼里就是失败，
                     // HTTP 层 200 不算数
                     boolean usageOk = usageSuccess(reqOk, !conn.apiProvider.isEmpty(), conn.responseFailed);
+                    Usage.Obs obs = new Usage.Obs();
+                    obs.source = r.header("x-cpa-ephemeral").isEmpty() ? "user" : "probe";
+                    obs.tools = conn.toolsSent;
+                    obs.hasToolHistory = conn.hasToolHistory;
+                    obs.parse = conn.parseOutcome == null ? "" : conn.parseOutcome;
+                    obs.shape = shapeOf(conn);
+                    /* 4.35.0 结果质量：让日常真实流量自己变成样本。
+                       只判结构上确定的东西（空/截断/跑题/用户重发），不碰语义。 */
+                    obs.quality = Quality.judge(
+                            conn.seenTextHint,
+                            conn.askedHint,
+                            conn.stopReason,
+                            conn.clientRetried, conn.sawToolCall);
+                    obs.responseId = conn.upstreamResponseId;
+                    obs.conversationId = conn.conversationId;
+                    /* 没报错但结果为空 —— 这也是一种失败，单独归类 */
+                    obs.toolNames = conn.toolNames;
+                    obs.errorKind = !ErrorKind.NONE.equals(errKind)
+                            ? errKind
+                            : (conn.errorKind != null && !conn.errorKind.isEmpty()
+                                    ? conn.errorKind
+                                    : ("empty".equals(obs.quality) ? ErrorKind.EMPTY : ""));
+                    /* 4.33.1 原始响应留样：只在可疑请求上留（空回复、正文像调用、报错）。
+                       目的不是统计，而是拿到"上游到底回了什么"的真实样本 ——
+                       要照着它的结构做适配，就得先看清结构。 */
+                    if (!"probe".equals(obs.source)) {
+                        String why = null;
+                        if ("empty".equals(obs.shape)) why = "empty";
+                        else if ("text".equals(obs.shape)) why = "looks-text";
+                        else if ("error".equals(obs.shape)) why = "upstream-error";
+                        if (why != null) {
+                            RawCap.note(why,
+                                    r.path + " | " + conn.apiProvider + " | " + conn.apiModel
+                                            + " | " + took + "ms | tools=" + conn.toolsSent
+                                            + " | hist=" + (conn.hasToolHistory ? 1 : 0),
+                                    "outChars=" + conn.outChars
+                                            + " stop=" + conn.stopReason
+                                            + "\nbody: " + (conn.seenTextHint == null ? "" : conn.seenTextHint));
+                        }
+                    }
                     Usage.record(r.path, conn.apiModel, conn.apiProvider, took,
-                            usageOk, conn.tokIn, conn.tokOut, conn.apiKeyLabel);
+                            usageOk, conn.tokIn, conn.tokOut, conn.apiKeyLabel,
+                            conn.outChars, conn.sawToolCall, conn.stopReason, obs);
                 }
                 conn.apiModel = "";
                 conn.apiProvider = "";
                 conn.responseFailed = false;
                 conn.tokIn = 0;
                 conn.tokOut = 0;
+                conn.outChars = 0;
+                conn.sawToolCall = false;
+                conn.stopReason = "";
+                conn.toolsSent = 0;
+                conn.hasToolHistory = false;
+                conn.parseOutcome = "none";
+                conn.responseShape = "";
+                conn.seenTextHint = "";
+                conn.askedHint = "";
+                conn.clientRetried = false;
+                conn.upstreamResponseId = "";
+                conn.conversationId = "";
+                conn.toolNames = "";
+                conn.errorKind = "";
                 conn.apiKeyLabel = "";
                 if (took > 1500 || r.path.startsWith("/v1/")) {
                     Log.i(r.method + " " + r.path + " 用时 " + took + "ms");
@@ -2001,6 +2198,23 @@ public final class Server {
      */
     private void writeError(OutputStream out, String path, int status, String message, String kind)
             throws Exception {
+        /* 4.36.1：这类错误是"正常返回一个错误响应"，不抛异常，
+           所以 catch 里拿不到。在这里记一笔，才能归类到 usage.tsv。
+           400/404 这类多半是**请求侧**问题 —— 换号更没用。 */
+        Conn cc = connFor(out);
+        if (cc != null && (cc.errorKind == null || cc.errorKind.isEmpty() || ErrorKind.OTHER.equals(cc.errorKind))) {
+            if (kind != null && !kind.isEmpty()) {
+                cc.errorKind = kind;
+            } else if (status == 400 || status == 404 || status == 422) {
+                cc.errorKind = ErrorKind.BADREQ;
+            } else if (status == 401 || status == 403) {
+                cc.errorKind = ErrorKind.AUTH;
+            } else if (status == 429) {
+                cc.errorKind = ErrorKind.RATE;
+            } else if (status >= 500) {
+                cc.errorKind = ErrorKind.OTHER;
+            }
+        }
         JSONObject o = new JSONObject();
         if (path.startsWith("/v1/messages")) {
             JSONObject e = new JSONObject();
@@ -2609,9 +2823,10 @@ public final class Server {
                                    long until, int tries, boolean channel) throws Exception {
         if (channel) {
             Log.w("请求 " + model + "：候选账号都被上游渠道校验拒绝，本次不向上游发起请求"
-                    + "（改请求形状无效，需要换号或重新登录）");
+                    + "（账号与国际版身份都试过，需要换号或重新登录）");
             writeError(out, path, 403,
-                    "该模型的候选账号都被上游渠道校验拒绝（上游要求官方客户端，改请求形状无效）；"
+                    "该模型的候选账号都被上游渠道校验拒绝（上游要求官方客户端；"
+                            + "已按国际版身份重发过仍被拒）；"
                             + "请换一个账号或重新登录该账号，等下去不会自己恢复", "channel");
             return;
         }
@@ -2898,6 +3113,19 @@ public final class Server {
         if (cur != null) {
             cur.apiProvider = p == null ? "" : p.name;
             cur.apiModel = upstreamModel == null ? "" : upstreamModel;
+            /* 4.33.0 观测：这次带了多少工具、历史里有没有工具调用。
+               有了它们才能区分"模型不想调"和"我们没给"。 */
+            cur.toolsSent = req == null || req.tools == null ? 0 : req.tools.size();
+            cur.hasToolHistory = hasToolHistory(req);
+            /* 4.35.0 留一份请求正文（判跑题用）；客户端重发次数也从这里取 */
+            cur.toolNames = toolNameList(req);
+            cur.askedHint = lastUserText(req);
+            cur.clientRetried = Repeats.seenCount(req) > 1;
+            /* 会话标识：同一段对话的多跳请求共用一个。
+               用「首条用户消息 + 消息数」做指纹——同一轮工具循环里，
+               消息数会递增，所以不能只用内容；直接用内容指纹会误把
+               "用户重复问同一句"合并成一轮。 */
+            cur.conversationId = Conversation.id(req);
         }
         // 包一层 Sink：上游报的 token 用量顺手记进 Conn，用量统计的后两列（tokIn/tokOut）才有数。
         // 所有回调原样转发，连工具画像用的 sawToolCall 也转发，行为与之前完全一致。
@@ -2905,6 +3133,17 @@ public final class Server {
         Proto.Sink tap = new Proto.Sink() {
             @Override
             public void text(String delta) {
+                /* 数正文字符：上游普遍不返回 usage（中转站尤其），tokOut 长期是 0；
+                   而 text(delta) 是逐字过来的，自己数不依赖上游。 */
+                if (delta != null && cur != null) {
+                    cur.outChars += delta.length();
+                    /* 留一份正文样本：用来判定"上游是不是把工具调用写进了正文"。
+                       只留前 2000 字符，够识别标记，不会把内存吃满。 */
+                    String hint = cur.seenTextHint;
+                    if (hint != null && hint.length() < 2000) {
+                        cur.seenTextHint = hint + delta;
+                    }
+                }
                 inner.text(delta);
             }
 
@@ -2915,6 +3154,7 @@ public final class Server {
 
             @Override
             public void toolCall(String id, String name, String argsJson) {
+                if (cur != null) cur.sawToolCall = true;
                 inner.toolCall(id, name, argsJson);
             }
 
@@ -2924,16 +3164,29 @@ public final class Server {
                 // 竞速路径下 serve 跑在 RACE_POOL 线程上，那里的 ThreadLocal 从来没被 set 过，
                 // CURRENT.get() 恒为 null —— token 用量永远记 0。
                 Conn c = cur;
-                if (c != null && usage != null) {
-                    c.tokIn = usage.input;
-                    c.tokOut = usage.output;
+                if (c != null) {
+                    /* 结束原因以前收到就丢：于是 length（被 max_tokens 截断）和 stop（正常结束）
+                       在用量数据里完全一样，截断彻底不可见。现在记下来。 */
+                    c.stopReason = stopReason == null ? "" : stopReason;
+                    if (usage != null) {
+                        c.tokIn = usage.input;
+                        c.tokOut = usage.output;
+                    }
                 }
                 inner.finish(stopReason, usage);
             }
 
             @Override
             public boolean sawToolCall() {
-                return inner.sawToolCall();
+                boolean innerSaw = inner.sawToolCall();
+                if (innerSaw && cur != null) cur.sawToolCall = true;
+                return innerSaw;
+            }
+
+            @Override
+            public void responseId(String id) {
+                if (id != null && !id.isEmpty() && cur != null) cur.upstreamResponseId = id;
+                inner.responseId(id);
             }
         };
         try {
@@ -3030,6 +3283,7 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.OpenAiFront.parse(body);
+        RequestCheck.check(req);
         req.ephemeral = body.optBoolean("_ephemeral", false);
         if (Router.isVirtual(req.model)) {
             if (Router.AUTO_RACE.equalsIgnoreCase(req.model) && req.stream && req.tools.isEmpty()) {
@@ -3351,6 +3605,11 @@ public final class Server {
                 try {
                     Fronts.Collector col = new Fronts.Collector();
                     serve(req.model, c.provider, c.model, req, col);
+                    /* 4.32.0 工具补偿：模型把调用写在正文里、没吐结构化 tool_calls 时，
+                       在这里把它捞成真正的调用，再交给客户端。
+                       只做非流式：Collector 的正文还在内存里、还没写给客户端，
+                       换错了也能退回去；流式已经出网，撤不回来，不做。 */
+                    compensateToolCall(req, col);
                     Router.recordOk(c.key(), System.currentTimeMillis() - t0);
                     Router.notePicked(req.model, c.key());
                         writeJson(out, 200, Fronts.OpenAiFront.render(req.model, col));
@@ -3525,6 +3784,8 @@ public final class Server {
         int tokens;
         try {
             Proto.Req req = Fronts.AnthropicFront.parse(body);
+        RequestCheck.check(req);
+            RequestCheck.check(req);
             tokens = Classifier.estimateTokens(req);
         } catch (Throwable t) {
             /* 解析失败时不要把整个调用打回去：这个端点的语义是"给个估算"，
@@ -3638,6 +3899,7 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.GeminiFront.parse(model, body);
+        RequestCheck.check(req);
         // 与 Anthropic / Responses 对齐：虚拟模型先解析成具体候选，别让 auto 在 Gemini 面上 404
         String effective = model;
         if (Router.isVirtual(model)) {
@@ -3717,6 +3979,60 @@ public final class Server {
 
     /* ------------------------------------------------- OpenAI /v1/responses shim */
 
+    /* ---- Responses 输入转换的辅助（4.32.2） ---- */
+
+    /**
+     * 把攒着的并行 function_call 落成一条 assistant 消息。
+     *
+     * Responses 里并行工具调用就是几个相邻的 function_call 项，没有共同的父消息；
+     * Chat Completions 要求它们属于**同一条** assistant 消息的 tool_calls 数组，
+     * 且后面紧跟每个调用对应的 role=tool 消息。顺序错了上游会直接拒绝。
+     */
+    private static void flushCalls(List<JSONObject> msgs, JSONArray calls) throws Exception {
+        if (calls == null || calls.length() == 0) return;
+        JSONObject m = new JSONObject();
+        m.put("role", "assistant");
+        m.put("content", "");
+        m.put("tool_calls", calls);
+        msgs.add(m);
+    }
+
+    /**
+     * content 可能是字符串，也可能是 part 数组（input_text / output_text / text）。
+     * Chat Completions 的 content 要字符串，所以把各 part 的 text 拼起来。
+     */
+    private static Object plainContent(Object content) {
+        if (content == null) return null;
+        if (content instanceof String) return content;
+        if (content instanceof JSONArray) {
+            JSONArray arr = (JSONArray) content;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < arr.length(); i++) {
+                Object p = arr.opt(i);
+                if (p instanceof JSONObject) {
+                    JSONObject part = (JSONObject) p;
+                    String t = Proto.optString(part, "text", "");
+                    if (t.isEmpty()) t = Proto.optString(part, "content", "");
+                    if (!t.isEmpty()) {
+                        if (sb.length() > 0) sb.append('\n');
+                        sb.append(t);
+                    }
+                } else if (p != null) {
+                    if (sb.length() > 0) sb.append('\n');
+                    sb.append(String.valueOf(p));
+                }
+            }
+            return sb.toString();
+        }
+        return String.valueOf(content);
+    }
+
+    /** function_call_output 的 output 也可能是字符串或数组，统一成字符串。 */
+    private static String outputText(Object output) {
+        Object v = plainContent(output);
+        return v == null ? "" : String.valueOf(v);
+    }
+
     private void handleResponses(Req r, OutputStream out) throws Exception {
         JSONObject body;
         try {
@@ -3736,46 +4052,122 @@ public final class Server {
         if (!instructions.isEmpty()) {
             msgs.add(new JSONObject().put("role", "system").put("content", instructions));
         }
+        /*
+         * input → messages 转换（4.32.2 重写）。
+         *
+         * Responses 的 input 是一串“item”，类型比 Chat Completions 的 message 丰富得多：
+         *   {type:message, role:developer|user|assistant, content:[{type:input_text|output_text,text}]}
+         *   {type:function_call, call_id, name, arguments}
+         *   {type:function_call_output, call_id, output}
+         *
+         * 旧实现只认 function_call_output，其余一律当 message 处理，带来三个问题：
+         *  1) developer 角色原样透传 —— Chat Completions 不认这个角色，上游报错。
+         *  2) function_call 项没有 role 也没有 content，被当成 {role:user, content:null}。
+         *  3) function_call_output（role=tool）前面没有配对的 assistant 工具调用，
+         *     上游必然拒绝。客户端把拒绝当“完成”，界面上表现为“用时 1 秒、无任何内容”。
+         *
+         * 现在按 Chat Completions 的形状重建：
+         *   · developer → system
+         *   · 连续的 function_call 合并进**同一条** assistant 消息的 tool_calls
+         *   · content 是数组时把 input_text/output_text 的 text 拼起来
+         */
         Object input = body.opt("input");
         if (input instanceof String) {
             msgs.add(new JSONObject().put("role", "user").put("content", input));
         } else if (input instanceof JSONArray) {
             JSONArray arr = (JSONArray) input;
+            JSONArray pendingCalls = null;
+
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject item = arr.optJSONObject(i);
                 if (item == null) {
-                    msgs.add(new JSONObject().put("role", "user").put("content", String.valueOf(arr.opt(i))));
+                    flushCalls(msgs, pendingCalls);
+                    pendingCalls = null;
+                    msgs.add(new JSONObject().put("role", "user")
+                            .put("content", String.valueOf(arr.opt(i))));
                     continue;
                 }
                 String type = Proto.optString(item, "type", "message");
+
+                if ("function_call".equals(type)) {
+                    if (pendingCalls == null) pendingCalls = new JSONArray();
+                    JSONObject fn = new JSONObject();
+                    fn.put("name", Proto.optString(item, "name", ""));
+                    fn.put("arguments", Proto.optString(item, "arguments", "{}"));
+                    JSONObject call = new JSONObject();
+                    call.put("id", Proto.optString(item, "call_id", ""));
+                    call.put("type", "function");
+                    call.put("function", fn);
+                    pendingCalls.put(call);
+                    continue;
+                }
+
+                flushCalls(msgs, pendingCalls);
+                pendingCalls = null;
+
                 if ("function_call_output".equals(type)) {
                     msgs.add(new JSONObject().put("role", "tool")
                             .put("tool_call_id", Proto.optString(item, "call_id", ""))
-                            .put("content", Proto.optString(item, "output", "")));
+                            .put("content", outputText(item.opt("output"))));
                     continue;
                 }
+
                 String role = Proto.optString(item, "role", "user");
-                Object content = item.opt("content");
-                if (content == null) content = Proto.optString(item, "text", "");
+                if ("developer".equals(role)) role = "system";
+                Object content = plainContent(item.opt("content"));
+                if (content == null || "".equals(content)) {
+                    content = Proto.optString(item, "text", "");
+                }
                 msgs.add(new JSONObject().put("role", role).put("content", content));
             }
+            flushCalls(msgs, pendingCalls);
         }
         JSONArray chatMsgs = new JSONArray();
         for (JSONObject m : msgs) chatMsgs.put(m);
         chat.put("messages", chatMsgs);
+        /* 工具：Responses 与 Chat Completions 的 schema 不一样，必须转。
+         *
+         * Responses 原生格式（工具名和参数在**顶层**）：
+         *   {"type":"function","name":"bash","description":"…","parameters":{…}}
+         * Chat Completions 格式（多一层 function）：
+         *   {"type":"function","function":{"name":"bash","description":"…","parameters":{…}}}
+         *
+         * 以前这里只做 `converted.put(t)` 原样透传 —— 遇到 Responses 原生格式时，
+         * 上游收到的工具没有 function 字段，等价于"什么都没定义"，
+         * 模型于是回答"我没有可用的 bash 工具"。两种格式都得认。 */
         JSONArray toolArr = body.optJSONArray("tools");
         if (toolArr != null) {
             JSONArray converted = new JSONArray();
             for (int i = 0; i < toolArr.length(); i++) {
                 JSONObject t = toolArr.optJSONObject(i);
                 if (t == null) continue;
-                if ("function".equals(Proto.optString(t, "type", "function"))) {
-                    converted.put(t);
+                String type = Proto.optString(t, "type", "function");
+                if (!"function".equals(type)) continue;
+                JSONObject fn = t.optJSONObject("function");
+                if (fn != null) {
+                    converted.put(t);                       /* 已经是 Chat 格式 */
+                    continue;
                 }
+                /* 顶层写法 → 包进 function */
+                String tname = Proto.optString(t, "name", "");
+                if (tname.isEmpty()) continue;
+                JSONObject wrapped = new JSONObject();
+                wrapped.put("name", tname);
+                String desc = Proto.optString(t, "description", "");
+                if (!desc.isEmpty()) wrapped.put("description", desc);
+                JSONObject params = t.optJSONObject("parameters");
+                wrapped.put("parameters", params == null
+                        ? new JSONObject().put("type", "object").put("properties", new JSONObject())
+                        : params);
+                JSONObject outTool = new JSONObject();
+                outTool.put("type", "function");
+                outTool.put("function", wrapped);
+                converted.put(outTool);
             }
             if (converted.length() > 0) chat.put("tools", converted);
         }
         Proto.Req req = Fronts.OpenAiFront.parse(chat);
+        RequestCheck.check(req);
         if (Router.isVirtual(req.model)) {
             String real = resolveVirtual(req.model, req);
             if (real.isEmpty()) {
@@ -3809,6 +4201,17 @@ public final class Server {
             Fronts.Collector c = new Fronts.Collector();
             Proto.Sink sink = new Proto.Sink() {
                 private int seq = 0;
+                /*
+                 * output_index 分配：正文消息固定占 0，每个 function_call 从 1 递增。
+                 *
+                 * 以前全部硬编码 0 —— 那样客户端会把 function_call 当成"消息的第 N 个
+                 * content part"，而不是一个并列的 output item。Responses 协议里
+                 * output_index 才是 item 的标识，必须唯一。
+                 */
+                private int nextIndex = 1;
+                private final java.util.List<String> callIds = new java.util.ArrayList<>();
+                private final java.util.List<String> callNames = new java.util.ArrayList<>();
+                private final java.util.List<String> callArgs = new java.util.ArrayList<>();
 
                 private void event(String type, JSONObject payload) throws Exception {
                     payload.put("type", type);
@@ -3873,9 +4276,68 @@ public final class Server {
                     }
                 }
 
+                /* 工具调用的完整事件序列（4.32.1）。
+                   以前这个方法只有 c.toolCall(...) 一行，塞进 Collector 就完事，
+                   一个事件都不发给客户端 —— 走 /v1/responses 流式时工具调用被静默丢弃。 */
                 @Override
                 public void toolCall(String callId, String name, String argsJson) {
-                    c.toolCall(callId, name, argsJson);
+                    try {
+                        c.toolCall(callId, name, argsJson);
+                        Proto.Part part = null;
+                        for (int i = c.toolCalls.size() - 1; i >= 0; i--) {
+                            Proto.Part cand = c.toolCalls.get(i);
+                            if (cand != null && name != null && name.equals(cand.toolName)) {
+                                part = cand;
+                                break;
+                            }
+                        }
+                        if (part == null) return;
+                        String fixedArgs = part.argsJson == null ? "{}" : part.argsJson;
+                        String id = callId == null || callId.isEmpty() ? "fc_" + seq : callId;
+                        int idx = nextIndex++;
+                        callIds.add(id);
+                        callNames.add(name == null ? "" : name);
+                        callArgs.add(fixedArgs);
+
+                        ensureCreated();
+
+                        JSONObject item = new JSONObject();
+                        item.put("id", id);
+                        item.put("type", "function_call");
+                        item.put("status", "in_progress");
+                        item.put("call_id", id);
+                        item.put("name", name == null ? "" : name);
+                        item.put("arguments", "");
+                        JSONObject added = new JSONObject();
+                        added.put("output_index", idx);
+                        added.put("item", item);
+                        event("response.output_item.added", added);
+
+                        JSONObject d = new JSONObject();
+                        d.put("item_id", id);
+                        d.put("output_index", idx);
+                        d.put("delta", fixedArgs);
+                        event("response.function_call_arguments.delta", d);
+
+                        JSONObject dn = new JSONObject();
+                        dn.put("item_id", id);
+                        dn.put("output_index", idx);
+                        dn.put("arguments", fixedArgs);
+                        event("response.function_call_arguments.done", dn);
+
+                        JSONObject doneItem = new JSONObject();
+                        doneItem.put("id", id);
+                        doneItem.put("type", "function_call");
+                        doneItem.put("status", "completed");
+                        doneItem.put("call_id", id);
+                        doneItem.put("name", name == null ? "" : name);
+                        doneItem.put("arguments", fixedArgs);
+                        JSONObject doneEv = new JSONObject();
+                        doneEv.put("output_index", idx);
+                        doneEv.put("item", doneItem);
+                        event("response.output_item.done", doneEv);
+                    } catch (Exception ignored) {
+                    }
                 }
 
                 @Override
@@ -3889,11 +4351,45 @@ public final class Server {
                         done.put("content_index", 0);
                         done.put("text", c.text.toString());
                         event("response.output_text.done", done);
+
+                        JSONObject msgItem = new JSONObject();
+                        msgItem.put("id", "msg_" + respId);
+                        msgItem.put("type", "message");
+                        msgItem.put("role", "assistant");
+                        msgItem.put("status", "completed");
+                        JSONArray mc = new JSONArray();
+                        if (c.text.length() > 0) {
+                            mc.put(new JSONObject().put("type", "output_text")
+                                    .put("text", c.text.toString())
+                                    .put("annotations", new JSONArray()));
+                        }
+                        msgItem.put("content", mc);
+                        JSONObject msgDone = new JSONObject();
+                        msgDone.put("output_index", 0);
+                        msgDone.put("item", msgItem);
+                        event("response.output_item.done", msgDone);
+
+                        /* completed 里必须带完整 output：忽略增量、只看最终对象的
+                           客户端（不少 SDK 的兜底路径）否则完全看不到工具调用。 */
+                        JSONArray output = new JSONArray();
+                        output.put(msgItem);
+                        for (int i = 0; i < callIds.size(); i++) {
+                            JSONObject fc = new JSONObject();
+                            fc.put("id", callIds.get(i));
+                            fc.put("type", "function_call");
+                            fc.put("status", "completed");
+                            fc.put("call_id", callIds.get(i));
+                            fc.put("name", callNames.get(i));
+                            fc.put("arguments", callArgs.get(i));
+                            output.put(fc);
+                        }
+
                         JSONObject resp = new JSONObject();
                         resp.put("id", respId);
                         resp.put("object", "response");
                         resp.put("status", "completed");
                         resp.put("model", req.model);
+                        resp.put("output", output);
                         JSONObject umeta = new JSONObject();
                         umeta.put("input_tokens", c.usage.input);
                         umeta.put("output_tokens", c.usage.output);

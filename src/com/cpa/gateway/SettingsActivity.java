@@ -75,7 +75,14 @@ public class SettingsActivity extends Activity {
         portInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         serverCard.addView(portInput);
         serverCard.addView(Ui.label(this, "客户端密钥"), Ui.lp(this, 12));
-        keyInput = Ui.field(this, "客户端要填这个", cfg.apiKey, false);
+        /* 设置页**不再**把当前 Key 回填进输入框。
+           原因（真机）：以前这里是 cfg.apiKey 直接塞进去，而 apiKey 的默认值是
+           构造时随机生成的 "sk-cpa-local-xxxxxx"，第一次保存就落盘，于是这个
+           "随机默认值"被当成用户设过的 Key 一直读回来——用户把输入框清空、点保存，
+           下次进来又被填满，看起来"清都清不空"，而且客户端不带 Key 一律 401。
+           现在：没 Key 就显示空框（占位文字说明可以不填），有 Key 才回填。
+           清空并保存 = 真正关闭本机校验（局域网模式仍强制要求，见 Server）。 */
+        keyInput = Ui.field(this, "留空＝本机不校验（局域网访问必须填）", cfg.apiKey, false);
         // 密钥默认遮蔽：以前是明文显示，设置页一打开（或截屏、被旁人扫一眼）就暴露了。
         // 同时给一个「显示」按钮 —— 否则用户没法核对到底填对了没有。
         applyKeyMask(true);
@@ -317,10 +324,18 @@ public class SettingsActivity extends Activity {
                 cfg.apiKeyAliases.add(cfg.apiKey);
             }
         }
+        boolean keyCleared = newKey.isEmpty() && cfg.keyRequired();
         cfg.apiKey = newKey;
         cfg.lanAccess = lanSwitch.isChecked();
         cfg.autostart = autostartSwitch.isChecked();
         cfg.keepAlive = keepAliveSwitch.isChecked();
+        if (keyCleared && cfg.lanAccess) {
+            /* 局域网模式下没有 Key 会被 Server 直接 401 拒绝整个请求（那是有意的），
+               这里先把话说清楚，不要让用户以为"保存成功了但客户端连不上"是 bug。 */
+            toast("局域网访问已开启，必须填写客户端密钥，否则所有请求都会被拒绝");
+        } else if (keyCleared) {
+            toast("已清空客户端密钥：本机回环不再校验，客户端不填 Key 也能连");
+        }
         Gateway.save(this);
         if (cfg.keepAlive) KeepAliveJobService.schedule(this);
         else KeepAliveJobService.cancel(this);

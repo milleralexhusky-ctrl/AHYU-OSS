@@ -96,6 +96,11 @@ final class ToolFix {
         return inner.trim();
     }
 
+    /** 同 firstBalancedObject，供 {@link ToolCallText} 复用（正文提取要走同一套配平逻辑）。 */
+    static String firstObjectPublic(String s) {
+        return firstBalancedObject(s);
+    }
+
     /** 从一堆废话里取出第一个括号配平的 {…}。 */
     private static String firstBalancedObject(String s) {
         int start = s.indexOf('{');

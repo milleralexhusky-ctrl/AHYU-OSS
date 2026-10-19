@@ -220,6 +220,20 @@ public final class Proto {
         default String seenText() {
             return "";
         }
+
+        /**
+         * 上游返回的响应 ID（4.36.0）。
+         *
+         * 为什么要它：上游报错时给的那个 requestId 是排查的**唯一键**——
+         * 之前查 11128 就是靠发现"五次回包的 requestId 一模一样"，
+         * 才断定上游根本不看我们发的东西。但那个 ID 以前只活在日志里，
+         * 重启就没了，每次都得重新抓包。
+         *
+         * 现在各渠道解析到这个 ID 就上报一次，落进 usage.tsv。
+         * 不强制实现：有些渠道压根不返回 ID。
+         */
+        default void responseId(String id) {
+        }
     }
 
     public interface Upstream {

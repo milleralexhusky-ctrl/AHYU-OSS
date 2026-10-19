@@ -62,6 +62,21 @@ public final class Stats {
         public double cost;    // 衰减加权单次成本（美元），未知为 0
         public double w;       // 累计权重（≈"有效样本数"），用来判断上面三个估计有多可信
         public int n;          // 成功样本数
+
+        /*
+         * 下面三个是 4.32.0 新增的**内容侧**观察值，只记录、暂不参与打分。
+         *
+         * 为什么不直接进 score()：score() 的权重是经过多轮真机调过的，
+         * 在没有对照数据之前改权重，等于用一个未验证的信号去干扰一个已验证的排序。
+         * 先攒够样本，再决定要不要让它影响选路 —— 这也符合"先只读、看清了再做"的顺序。
+         *
+         * 注意 wContent 是"带内容信号的行数"：4.32.0 之前写的行没有这三列，
+         * 它们的 outChars/toolCall 读出来是 0/false，不能算进分母，否则会低估。
+         */
+        public double contentRate;   // 有效内容率：outChars>0 的占比（只统计有该信号的样本）
+        public double toolRate;      // 工具调用率：真吐了结构化 tool_calls 的占比
+        public double truncRate;     // 截断率：stopReason=length 的占比
+        public double wContent;      // 上面三个估计的有效样本权重
     }
 
     private static volatile Map<String, Seed> TABLE = Collections.emptyMap();
@@ -166,7 +181,14 @@ public final class Stats {
                     list = new ArrayList<>();
                     acc.put(key, list);
                 }
-                list.add(new Point(ts, ok, ms, tokIn, tokOut));
+                /* 新三列（4.32.0）：输出字符数 / 工具调用 / 结束原因。
+                   旧行只有 9 列，这里 hasContent=false，聚合时会跳过它们的分母。 */
+                boolean hasContent = c.length >= 12;
+                int outChars = hasContent ? (int) parseLong(c[9]) : 0;
+                boolean toolCall = hasContent && "1".equals(c[10]);
+                String stopReason = hasContent && c[11] != null ? c[11] : "";
+                list.add(new Point(ts, ok, ms, tokIn, tokOut,
+                        hasContent, outChars, toolCall, stopReason));
             }
         } finally {
             try {
@@ -224,6 +246,25 @@ public final class Stats {
             s.cost = wCost > 0 ? vCost / wCost : 0;
             s.w = wOk;
             s.n = nOk;
+            /* 内容侧三个比率：只用带新列的行做分母。
+               混进旧行会把"没记录"算成"没内容"，凭空制造出一堆 0。 */
+            double cw = 0, cNonEmpty = 0, cTool = 0, cTrunc = 0;
+            for (Point p : pts) {
+                if (!p.hasContent) continue;
+                double age = newest - p.ts;
+                double w = Math.pow(0.5, age / HALF_LIFE_S);
+                if (w < 1e-4) w = 1e-4;
+                cw += w;
+                if (p.outChars > 0) cNonEmpty += w;
+                if (p.toolCall) cTool += w;
+                if ("length".equals(p.stopReason)) cTrunc += w;
+            }
+            s.wContent = cw;
+            if (cw > 0) {
+                s.contentRate = cNonEmpty / cw;
+                s.toolRate = cTool / cw;
+                s.truncRate = cTrunc / cw;
+            }
             out.put(e.getKey(), s);
         }
         return out;
@@ -250,13 +291,27 @@ public final class Stats {
         final long ms;
         final long tokIn;
         final long tokOut;
+        /* 4.32.0 内容信号；hasContent=false 表示这行是旧格式（没有这三列） */
+        final boolean hasContent;
+        final int outChars;
+        final boolean toolCall;
+        final String stopReason;
 
         Point(long ts, boolean ok, long ms, long tokIn, long tokOut) {
+            this(ts, ok, ms, tokIn, tokOut, false, 0, false, "");
+        }
+
+        Point(long ts, boolean ok, long ms, long tokIn, long tokOut,
+              boolean hasContent, int outChars, boolean toolCall, String stopReason) {
             this.ts = ts;
             this.ok = ok;
             this.ms = ms;
             this.tokIn = tokIn;
             this.tokOut = tokOut;
+            this.hasContent = hasContent;
+            this.outChars = outChars;
+            this.toolCall = toolCall;
+            this.stopReason = stopReason == null ? "" : stopReason;
         }
     }
 }

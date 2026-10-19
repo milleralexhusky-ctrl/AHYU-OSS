@@ -441,20 +441,44 @@ public final class Trae {
         for (Proto.Msg m : req.messages) {
             StringBuilder text = new StringBuilder();
             JSONArray toolCalls = new JSONArray();
+            /* tool 消息必须带上它回答的是哪个调用，否则上游报
+                 An assistant message with 'tool_calls' must be followed by tool messages
+                 responding to each 'tool_call_id'. Unexpected tool_call_id:
+               以前这里只拼了正文，tool_call_id 完全没发出去。 */
+            String toolCallId = null;
+            String toolName = null;
             for (Proto.Part part : m.parts) {
                 if (Proto.Part.TEXT.equals(part.type)) text.append(part.text == null ? "" : part.text);
-                else if (Proto.Part.TOOL_RESULT.equals(part.type)) text.append(part.text == null ? "" : part.text);
+                else if (Proto.Part.TOOL_RESULT.equals(part.type)) {
+                    text.append(part.text == null ? "" : part.text);
+                    if (part.toolCallId != null && !part.toolCallId.isEmpty()) {
+                        toolCallId = part.toolCallId;
+                        toolName = part.toolName;
+                    }
+                }
                 else if (Proto.Part.TOOL_CALL.equals(part.type)) {
                     JSONObject fn = new JSONObject();
                     fn.put("name", part.toolName == null ? "" : part.toolName);
                     fn.put("arguments", part.argsJson == null ? "{}" : part.argsJson);
                     JSONObject call = new JSONObject();
                     call.put("id", part.toolCallId == null ? "" : part.toolCallId);
+                    /* type 必须显式给 "function"。
+                       这条铁证来自上游自己：
+                         The parameter `messages.tool_calls.type` specified in the request
+                         are not valid: invalid value: ``, value must be `function`
+                       以前不写 type，上游按空值校验，整个请求被拒（4027），
+                       表现就是"本轮没有产生任何内容"。 */
+                    call.put("type", "function");
                     call.put("function_call", fn);
                     toolCalls.put(call);
                 }
             }
-            messages.put(message(m.role, text.toString(), toolCalls.length() > 0 ? toolCalls : null));
+            JSONObject msg = message(m.role, text.toString(), toolCalls.length() > 0 ? toolCalls : null);
+            if (toolCallId != null) {
+                msg.put("tool_call_id", toolCallId);
+                if (toolName != null && !toolName.isEmpty()) msg.put("name", toolName);
+            }
+            messages.put(msg);
         }
         body.put("messages", messages);
         if (req.temperature != null) body.put("temperature", req.temperature.doubleValue());
@@ -522,8 +546,18 @@ public final class Trae {
                     sink.finish(stopReason, usage);
                 }
             };
+            LAST_TRACE.remove();
             traeStream(AGENT_HOST + EP_CHAT, soloHeaders(acc, true), body, probe);
-            if (!sawAnything[0]) Log.w("trae 本轮没有产生任何内容，原始流可能换了结构");
+            if (!sawAnything[0]) {
+                Log.w("trae 本轮没有产生任何内容，原始流可能换了结构");
+                /* 把原始帧留样：这是"照着它的结构来"唯一可靠的依据。
+                   日志里只有一句结论，rawcap.log 里才有它真正的帧。 */
+                String trace = LAST_TRACE.get();
+                RawCap.note("trae-empty-stream",
+                        p.name + " | " + model + " | tools=" + (req.tools == null ? 0 : req.tools.size()),
+                        trace == null ? "(没有收到任何帧)" : trace);
+            }
+            LAST_TRACE.remove();
         }
     }
 
@@ -533,14 +567,24 @@ public final class Trae {
      *   event:token_usage data:{"prompt_tokens":…,"completion_tokens":…}
      *   event:done        data:{"finish_reason":"stop"}
      */
+    /** 本轮 Trae 原始帧（只用一次，读完即弃）。 */
+    private static final ThreadLocal<String> LAST_TRACE = new ThreadLocal<>();
+
     static void traeStream(String endpoint, Map<String, String> headers, JSONObject body, Proto.Sink sink) throws Exception {
         final Proto.Usage usage = new Proto.Usage();
         final String[] finish = {""};
         final TreeMap<Integer, JSONObject> toolAcc = new TreeMap<>();
         final String[] event = {""};
+        final boolean[] idReported = {false};
+        /* 4.33.1：留一份原始帧。本轮结束时如果什么都没产出，就把这份原始流写进
+           rawcap.log —— 那句"原始流可能换了结构"只有配上真实帧才有意义。 */
+        final StringBuilder rawTrace = new StringBuilder();
 
         Upstreams.postStream(endpoint, headers, body, line -> {
             String t = line == null ? "" : line.trim();
+            if (rawTrace.length() < 8192 && !t.isEmpty()) {
+                rawTrace.append(t).append('\n');
+            }
             if (t.isEmpty() || t.startsWith(":")) return;
             if (t.startsWith("event:")) {
                 event[0] = t.substring(6).trim();
@@ -556,6 +600,18 @@ public final class Trae {
                 return;
             }
             String name = event[0];
+            /* 4.36.0：把上游的 requestId 报上去。
+               Trae 出错时整条错误就挂在 requestId 上（排查 11128 全靠它），
+               以前它只进日志、重启即失。 */
+            if (!idReported[0]) {
+                String rid = Proto.optString(ev, "requestId", "");
+                if (rid.isEmpty()) rid = Proto.optString(ev, "request_id", "");
+                if (rid.isEmpty() && "error".equals(name)) rid = Proto.optString(ev, "id", "");
+                if (!rid.isEmpty()) {
+                    idReported[0] = true;
+                    sink.responseId(rid);
+                }
+            }
             if ("output".equals(name) || name.isEmpty()) {
                 String text = Proto.optString(ev, "response", "");
                 if (!text.isEmpty()) sink.text(text);
@@ -597,6 +653,7 @@ public final class Trae {
             }
         });
 
+        LAST_TRACE.set(rawTrace.toString());
         for (JSONObject acc : toolAcc.values()) {
             String id = Proto.optString(acc, "id", "");
             if (id.isEmpty()) id = "call_" + Math.abs(System.nanoTime() % 1000000);

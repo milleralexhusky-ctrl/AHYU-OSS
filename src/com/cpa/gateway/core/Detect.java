@@ -847,7 +847,7 @@ public final class Detect {
         if ((code == 11128 || w.contains("conversation id missing"))
                 && (w.contains("channel verification") || w.contains("official client")
                     || w.contains("request illegal") || w.contains("conversation id missing"))) {
-            return "渠道校验拒绝（上游要求官方客户端，改请求形状无效）";
+            return "渠道校验拒绝（上游要求官方客户端；已试过国际版身份，仍被拒就换号或重新登录）";
         }
         if (code == 11103 || msg.contains("not supported") || msg.contains("unsupported")) {
             return "该模型上游不支持";

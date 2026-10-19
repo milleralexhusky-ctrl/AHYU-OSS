@@ -64,6 +64,11 @@ public class LogActivity extends Activity {
         TextView usage = Ui.ghostButton(this, "用量");
         usage.setOnClickListener(v -> usageDialog());
         actions.addView(usage);
+        /* 4.35.1 行为画像：哪个渠道靠得住、哪个给了工具却不调。
+           数据来自 usage.tsv 的质量列，不需要额外发请求。 */
+        TextView profile = Ui.ghostButton(this, "画像");
+        profile.setOnClickListener(v -> profileDialog());
+        actions.addView(profile);
         TextView probe = Ui.ghostButton(this, "探活");
         probe.setOnClickListener(v -> {
             Log.i("运行中=" + Gateway.isRunning() + " 端口=" + Gateway.runningPort());
@@ -205,6 +210,18 @@ public class LogActivity extends Activity {
     }
 
     /** 用量明细：近 7 天，按接口 / 渠道 / 模型 / 天各列前几名。 */
+    /** 行为画像：按渠道/模型看可用率、空回复、工具失败率。 */
+    private void profileDialog() {
+        try {
+            String text = com.cpa.gateway.core.QualityStats.report(7);
+            LinearLayout box = Ui.column(this);
+            box.addView(Ui.label(this, text));
+            Ui.dialog(this, "行为画像", Ui.scroller(this, box), "关闭", null, null, null);
+        } catch (Throwable t) {
+            Ui.dialog(this, "行为画像", Ui.label(this, "统计失败：" + t), "关闭", null, null, null);
+        }
+    }
+
     private void usageDialog() {
         if (usageLine != null) usageLine.setText("今日 " + com.cpa.gateway.core.Usage.line(1));
         com.cpa.gateway.core.Usage.Summary s = com.cpa.gateway.core.Usage.summary(7);

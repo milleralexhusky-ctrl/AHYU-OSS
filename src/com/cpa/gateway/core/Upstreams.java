@@ -545,7 +545,8 @@ public final class Upstreams {
         final TreeMap<Integer, JSONObject> toolAcc = new TreeMap<>();
         final Proto.Usage usage = new Proto.Usage();
         final String[] finish = {""};
-        final boolean[] wrote = {false};      // 内容是否已经流给客户端（决定坏 tool_call 能不能重来）
+        final boolean[] wrote = {false};
+        final boolean[] idReported = {false};      // 内容是否已经流给客户端（决定坏 tool_call 能不能重来）
 
         postStream(endpoint, headers, body, line -> {
             // HTTP 200 也可能是错误。两种形态都要挡：
@@ -566,6 +567,15 @@ public final class Upstreams {
             if (chunk == null) return;
             if (chunk.opt("error") != null) {
                 raiseUpstreamBodyError(chunk.toString());
+            }
+            /* 4.36.0：把上游的响应 id 报上去（OpenAI 兼容流每个 chunk 都带它）。
+               只报第一个非空的，后面重复的不必再传。 */
+            if (!idReported[0]) {
+                String rid = Proto.optString(chunk, "id", "");
+                if (!rid.isEmpty()) {
+                    idReported[0] = true;
+                    sink.responseId(rid);
+                }
             }
             JSONObject u = chunk.optJSONObject("usage");
             if (u != null) {
