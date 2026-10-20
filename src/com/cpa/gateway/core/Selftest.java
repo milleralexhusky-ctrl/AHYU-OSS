@@ -78,6 +78,7 @@ public final class Selftest {
         add(out, "入口解析保留工具结果 id（OpenAI/Anthropic/Gemini）", Selftest::checkFrontToolResults);
         add(out, "Ollama 请求翻译与响应形状", Selftest::checkOllamaProtocol);
         add(out, "同协议未知参数透传（top_k/service_tier/metadata）", Selftest::checkExtraBody);
+        add(out, "响应保真透传（logprobs / 多 choice / 正文不被改写）", Selftest::checkRawFidelity);
         return out;
     }
 
@@ -1032,6 +1033,82 @@ public final class Selftest {
         } catch (Throwable t) {
             return "未知参数透传自检异常：" + t;
         }
+    }
+
+    /**
+     * 响应保真（4.50.0）：n>1 / logprobs 的请求，上游回什么就该给客户端什么。
+     *
+     * 这条只测纯函数部分：把上游分片喂给 Streamer 的 raw 入口，检查
+     *   · role 空壳先压住（失败换号时客户端不该看到半截流）；
+     *   · 多 choice 与 logprobs 原样出现；
+     *   · model 改写成客户端请求的名字；
+     *   · 要 logprobs 时正文一个字符都不删（删了 token 与概率就错位）；
+     *   · [DONE] 由网关补一次，且不会重复。
+     */
+    private static String checkRawFidelity() throws Exception {
+        /* 请求侧：n / logprobs / top_logprobs 必须真的发给上游。 */
+        JSONObject reqBody = new JSONObject();
+        reqBody.put("model", "m");
+        reqBody.put("messages", new JSONArray().put(new JSONObject()
+                .put("role", "user").put("content", "hi")));
+        reqBody.put("n", 2);
+        reqBody.put("logprobs", true);
+        reqBody.put("top_logprobs", 3);
+        Proto.Req parsed = Fronts.OpenAiFront.parse(reqBody);
+        JSONObject sent = Upstreams.openAiBody("up-m", parsed, true);
+        if (sent.optInt("n", 0) != 2) return "请求侧 n 没透传";
+        if (!sent.optBoolean("logprobs", false)) return "请求侧 logprobs 没透传";
+        if (sent.optInt("top_logprobs", 0) != 3) return "请求侧 top_logprobs 没透传";
+
+        java.io.StringWriter sw = new java.io.StringWriter();
+        Fronts.OpenAiFront.Streamer s = new Fronts.OpenAiFront.Streamer(
+                new java.io.BufferedWriter(sw), "client-model", false);
+
+        /* 只有 role 的空壳：先不写出去。 */
+        JSONObject role = new JSONObject();
+        role.put("id", "up-1");
+        role.put("choices", new JSONArray().put(new JSONObject()
+                .put("index", 0).put("delta", new JSONObject().put("role", "assistant"))));
+        s.rawChunk(role);
+        if (!sw.toString().isEmpty()) {
+            return "只有 role 的分片被提前写出（换号时客户端会看到半截流）";
+        }
+
+        /* 两个 choice + logprobs + 自报家门正文。 */
+        JSONObject chunk = new JSONObject();
+        chunk.put("id", "up-1");
+        chunk.put("model", "upstream-model");
+        JSONArray choices = new JSONArray();
+        JSONObject c0 = new JSONObject();
+        c0.put("index", 0);
+        c0.put("delta", new JSONObject().put("content", "我是DeepSeek，答案甲"));
+        c0.put("logprobs", new JSONObject().put("content", new JSONArray()));
+        choices.put(c0);
+        JSONObject c1 = new JSONObject();
+        c1.put("index", 1);
+        c1.put("delta", new JSONObject().put("content", "答案乙"));
+        c1.put("logprobs", new JSONObject().put("content", new JSONArray()));
+        choices.put(c1);
+        chunk.put("choices", choices);
+        s.rawChunk(chunk);
+        s.rawDone();
+        s.finish("stop", new Proto.Usage());
+
+        String out = sw.toString();
+        if (!out.contains("\"index\":1")) return "第二个 choice 没透传";
+        if (!out.contains("\"logprobs\"")) return "logprobs 没透传";
+        if (!out.contains("我是DeepSeek，答案甲")) {
+            return "要 logprobs 时正文被改写了（token 与概率会错位）";
+        }
+        if (!out.contains("\"model\":\"client-model\"")) return "model 没改写成客户端请求的名字";
+        if (!out.contains("data: [DONE]")) return "[DONE] 没补";
+        int done = out.split("data: \\[DONE\\]", -1).length - 1;
+        if (done != 1) return "[DONE] 出现了 " + done + " 次";
+        /* 不能出现 canonical 的补写收尾（否则客户端会收到一个多余的空 delta）。 */
+        if (out.contains("\"finish_reason\":\"stop\"")) {
+            return "保真模式仍补写了 canonical 收尾分片";
+        }
+        return null;
     }
 
     /** Ollama 是本地生态最常用的入口：翻译、工具配对、两种响应形状都要对。 */

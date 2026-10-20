@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.49.0**（versionCode 642，见 `version.properties`）
+- 当前版本：**4.50.0**（versionCode 643，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -128,6 +128,9 @@ docs/research/             协议调查脚本
 - 150 次 keep-alive 真机压测：`/v1/models` p50 0.77ms、`/health` 0.99ms、`/v1/capacity` 1.18ms。
 - 同协议转发时保留未建模字段（`top_k` / `service_tier` / `metadata` / `safetySettings` 等），
   不因网关不认识而丢掉；跨协议不硬塞。
+- 客户端要 `n>1`、`logprobs` / `top_logprobs` 或音频输出时，OpenAI 兼容渠道走
+  **响应原样透传**：多 choice、token 概率、`system_fingerprint` 不再被 canonical
+  合并掉；选路、换号、断流检测、用量统计照旧。普通请求仍走 canonical，行为不变。
 
 ## 资源占用
 

@@ -58,6 +58,18 @@ public final class Fronts {
         public final List<Proto.Part> toolCalls = new ArrayList<>();
         public final Proto.Usage usage = new Proto.Usage();
         public String stop = "stop";
+        /**
+         * 响应保真模式下上游给的完整响应体（4.50.0）。
+         *
+         * 非 null 表示这次走的是原样透传，Server 直接写它，不再用
+         * `render()` 重新拼——`n>1` 的多 choice、`logprobs` 都在里面。
+         */
+        public JSONObject rawBody;
+
+        @Override
+        public void rawBody(JSONObject body) {
+            rawBody = body;
+        }
 
         @Override
         public boolean sawToolCall() {
@@ -318,9 +330,28 @@ public final class Fronts {
             private String stop = "stop";
             private final boolean[] toolStarted = {false};
 
+            /* ---- 响应保真（4.50.0） ---- */
+            /** 这条流有没有真的透传过上游分片；有则 finish() 不再补 canonical 收尾。 */
+            private boolean rawWrote;
+            /** 上游明确给了 [DONE]；即使一个分片都没写，也别再补一条 canonical 收尾。 */
+            private boolean rawEnded;
+            /** 透传时是否去掉开头"我是 XX 模型"的自报家门。
+                要了 logprobs 就不能动正文——删字会让 token 与概率对不上。 */
+            private final boolean stripPersona;
+            /** 每个 choice 各自一份 stripper（n>1 时各 choice 的开头是独立的）。 */
+            private final java.util.Map<Integer, Persona.Stripper> rawStrippers =
+                    new java.util.HashMap<>();
+            /** 还没确认有正文的 role-only 分片：先压着，失败换号时客户端什么都没看到。 */
+            private final List<JSONObject> rawPending = new ArrayList<>();
+
             public Streamer(BufferedWriter w, String model) {
+                this(w, model, true);
+            }
+
+            public Streamer(BufferedWriter w, String model, boolean stripPersona) {
                 this.w = w;
                 this.model = model;
+                this.stripPersona = stripPersona;
             }
 
             /**
@@ -331,7 +362,90 @@ public final class Fronts {
              * roleSent 是第一个 chunk 的标记，拿它当"已提交"的判据最保守。
              */
             public boolean committed() {
-                return roleSent;
+                return roleSent || rawWrote;
+            }
+
+            /* ------------------------------------------------ 响应保真（4.50.0） */
+
+            /** 这个分片有没有"实质内容"（而不是只有 role 的空壳）。 */
+            private static boolean substantive(JSONObject chunk) {
+                JSONArray choices = chunk.optJSONArray("choices");
+                if (choices == null || choices.length() == 0) {
+                    /* 只有 usage 的收尾分片（OpenAI 在 include_usage 下会单独发一条）。 */
+                    return chunk.opt("usage") != null;
+                }
+                for (int i = 0; i < choices.length(); i++) {
+                    JSONObject c = choices.optJSONObject(i);
+                    if (c == null) continue;
+                    String fr = Proto.optString(c, "finish_reason", "");
+                    if (!fr.isEmpty() && !"null".equals(fr)) return true;
+                    JSONObject d = c.optJSONObject("delta");
+                    if (d == null) continue;
+                    if (!Proto.optString(d, "content", "").isEmpty()) return true;
+                    if (!Proto.optString(d, "reasoning_content", "").isEmpty()) return true;
+                    if (!Proto.optString(d, "reasoning", "").isEmpty()) return true;
+                    JSONArray tc = d.optJSONArray("tool_calls");
+                    if (tc != null && tc.length() > 0) return true;
+                }
+                return false;
+            }
+
+            /** 改写 model（客户端认得的是它请求的名字），按需去自报家门，然后原样写出。 */
+            private void writeRaw(JSONObject chunk) throws Exception {
+                try {
+                    chunk.put("model", model);
+                } catch (Exception ignored) {
+                }
+                if (stripPersona) {
+                    JSONArray choices = chunk.optJSONArray("choices");
+                    for (int i = 0; choices != null && i < choices.length(); i++) {
+                        JSONObject c = choices.optJSONObject(i);
+                        JSONObject d = c == null ? null : c.optJSONObject("delta");
+                        if (d == null) continue;
+                        String content = Proto.optString(d, "content", "");
+                        if (content.isEmpty()) continue;
+                        int idx = Proto.optInt(c, "index") == null ? i : Proto.optInt(c, "index").intValue();
+                        Persona.Stripper s = rawStrippers.get(idx);
+                        if (s == null) {
+                            s = new Persona.Stripper();
+                            rawStrippers.put(idx, s);
+                        }
+                        String cleaned = s.clean(content);
+                        if (cleaned != null && !cleaned.equals(content)) d.put("content", cleaned);
+                    }
+                }
+                sse(w, chunk.toString());
+            }
+
+            @Override
+            public void rawChunk(JSONObject chunk) {
+                if (chunk == null) return;
+                try {
+                    if (!rawWrote && !substantive(chunk)) {
+                        /* role 空壳先攒着。上游在真正出字前失败时，这些分片一个都
+                           没写出去，上层还能安静地换号，客户端不会看到半截流。 */
+                        rawPending.add(chunk);
+                        return;
+                    }
+                    if (!rawWrote) {
+                        for (JSONObject p : rawPending) writeRaw(p);
+                        rawPending.clear();
+                    }
+                    rawWrote = true;
+                    writeRaw(chunk);
+                } catch (Exception ignored) {
+                }
+            }
+
+            @Override
+            public void rawDone() {
+                if (rawEnded) return;
+                rawEnded = true;
+                try {
+                    sse(w, "[DONE]");
+                    w.flush();
+                } catch (Exception ignored) {
+                }
             }
 
             private void chunk(JSONObject delta, String finishReason) throws Exception {
@@ -419,6 +533,9 @@ public final class Fronts {
                 try {
                     stop = stopReason;
                     if (u != null) usage = u;
+                    /* 保真模式：上游的分片（含 finish_reason 与 usage）已经原样写出去了，
+                       这里只更新记账状态，别再补一条 canonical 收尾把客户端搞乱。 */
+                    if (rawWrote || rawEnded) return;
                     String fr = "length".equals(stop) ? "length" : (toolStarted[0] ? "tool_calls" : "stop");
                     chunk(new JSONObject(), fr);
                     JSONObject tail = new JSONObject();

@@ -153,6 +153,18 @@ public final class Proto {
         public final List<Tool> tools = new ArrayList<>();
         public boolean stream;
         /**
+         * 响应保真模式（4.50.0）：同协议、无工具时，把上游响应原样回给客户端。
+         *
+         * 只在客户端要的东西 canonical 表达不了时才打开（`n>1` 多候选、
+         * `logprobs`/`top_logprobs` token 概率、音频输出）。打开后上游拿到的
+         * 还是同一份请求，只是响应不再被拆成"一段正文 + 一次 finish"——
+         * 多 choice、logprobs、system_fingerprint 这些字段不再丢。
+         *
+         * 只对通用 OpenAI 兼容上游生效；别的渠道照旧走 canonical，
+         * 所以这个开关不会改变任何现有渠道的行为。
+         */
+        public boolean rawResponse;
+        /**
          * 重复请求计数的"本次请求"快照（4.37.0）。
          *
          * 一个客户端请求可能被同一个网关请求对象用于多个候选（换号重试），
@@ -251,6 +263,25 @@ public final class Proto {
          * 不强制实现：有些渠道压根不返回 ID。
          */
         default void responseId(String id) {
+        }
+
+        /* ---------------------------------------------------- 响应保真（4.50.0）
+         *
+         * 下面三个回调只有"同协议原始透传"才会用到。默认实现是空操作，
+         * 所以现有的渲染器、Collector、tap 包装器都不受影响。
+         * 走 canonical 的渠道永远不会调用它们；OpenAiUp 在 rawResponse
+         * 打开时才会调。 */
+
+        /** 一个上游 SSE data 块（已解析成 JSON），原样交给客户端。 */
+        default void rawChunk(JSONObject chunk) {
+        }
+
+        /** 非流式上游的完整响应体。 */
+        default void rawBody(JSONObject body) {
+        }
+
+        /** 流结束标记（对应上游的 `data: [DONE]`）。 */
+        default void rawDone() {
         }
     }
 

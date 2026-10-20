@@ -3580,6 +3580,69 @@ public final class Server {
                 if (id != null && !id.isEmpty() && cur != null) cur.upstreamResponseId = id;
                 inner.responseId(id);
             }
+
+            /* 响应保真（4.50.0）：原样透传的分片也要穿过这层记账包装，
+               否则 Streamer/Collector 永远收不到 raw 回调，客户端会拿到空响应。 */
+            @Override
+            public void rawChunk(JSONObject chunk) {
+                if (cur != null) {
+                    cur.lastUpstreamAt = System.currentTimeMillis();
+                    JSONArray choices = chunk.optJSONArray("choices");
+                    for (int i = 0; choices != null && i < choices.length(); i++) {
+                        JSONObject c = choices.optJSONObject(i);
+                        JSONObject d = c == null ? null : c.optJSONObject("delta");
+                        if (d == null) continue;
+                        String text = Proto.optString(d, "content", "");
+                        if (!text.isEmpty()) {
+                            cur.outChars += text.length();
+                            /* 质量判定看的是"正文有没有跑题/为空"，第一个 choice 就够。
+                               n>1 时把各 choice 拼在一起反而会误判。 */
+                            Integer idx = Proto.optInt(c, "index");
+                            if (idx == null || idx.intValue() == 0) {
+                                String hint = cur.seenTextHint;
+                                if (hint != null && hint.length() < 2000) {
+                                    cur.seenTextHint = hint + text;
+                                }
+                            }
+                        }
+                        JSONArray tc = d.optJSONArray("tool_calls");
+                        if (tc != null && tc.length() > 0) cur.sawToolCall = true;
+                    }
+                }
+                inner.rawChunk(chunk);
+            }
+
+            @Override
+            public void rawBody(JSONObject body) {
+                if (cur != null) {
+                    cur.lastUpstreamAt = System.currentTimeMillis();
+                    JSONArray choices = body.optJSONArray("choices");
+                    for (int i = 0; choices != null && i < choices.length(); i++) {
+                        JSONObject c = choices.optJSONObject(i);
+                        JSONObject m = c == null ? null : c.optJSONObject("message");
+                        if (m == null) continue;
+                        String text = Proto.optString(m, "content", "");
+                        if (!text.isEmpty()) {
+                            cur.outChars += text.length();
+                            Integer idx = Proto.optInt(c, "index");
+                            if (idx == null || idx.intValue() == 0) {
+                                String hint = cur.seenTextHint;
+                                if (hint != null && hint.length() < 2000) {
+                                    cur.seenTextHint = hint + text;
+                                }
+                            }
+                        }
+                        JSONArray tc = m.optJSONArray("tool_calls");
+                        if (tc != null && tc.length() > 0) cur.sawToolCall = true;
+                    }
+                }
+                inner.rawBody(body);
+            }
+
+            @Override
+            public void rawDone() {
+                inner.rawDone();
+            }
         };
         try {
             Upstreams.create(p).chat(upstreamModel, req, tap);
@@ -4622,6 +4685,19 @@ public final class Server {
         writeJson(out, 200, run.toString());
     }
 
+    /** 客户端要不要音频输出（Realtime 之外的 Chat Completions audio 模态）。 */
+    private static boolean wantsAudioOutput(JSONObject body) {
+        JSONArray modal = body.optJSONArray("modalities");
+        if (modal != null) {
+            for (int i = 0; i < modal.length(); i++) {
+                if ("audio".equalsIgnoreCase(String.valueOf(modal.opt(i)))) return true;
+            }
+        }
+        /* 有 audio 对象就是音频输出（format=text 的转写场景也走原样回传，
+           对 canonical 没有损失，但没必要为它多开一条路径）。 */
+        return body.has("audio");
+    }
+
     private void handleOpenAiChat(Req r, OutputStream out) throws Exception {
         JSONObject body;
         try {
@@ -4633,6 +4709,19 @@ public final class Server {
         Proto.Req req = Fronts.OpenAiFront.parse(body);
         RequestCheck.check(req);
         req.ephemeral = body.optBoolean("_ephemeral", false);
+        /* 响应保真（4.50.0）：只有"canonical 表达不了"的请求才走原样透传。
+         *  · n>1        —— 多候选会被 canonical 合并成一个 choice
+         *  · logprobs   —— token 概率在重组正文后无法对应
+         *  · 音频输出   —— canonical 只认文本
+         * 带工具的请求不走：工具参数修复 / 坏调用换号是网关的安全网，
+         * 而这几类响应字段和工具调用同时出现的场景极少。 */
+        boolean wantLogprobs = body.optBoolean("logprobs", false)
+                || body.has("top_logprobs");
+        boolean wantRaw = wantLogprobs
+                || body.optInt("n", 1) > 1
+                || wantsAudioOutput(body);
+        req.rawResponse = wantRaw && req.tools.isEmpty()
+                && !Router.isVirtual(req.model);
         if (Router.isVirtual(req.model)) {
             if (Router.AUTO_RACE.equalsIgnoreCase(req.model) && req.stream && req.tools.isEmpty()) {
                 serveRace(r, out, req);
@@ -4663,7 +4752,10 @@ public final class Server {
         }
         if (req.stream) {
             BufferedWriter w = startSse(out);
-            Fronts.OpenAiFront.Streamer streamer = new Fronts.OpenAiFront.Streamer(w, req.model);
+            /* 要 logprobs 时不能去"自报家门"：删字会让 token 与概率错位。
+               其余保真请求（n>1 / 音频）照常清理正文。 */
+            Fronts.OpenAiFront.Streamer streamer =
+                    new Fronts.OpenAiFront.Streamer(w, req.model, !wantLogprobs);
             Exception last = null;
             for (int i = 0; i < tries; i++) {
                 Config.Provider p = cands.get(i);
@@ -4721,7 +4813,12 @@ public final class Server {
                 try {
                     serve(req.model, p, um, req, c);
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
-                    writeJson(out, 200, Fronts.OpenAiFront.render(req.model, c));
+                    /* 保真模式拿到的是上游完整响应体：多 choice / logprobs 都在里面，
+                       不再用 canonical 重新拼。上游不支持保真时 rawBody 为 null，
+                       照旧走 render()，行为与以前完全一致。 */
+                    writeJson(out, 200, req.rawResponse && c.rawBody != null
+                            ? c.rawBody.toString()
+                            : Fronts.OpenAiFront.render(req.model, c));
                     return;
                 } catch (Exception e) {
                     recordDirectOutcome(p, um, req.ephemeral, t0, e);

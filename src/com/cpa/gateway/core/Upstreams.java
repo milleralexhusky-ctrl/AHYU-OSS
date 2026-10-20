@@ -471,12 +471,149 @@ public final class Upstreams {
 
         @Override
         public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
-            JSONObject body = openAiBody(model, req, true);
+            String endpoint = url(openAiBase(p.baseUrl), "chat/completions");
             Map<String, String> headers = new HashMap<>();
             if (!p.apiKey.isEmpty()) headers.put("Authorization", "Bearer " + p.apiKey);
             headers.putAll(webSessionHeaders(p));
-            openAiStream(url(openAiBase(p.baseUrl), "chat/completions"), headers, body, sink);
+            /* 响应保真（4.50.0）：同样是 OpenAI 形状，客户端要 n>1 / logprobs / 音频时
+               不再把响应拆成 canonical 的"一段正文"，而是原样回传。请求体还是同一份，
+               选路、限额、换号、用量统计都在外层照常工作。 */
+            if (req.rawResponse && "openai".equals(req.protocol)) {
+                if (req.stream) {
+                    rawOpenAiStream(endpoint, headers, openAiBody(model, req, true), sink);
+                } else {
+                    rawOpenAiCall(endpoint, headers, openAiBody(model, req, false),
+                            req.model == null || req.model.isEmpty() ? model : req.model, sink);
+                }
+                return;
+            }
+            openAiStream(endpoint, headers, openAiBody(model, req, true), sink);
         }
+    }
+
+    /* ---------------------------------------------------- 响应保真（4.50.0） */
+
+    /**
+     * 同协议流式原样透传。
+     *
+     * 与 {@link #openAiStream} 的区别只在"解读"：这里不把 delta 拆成 canonical 的
+     * text/thinking/toolCall，而是把每个 data 块交给客户端。多 choice、logprobs、
+     * system_fingerprint、音频分片这些字段因此完整保留。
+     *
+     * 仍然做的三件事（缺了就是后退）：
+     *  · 上游 200 里包着的 error 照样识别并抛 Throttled；
+     *  · 没等到 finish_reason / [DONE] 就断流 → 抛 IOException，让上层决定换号；
+     *  · usage / responseId 照样上报，用量统计不断。
+     */
+    static void rawOpenAiStream(String endpoint, Map<String, String> headers,
+                                JSONObject body, Proto.Sink sink) throws Exception {
+        final Proto.Usage usage = new Proto.Usage();
+        final String[] finish = {""};
+        final boolean[] doneSeen = {false};
+        final boolean[] doneSent = {false};
+        final boolean[] idReported = {false};
+        postStream(endpoint, headers, body, line -> {
+            String raw = line == null ? "" : line.trim();
+            if (raw.startsWith("{") && raw.contains("\"error\"")) {
+                try {
+                    JSONObject j = new JSONObject(raw);
+                    if (j.opt("error") != null) raiseUpstreamBodyError(raw);
+                } catch (org.json.JSONException notJson) {
+                    // 不是 JSON 就当普通行
+                }
+            }
+            if (raw.equals("data: [DONE]") || raw.equals("data:[DONE]")) {
+                doneSeen[0] = true;
+                if (!doneSent[0]) {
+                    doneSent[0] = true;
+                    sink.rawDone();
+                }
+                return;
+            }
+            JSONObject chunk = sseData(line);
+            if (chunk == null) return;
+            if (chunk.opt("error") != null) raiseUpstreamBodyError(chunk.toString());
+            if (!idReported[0]) {
+                String rid = Proto.optString(chunk, "id", "");
+                if (!rid.isEmpty()) {
+                    idReported[0] = true;
+                    sink.responseId(rid);
+                }
+            }
+            JSONObject u = chunk.optJSONObject("usage");
+            if (u != null) {
+                applyUsage(usage, u, "prompt_tokens", "completion_tokens", "cached_tokens");
+                JSONObject details = u.optJSONObject("prompt_tokens_details");
+                if (details != null) {
+                    Integer c = Proto.optInt(details, "cached_tokens");
+                    if (c != null) usage.cached = c;
+                }
+            }
+            JSONArray choices = chunk.optJSONArray("choices");
+            if (choices != null) {
+                for (int i = 0; i < choices.length(); i++) {
+                    JSONObject c = choices.optJSONObject(i);
+                    String fr = c == null ? "" : Proto.optString(c, "finish_reason", "");
+                    if (!fr.isEmpty() && !"null".equals(fr)) {
+                        finish[0] = fr;
+                        doneSeen[0] = true;
+                    }
+                }
+            }
+            sink.rawChunk(chunk);
+        });
+        if (!doneSeen[0]) {
+            Log.w("上游流在 finish_reason/[DONE] 之前结束（保真模式），判定为连接中断");
+            throw new java.io.IOException("upstream stream ended before finish_reason");
+        }
+        if (!doneSent[0]) {
+            doneSent[0] = true;
+            sink.rawDone();
+        }
+        sink.finish(Proto.canonicalStop(finish[0], false), usage);
+    }
+
+    /** 同协议非流式原样透传：一次完整响应，字段一个不动。 */
+    static void rawOpenAiCall(String endpoint, Map<String, String> headers,
+                              JSONObject body, String clientModel, Proto.Sink sink) throws Exception {
+        /* 不用 postJson 的 60 秒读超时：非流式的长回答/推理本来就可能超过一分钟，
+           超时会被上层当成通道故障换号，等于把一次正常请求白打掉。 */
+        String resp = Http.call("POST", endpoint, headers,
+                body.toString().getBytes(StandardCharsets.UTF_8), "application/json",
+                10000, 300000, true).body;
+        JSONObject j;
+        try {
+            j = new JSONObject(resp);
+        } catch (Exception e) {
+            throw new IllegalStateException("上游返回非 JSON：" + shorten(resp));
+        }
+        if (j.opt("error") != null) raiseUpstreamBodyError(resp);
+        /* 与流式路径一致：客户端认的是它请求的名字（可能带账号前缀），
+           不是上游内部的实际模型名。 */
+        try {
+            j.put("model", clientModel);
+        } catch (Exception ignored) {
+        }
+        String rid = Proto.optString(j, "id", "");
+        if (!rid.isEmpty()) sink.responseId(rid);
+        Proto.Usage usage = new Proto.Usage();
+        JSONObject u = j.optJSONObject("usage");
+        if (u != null) {
+            applyUsage(usage, u, "prompt_tokens", "completion_tokens", "cached_tokens");
+            JSONObject details = u.optJSONObject("prompt_tokens_details");
+            if (details != null) {
+                Integer c = Proto.optInt(details, "cached_tokens");
+                if (c != null) usage.cached = c;
+            }
+        }
+        String finish = "";
+        JSONArray choices = j.optJSONArray("choices");
+        if (choices != null && choices.length() > 0) {
+            JSONObject c0 = choices.optJSONObject(0);
+            finish = c0 == null ? "" : Proto.optString(c0, "finish_reason", "");
+        }
+        sink.rawBody(j);
+        sink.finish(Proto.canonicalStop(finish, false), usage);
     }
 
     /**
