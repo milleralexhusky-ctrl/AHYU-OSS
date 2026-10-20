@@ -921,6 +921,28 @@ public final class Server {
                 long netT0 = android.os.SystemClock.uptimeMillis();
                 Req r = readRequest(in);
                 if (r == null) break;
+                /* Realtime：HTTP Upgrade 后整条连接交给 WebSocket 循环，不能再按
+                   普通 keep-alive 请求处理。 */
+                if (r.header("upgrade").toLowerCase(Locale.US).contains("websocket")) {
+                    if (!"/v1/realtime".equals(r.path)) {
+                        writeError(out, r.path, 404, "unknown websocket route: " + r.path);
+                        break;
+                    }
+                    String wsUsed = usedKey(r);
+                    boolean wsHasKey = config.apiKey != null && !config.apiKey.isEmpty();
+                    if ((config.lanAccess && !wsHasKey) || (wsHasKey && wsUsed.isEmpty())) {
+                        Log.w("Realtime 鉴权失败：客户端 Key 与服务端不一致");
+                        writeError(out, r.path, 401, "invalid api key");
+                        break;
+                    }
+                    try {
+                        Realtime.handle(s, in, out, r, config);
+                    } catch (Throwable t) {
+                        Log.w("Realtime 连接异常：" + t);
+                    }
+                    conn.keepAlive = false;
+                    break;
+                }
                 long netT1 = android.os.SystemClock.uptimeMillis();
                 served++;
                 conn.keepAlive = r.keepAlive;
@@ -4255,9 +4277,47 @@ public final class Server {
                         writeJson(out, 200, Assistants.listObject(steps).toString());
                         return;
                     }
-                    if (parts.length == 2 && "submit_tool_outputs".equals(parts[1])) {
-                        writeError(out, path, 400,
-                                "AHYU 的 Assistants 兼容层暂不支持工具调用（requires_action）");
+                    if (parts.length == 2 && "submit_tool_outputs".equals(parts[1])
+                            && "POST".equals(method)) {
+                        JSONObject body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                        JSONObject run = Assistants.getRun(tid, rid);
+                        if (!"requires_action".equals(run.optString("status"))) {
+                            writeError(out, path, 400, "run 当前不在 requires_action 状态");
+                            return;
+                        }
+                        JSONArray outputs = body.optJSONArray("tool_outputs");
+                        if (outputs == null || outputs.length() == 0) {
+                            writeError(out, path, 400, "缺少 tool_outputs");
+                            return;
+                        }
+                        for (int i = 0; i < outputs.length(); i++) {
+                            JSONObject o = outputs.optJSONObject(i);
+                            if (o == null) continue;
+                            Assistants.addToolOutput(tid,
+                                    Proto.optString(o, "tool_call_id", ""),
+                                    Proto.optString(o, "output", ""));
+                        }
+                        run.put("status", "in_progress");
+                        run.put("required_action", JSONObject.NULL);
+                        Assistants.updateRun(tid, run);
+                        JSONObject assistant = null;
+                        try {
+                            String aid = run.optString("assistant_id", "");
+                            if (!aid.isEmpty()) assistant = Assistants.getAssistant(aid);
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            run = runAssistantChat(tid, run, assistant);
+                        } catch (Throwable t) {
+                            run.put("status", "failed");
+                            run.put("failed_at", System.currentTimeMillis() / 1000);
+                            JSONObject err = new JSONObject();
+                            err.put("code", "server_error");
+                            err.put("message", String.valueOf(t.getMessage()));
+                            run.put("last_error", err);
+                            Assistants.updateRun(tid, run);
+                        }
+                        writeAssistantsRun(out, body, run);
                         return;
                     }
                 }
@@ -4315,62 +4375,7 @@ public final class Server {
         Assistants.updateRun(threadId, run);
 
         try {
-            JSONArray messages = new JSONArray();
-            if (!instructions.isEmpty()) {
-                messages.put(new JSONObject().put("role", "system").put("content", instructions));
-            }
-            JSONArray history = Assistants.modelMessages(threadId);
-            for (int i = 0; i < history.length(); i++) messages.put(history.opt(i));
-            if (messages.length() == 0) {
-                messages.put(new JSONObject().put("role", "user").put("content", ""));
-            }
-            JSONObject chat = new JSONObject();
-            chat.put("model", model);
-            chat.put("messages", messages);
-            chat.put("stream", false);
-            if (tools != null && tools.length() > 0) chat.put("tools", tools);
-
-            Map<String, String> headers = new HashMap<>();
-            if (config.apiKey != null && !config.apiKey.isEmpty()) {
-                headers.put("Authorization", "Bearer " + config.apiKey);
-            }
-            Http.Resp resp = Http.call("POST",
-                    "http://127.0.0.1:" + config.port + "/v1/chat/completions",
-                    headers, chat.toString().getBytes(StandardCharsets.UTF_8),
-                    "application/json", 10000, 120000, false);
-            if (resp.code < 200 || resp.code >= 300) {
-                throw new IllegalStateException("chat HTTP " + resp.code + ": " + resp.body);
-            }
-            JSONObject reply = new JSONObject(resp.body);
-            JSONArray choices = reply.optJSONArray("choices");
-            JSONObject msg = choices != null && choices.length() > 0
-                    ? choices.optJSONObject(0).optJSONObject("message") : null;
-            if (msg == null) throw new IllegalStateException("chat 响应里没有 message");
-            if (msg.optJSONArray("tool_calls") != null && msg.optJSONArray("tool_calls").length() > 0) {
-                throw new IllegalStateException("模型要求工具调用；Assistants 兼容层暂不支持");
-            }
-            String text = msg.optString("content", "");
-            JSONObject stored = Assistants.addAssistantMessage(threadId, text, runId, assistantId);
-            run.put("status", "completed");
-            run.put("completed_at", System.currentTimeMillis() / 1000);
-            JSONObject usage = reply.optJSONObject("usage");
-            if (usage != null) {
-                JSONObject u = new JSONObject();
-                u.put("prompt_tokens", usage.optInt("prompt_tokens", 0));
-                u.put("completion_tokens", usage.optInt("completion_tokens", 0));
-                u.put("total_tokens", usage.optInt("total_tokens", 0));
-                run.put("usage", u);
-            }
-            Assistants.updateRun(threadId, run);
-            JSONObject details = new JSONObject();
-            details.put("type", "message_creation");
-            details.put("message_creation", new JSONObject().put("message_id", stored.optString("id")));
-            Proto.Usage pu = new Proto.Usage();
-            if (usage != null) {
-                pu.input = usage.optInt("prompt_tokens", 0);
-                pu.output = usage.optInt("completion_tokens", 0);
-            }
-            Assistants.addStep(threadId, runId, assistantId, "message_creation", details, pu);
+            return runAssistantChat(threadId, run, assistant);
         } catch (Throwable t) {
             run.put("status", "failed");
             run.put("failed_at", System.currentTimeMillis() / 1000);
@@ -4379,15 +4384,116 @@ public final class Server {
             err.put("message", String.valueOf(t.getMessage()));
             run.put("last_error", err);
             Assistants.updateRun(threadId, run);
+            return run;
         }
+    }
+
+    /**
+     * 跑一次 chat：正常文本 → completed；模型要求工具调用 → requires_action。
+     * submit_tool_outputs 之后也走这里，所以工具闭环共用同一段逻辑。
+     */
+    private JSONObject runAssistantChat(String threadId, JSONObject run, JSONObject assistant)
+            throws Exception {
+        String runId = run.optString("id", "");
+        String assistantId = run.optString("assistant_id", "");
+        String model = run.optString("model", "");
+        if (model.isEmpty() && assistant != null) model = assistant.optString("model", "");
+        if (model.isEmpty()) model = "auto";
+        String instructions = run.optString("instructions", "");
+        if (instructions.isEmpty() && assistant != null) {
+            instructions = assistant.optString("instructions", "");
+        }
+        JSONArray tools = run.optJSONArray("tools");
+        if ((tools == null || tools.length() == 0) && assistant != null) {
+            tools = assistant.optJSONArray("tools");
+        }
+        run.put("model", model);
+        if (!instructions.isEmpty()) run.put("instructions", instructions);
+        if (tools != null) run.put("tools", tools);
+
+        JSONArray messages = new JSONArray();
+        if (!instructions.isEmpty()) {
+            messages.put(new JSONObject().put("role", "system").put("content", instructions));
+        }
+        JSONArray history = Assistants.modelMessages(threadId);
+        for (int i = 0; i < history.length(); i++) messages.put(history.opt(i));
+        if (messages.length() == 0) {
+            messages.put(new JSONObject().put("role", "user").put("content", ""));
+        }
+        JSONObject chat = new JSONObject();
+        chat.put("model", model);
+        chat.put("messages", messages);
+        chat.put("stream", false);
+        if (tools != null && tools.length() > 0) chat.put("tools", tools);
+
+        Map<String, String> headers = new HashMap<>();
+        if (config.apiKey != null && !config.apiKey.isEmpty()) {
+            headers.put("Authorization", "Bearer " + config.apiKey);
+        }
+        Http.Resp resp = Http.call("POST",
+                "http://127.0.0.1:" + config.port + "/v1/chat/completions",
+                headers, chat.toString().getBytes(StandardCharsets.UTF_8),
+                "application/json", 10000, 120000, false);
+        if (resp.code < 200 || resp.code >= 300) {
+            throw new IllegalStateException("chat HTTP " + resp.code + ": " + resp.body);
+        }
+        JSONObject reply = new JSONObject(resp.body);
+        JSONArray choices = reply.optJSONArray("choices");
+        JSONObject msg = choices != null && choices.length() > 0
+                ? choices.optJSONObject(0).optJSONObject("message") : null;
+        if (msg == null) throw new IllegalStateException("chat 响应里没有 message");
+
+        JSONArray toolCalls = msg.optJSONArray("tool_calls");
+        if (toolCalls != null && toolCalls.length() > 0) {
+            Assistants.addAssistantToolCalls(threadId, toolCalls);
+            JSONObject required = new JSONObject();
+            required.put("type", "submit_tool_outputs");
+            required.put("submit_tool_outputs",
+                    new JSONObject().put("tool_calls", toolCalls));
+            run.put("status", "requires_action");
+            run.put("required_action", required);
+            run.put("expires_at", System.currentTimeMillis() / 1000 + 600);
+            Assistants.updateRun(threadId, run);
+            JSONObject details = new JSONObject();
+            details.put("type", "tool_calls");
+            details.put("tool_calls", toolCalls);
+            Assistants.addStep(threadId, runId, assistantId, "tool_calls", details, null);
+            return run;
+        }
+
+        String text = msg.optString("content", "");
+        JSONObject stored = Assistants.addAssistantMessage(threadId, text, runId, assistantId);
+        run.put("status", "completed");
+        run.put("required_action", JSONObject.NULL);
+        run.put("completed_at", System.currentTimeMillis() / 1000);
+        JSONObject usage = reply.optJSONObject("usage");
+        if (usage != null) {
+            JSONObject u = new JSONObject();
+            u.put("prompt_tokens", usage.optInt("prompt_tokens", 0));
+            u.put("completion_tokens", usage.optInt("completion_tokens", 0));
+            u.put("total_tokens", usage.optInt("total_tokens", 0));
+            run.put("usage", u);
+        }
+        Assistants.updateRun(threadId, run);
+        JSONObject details = new JSONObject();
+        details.put("type", "message_creation");
+        details.put("message_creation", new JSONObject().put("message_id", stored.optString("id")));
+        Proto.Usage pu = new Proto.Usage();
+        if (usage != null) {
+            pu.input = usage.optInt("prompt_tokens", 0);
+            pu.output = usage.optInt("completion_tokens", 0);
+        }
+        Assistants.addStep(threadId, runId, assistantId, "message_creation", details, pu);
         return run;
     }
 
     private void writeAssistantsRun(OutputStream out, JSONObject body, JSONObject run) throws Exception {
         if (body.optBoolean("stream", false)) {
             BufferedWriter w = startSse(out);
-            String event = "failed".equals(run.optString("status"))
-                    ? "thread.run.failed" : "thread.run.completed";
+            String status = run.optString("status");
+            String event = "failed".equals(status) ? "thread.run.failed"
+                    : "requires_action".equals(status) ? "thread.run.requires_action"
+                    : "thread.run.completed";
             w.write("event: thread.run.created\ndata: " + run.toString() + "\n\n");
             w.write("event: thread.run.in_progress\ndata: " + run.toString() + "\n\n");
             w.write("event: " + event + "\ndata: " + run.toString() + "\n\n");

@@ -159,6 +159,9 @@ public final class Assistants {
             JSONObject entry = new JSONObject();
             entry.put("thread", t);
             entry.put("messages", new JSONArray());
+            /* 给模型看的历史（含 assistant tool_calls / tool 结果）；messages 只放
+               客户端应该看到的 user/assistant 文本。 */
+            entry.put("history", new JSONArray());
             entry.put("runs", new JSONArray());
             entry.put("steps", new JSONArray());
             load().optJSONObject("threads").put(t.getString("id"), entry);
@@ -203,6 +206,14 @@ public final class Assistants {
             JSONArray list = e.optJSONArray("messages");
             list.put(m);
             trim(list, 200);
+            JSONArray history = e.optJSONArray("history");
+            if (history != null) {
+                JSONObject h = new JSONObject();
+                h.put("role", m.optString("role", "user"));
+                h.put("content", messageText(m));
+                history.put(h);
+                trim(history, 200);
+            }
             save();
             return m;
         }
@@ -227,8 +238,54 @@ public final class Assistants {
             JSONArray list = e.optJSONArray("messages");
             list.put(m);
             trim(list, 200);
+            JSONArray history = e.optJSONArray("history");
+            if (history != null) {
+                JSONObject h = new JSONObject();
+                h.put("role", "assistant");
+                h.put("content", text == null ? "" : text);
+                history.put(h);
+                trim(history, 200);
+            }
             save();
             return m;
+        }
+    }
+
+    /** 模型要求工具调用：只进模型历史，不塞进客户端可见的 messages。 */
+    public static void addAssistantToolCalls(String threadId, JSONArray toolCalls) throws Exception {
+        synchronized (LOCK) {
+            JSONObject e = entry(threadId);
+            JSONArray history = e.optJSONArray("history");
+            if (history == null) {
+                history = new JSONArray();
+                e.put("history", history);
+            }
+            JSONObject h = new JSONObject();
+            h.put("role", "assistant");
+            h.put("content", "");
+            h.put("tool_calls", toolCalls);
+            history.put(h);
+            trim(history, 200);
+            save();
+        }
+    }
+
+    /** 客户端提交的工具结果：进模型历史，下一轮 chat 才能配对。 */
+    public static void addToolOutput(String threadId, String toolCallId, String output) throws Exception {
+        synchronized (LOCK) {
+            JSONObject e = entry(threadId);
+            JSONArray history = e.optJSONArray("history");
+            if (history == null) {
+                history = new JSONArray();
+                e.put("history", history);
+            }
+            JSONObject h = new JSONObject();
+            h.put("role", "tool");
+            h.put("tool_call_id", toolCallId == null ? "" : toolCallId);
+            h.put("content", output == null ? "" : output);
+            history.put(h);
+            trim(history, 200);
+            save();
         }
     }
 
@@ -257,9 +314,16 @@ public final class Assistants {
     }
 
     /** 取给模型用的消息（role + 纯文本），按时间正序。 */
-    public static JSONArray modelMessages(String threadId) throws NotFound {
+    public static JSONArray modelMessages(String threadId) throws Exception {
         synchronized (LOCK) {
-            JSONArray list = entry(threadId).optJSONArray("messages");
+            JSONObject e = entry(threadId);
+            JSONArray history = e.optJSONArray("history");
+            if (history != null && history.length() > 0) {
+                /* 深拷贝一份，避免调用方改到存储对象。 */
+                return new JSONArray(history.toString());
+            }
+            /* 4.45.0 之前的线程没有 history：从可见消息退化成纯文本历史。 */
+            JSONArray list = e.optJSONArray("messages");
             JSONArray out = new JSONArray();
             for (int i = 0; i < list.length(); i++) {
                 JSONObject m = list.optJSONObject(i);
