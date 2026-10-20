@@ -93,7 +93,12 @@ public final class Upstreams {
             // 记录里**不能有换行**：logcat 会把带 \n 的一条日志拆成多条，
             // 分段打印时就会丢内容（真机上就是这么丢了 body 开头）。
             // 用 " |BODY| " 做分隔符。
-            String rec = "URL " + url + " |BODY| " + body.toString();
+            /* 调试抓包也必须有上限：一个 8MB 的图片请求 × 12 条会吃掉上百 MB。 */
+            String bs = body == null ? "" : body.toString();
+            if (bs.length() > 64 * 1024) {
+                bs = bs.substring(0, 64 * 1024) + "...(truncated, " + bs.length() + " chars)";
+            }
+            String rec = "URL " + url + " |BODY| " + bs;
             synchronized (CAPTURED) {
                 CAPTURED.add(rec);
                 while (CAPTURED.size() > CAPTURE_MAX) CAPTURED.remove(0);
@@ -529,6 +534,7 @@ public final class Upstreams {
         final boolean[] doneSeen = {false};
         final boolean[] doneSent = {false};
         final boolean[] idReported = {false};
+        try {
         postStream(endpoint, headers, body, line -> {
             String raw = line == null ? "" : line.trim();
             if (raw.startsWith("{") && raw.contains("\"error\"")) {
@@ -579,6 +585,12 @@ public final class Upstreams {
             }
             sink.rawChunk(chunk);
         });
+        } catch (Exception e) {
+            /* 已经收到 finish_reason/[DONE] 后，上游不关连接、读超时/重置都不影响
+               客户端拿到的完整性；再抛出去会让上层换号重发一遍。 */
+            if (!doneSeen[0]) throw e;
+            Log.w("保真流在结束标记之后读流出错，已忽略：" + e.getMessage());
+        }
         if (!doneSeen[0]) {
             Log.w("上游流在 finish_reason/[DONE] 之前结束（保真模式），判定为连接中断");
             throw new java.io.IOException("upstream stream ended before finish_reason");
@@ -832,7 +844,8 @@ public final class Upstreams {
                             + shortenPublic(raw));
                     continue;
                 }
-                throw new ToolFix.BadToolCall(name, raw);   // 还没输出 → 让上层换账号重试
+                /* 还没输出 → 让上层决定；length 截断不算模型"不会用工具"。 */
+                throw new ToolFix.BadToolCall(name, raw, "length".equals(finish[0]));
             }
             if (name.isEmpty()) name = ToolFix.nameFromArgs(fixed);
             sink.toolCall(id, name, fixed);

@@ -143,6 +143,17 @@ public final class Antigravity {
     }
 
     public static String authorizeUrl(String state) throws Exception {
+        return authorizeUrl(state, null);
+    }
+
+    /**
+     * @param codeChallenge PKCE S256 challenge；null 表示不使用 PKCE。
+     *
+     * 为什么要加：client_secret 随 APK 分发，单靠 secret + 固定回环端口，
+     * 本机另一个应用抢先占用 51121 就能截走 authorization code 并兑换 token。
+     * PKCE 的 verifier 只存在于本次登录的内存里，截到 code 也换不了。
+     */
+    public static String authorizeUrl(String state, String codeChallenge) throws Exception {
         StringBuilder sb = new StringBuilder(AUTH_ENDPOINT).append("?");
         sb.append("access_type=offline");
         sb.append("&client_id=").append(URLEncoder.encode(CLIENT_ID, "UTF-8"));
@@ -151,15 +162,26 @@ public final class Antigravity {
         sb.append("&response_type=code");
         sb.append("&scope=").append(URLEncoder.encode(String.join(" ", SCOPES), "UTF-8"));
         sb.append("&state=").append(URLEncoder.encode(state, "UTF-8"));
+        if (codeChallenge != null && !codeChallenge.isEmpty()) {
+            sb.append("&code_challenge=").append(URLEncoder.encode(codeChallenge, "UTF-8"));
+            sb.append("&code_challenge_method=S256");
+        }
         return sb.toString();
     }
 
     public static Account exchangeCode(String code) throws Exception {
+        return exchangeCode(code, null);
+    }
+
+    public static Account exchangeCode(String code, String codeVerifier) throws Exception {
         String form = "code=" + URLEncoder.encode(code, "UTF-8")
                 + "&client_id=" + URLEncoder.encode(CLIENT_ID, "UTF-8")
                 + "&client_secret=" + URLEncoder.encode(clientSecret(), "UTF-8")
                 + "&redirect_uri=" + URLEncoder.encode(redirectUri(), "UTF-8")
                 + "&grant_type=authorization_code";
+        if (codeVerifier != null && !codeVerifier.isEmpty()) {
+            form += "&code_verifier=" + URLEncoder.encode(codeVerifier, "UTF-8");
+        }
         Map<String, String> headers = new HashMap<>();
         headers.put("Content-Type", "application/x-www-form-urlencoded");
         headers.put("Accept", "application/json");
@@ -185,7 +207,7 @@ public final class Antigravity {
     public static Account ensureFresh(Config.Provider p) throws Exception {
         // 原来是 static synchronized（类级锁）：一个账号走网络刷新 token 时，
         // 同 Provider 的其他账号全被堵住。现在按账号加锁，各刷各的。
-        synchronized (FreshLocks.forKey(p.name)) {
+        synchronized (FreshLocks.of(p)) {
             return ensureFreshInner(p);
         }
     }

@@ -19,10 +19,20 @@ final class ToolFix {
     private ToolFix() {
     }
 
-    /** 参数坏到修不了。上层会把它当成"这个账号这轮不行"。 */
+    /** 参数坏到修不了。 */
     static final class BadToolCall extends Exception {
+        /** 是不是被 max_tokens 截断导致的（这时不该把模型记成"不会用工具"）。 */
+        final boolean truncated;
+
         BadToolCall(String name, String raw) {
-            super("工具参数不是合法 JSON（" + name + "）：" + Upstreams.shortenPublic(raw));
+            this(name, raw, false);
+        }
+
+        BadToolCall(String name, String raw, boolean truncated) {
+            super("工具参数不是合法 JSON（" + name + "）"
+                    + (truncated ? "，且 finish_reason=length（可能被 max_tokens 截断）" : "")
+                    + "：" + Upstreams.shortenPublic(raw));
+            this.truncated = truncated;
         }
     }
 

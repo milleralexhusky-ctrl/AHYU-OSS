@@ -112,6 +112,11 @@ public final class Secret {
         int n = 0;
         try {
             if (isPlainValue(root, "apiKey")) n++;
+            JSONArray aliases = root.optJSONArray("apiKeyAliases");
+            for (int i = 0; aliases != null && i < aliases.length(); i++) {
+                String v = aliases.optString(i, "");
+                if (!v.isEmpty() && !isSealed(v)) n++;
+            }
             JSONArray arr = root.optJSONArray("providers");
             for (int i = 0; arr != null && i < arr.length(); i++) {
                 JSONObject p = arr.optJSONObject(i);
@@ -143,6 +148,11 @@ public final class Secret {
         try {
             String top = unreadable(root, "apiKey");
             if (top != null) return "apiKey";
+            JSONArray aliases = root.optJSONArray("apiKeyAliases");
+            for (int i = 0; aliases != null && i < aliases.length(); i++) {
+                String v = aliases.optString(i, "");
+                if (isSealed(v) && open(v).isEmpty()) return "apiKeyAliases[" + i + "]";
+            }
             JSONArray arr = root.optJSONArray("providers");
             for (int i = 0; arr != null && i < arr.length(); i++) {
                 JSONObject p = arr.optJSONObject(i);
@@ -164,6 +174,45 @@ public final class Secret {
         String v = Proto.optString(o, field, "");
         if (!isSealed(v)) return null;
         return open(v).isEmpty() ? field : null;
+    }
+
+    /**
+     * 把"本机解不开"的密文原样保留在打开的 JSON 里（4.50.3）。
+     *
+     * 为什么要保留：open() 解不开会返回空串，如果此时因为改配置/生成新 Key
+     * 触发一次保存，空串就会把原始密文永久覆盖掉 —— 等 Keystore 恢复也回不来了。
+     * 保留 `enc:v1:...` 原值后，保存时 seal() 看到它已是密文会原样写回，
+     * 数据不再丢；本次运行里该账号表现为"未登录"，需要时重新登录即可。
+     */
+    public static void restoreUnreadable(JSONObject raw, JSONObject opened) {
+        if (raw == null || opened == null) return;
+        try {
+            copyUnreadable(raw, opened, "apiKey");
+            JSONArray ra = raw.optJSONArray("apiKeyAliases");
+            JSONArray oa = opened.optJSONArray("apiKeyAliases");
+            if (ra != null && oa != null) {
+                for (int i = 0; i < ra.length() && i < oa.length(); i++) {
+                    String v = ra.optString(i, "");
+                    if (isSealed(v) && open(v).isEmpty()) oa.put(i, v);
+                }
+            }
+            JSONArray rp = raw.optJSONArray("providers");
+            JSONArray op = opened.optJSONArray("providers");
+            for (int i = 0; rp != null && op != null && i < rp.length() && i < op.length(); i++) {
+                JSONObject r = rp.optJSONObject(i);
+                JSONObject o = op.optJSONObject(i);
+                if (r == null || o == null) continue;
+                copyUnreadable(r, o, "apiKey");
+                copyUnreadable(r, o, "credentials");
+            }
+        } catch (Throwable t) {
+            Log.w("保留不可读密文失败（本次仍按空值运行）：" + t);
+        }
+    }
+
+    private static void copyUnreadable(JSONObject raw, JSONObject opened, String field) throws Exception {
+        String v = Proto.optString(raw, field, "");
+        if (isSealed(v) && open(v).isEmpty()) opened.put(field, v);
     }
 
     /** 读盘后：把密文换回明文。 */

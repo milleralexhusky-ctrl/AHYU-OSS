@@ -73,7 +73,9 @@ public class AntigravityLoginActivity extends LoginPageBase {
     private void run() {
         try {
             String state = UUID.randomUUID().toString();
-            authUrl = Antigravity.authorizeUrl(state);
+            /* PKCE：code 即使被本机别的应用截走，没有 verifier 也换不了 token。 */
+            OAuth.Pkce pkce = new OAuth.Pkce();
+            authUrl = Antigravity.authorizeUrl(state, pkce.challenge);
             Log.i("antigravity 授权开始：" + authUrl);
             post(() -> {
                 setStatus("请在下方的页面里选择 Google 账号并授权。", true);
@@ -81,7 +83,7 @@ public class AntigravityLoginActivity extends LoginPageBase {
             });
             String code = OAuth.waitForCode("Antigravity", Antigravity.CALLBACK_PORT, state, 10 * 60 * 1000L);
             post(() -> setStatus("正在换取凭据…", true));
-            Antigravity.Account acc = Antigravity.exchangeCode(code);
+            Antigravity.Account acc = Antigravity.exchangeCode(code, pkce.verifier);
             post(() -> setStatus("正在开通/查询 Antigravity 项目…", true));
             org.json.JSONObject registered = Antigravity.registerProvider(acc.toJson());
             Log.i("antigravity 登录完成：" + registered.optString("provider")

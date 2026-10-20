@@ -821,7 +821,20 @@ public final class Config {
                之后就再也分不清"本来就没有 Key"和"Key 解不开"了。 */
             String rawKey = Proto.optString(raw, "apiKey", "");
             boolean keyLost = Secret.isSealed(rawKey) && Secret.open(rawKey).isEmpty();
-            Config loaded = fromJson(Secret.open(raw));
+            /* 账号凭据也可能解不开（Keystore 重建/换机/临时不可用）。必须在 open()
+               之前判断：open() 会把解不开的值就地换成空串，之后再保存就会把
+               所有 refresh_token 永久写成空。 */
+            String unreadableField = Secret.unreadableSealed(raw);
+            boolean providerSecretLost = unreadableField != null
+                    && unreadableField.startsWith("providers[");
+            if (providerSecretLost) {
+                Log.e("账号凭据解不开（" + unreadableField + "）：本次不保存配置，保留磁盘上的密文。"
+                        + "若 Keystore 已永久失效，需要重新登录对应账号");
+            }
+            JSONObject opened = Secret.open(new JSONObject(raw.toString()));
+            /* 解不开的密文原样保留，避免后续保存把 refresh_token 覆盖成空串。 */
+            Secret.restoreUnreadable(raw, opened);
+            Config loaded = fromJson(opened);
             if (keyLost) {
                 /* 绝不能把"解不开"当成"用户清空了 Key"（旧行为：本机模式下直接不校验）。
                    这里生成一把新 Key 并立刻落盘（用当前 Keystore 加密），
@@ -831,6 +844,7 @@ public final class Config {
                 Log.e("客户端 Key 解不开（Keystore 重建或换机），已生成新 Key；"
                         + "请到设置页把「客户端密钥」重新复制给客户端");
                 try {
+                    /* 不可读的账号密文已由 restoreUnreadable 原样保留，保存不会丢数据。 */
                     loaded.save(ctx);
                 } catch (Throwable t) {
                     Log.w("新 Key 落盘失败（本次运行仍生效）：" + t);

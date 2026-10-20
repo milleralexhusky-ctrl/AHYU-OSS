@@ -341,6 +341,12 @@ public final class Gateway {
         }
         Config parsed = Config.fromJson(Secret.open(payload));
         if (parsed == null) throw new IllegalStateException("备份内容无法解析为配置");
+        /* 备份是外部输入：不能让它直接把网关切到 0.0.0.0。恢复后强制关闭局域网，
+           用户需要时再在设置里手动打开。 */
+        if (parsed.lanAccess) {
+            parsed.lanAccess = false;
+            Log.w("备份里开启了局域网访问，已强制关闭；如需局域网请在设置里重新打开");
+        }
 
         /* 3) 停网关 → 落盘（走正常 save，让 Secret 重新用本机密钥加密）→ 重新加载 → 起网关 */
         boolean wasRunning = isRunning();

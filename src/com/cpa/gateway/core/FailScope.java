@@ -35,7 +35,11 @@ enum FailScope {
 
     static FailScope of(Throwable t) {
         if (t == null) return UNKNOWN;
-        if (t instanceof ToolFix.BadToolCall) return MODEL_BAD;
+        if (t instanceof ToolFix.BadToolCall) {
+            /* 被 max_tokens 截断的工具参数不是模型"不会用工具"，
+               而是客户端给的长度不够 —— 按请求问题处理，不写模型画像。 */
+            return ((ToolFix.BadToolCall) t).truncated ? REQUEST : MODEL_BAD;
+        }
         if (t instanceof Throttled) return ACCOUNT;
         if (t instanceof ClientGone || t instanceof RaceLost) return UNKNOWN;
 
@@ -50,36 +54,65 @@ enum FailScope {
             return MODEL_BAD;
         }
 
-        /* 模型接入：账号没有这个模型 / 不支持这个模型。 */
+        /* 模型接入：只认明确的"没有这个模型/没权限"。
+           刻意不收 "does not support" / "unsupported"：那多半是请求用了模型不支持的参数，
+           属于请求问题，换号也没用。 */
         boolean modelWord = msg.contains("model") || msg.contains("模型");
         if (modelWord && (msg.contains("not found") || msg.contains("not exist")
-                || msg.contains("not support") || msg.contains("unsupported")
                 || msg.contains("service info not found") || msg.contains("invalid model")
-                || msg.contains("no access") || msg.contains("does not support")
-                || msg.contains("不存在") || msg.contains("不支持") || msg.contains("不可用"))) {
+                || msg.contains("no access") || msg.contains("不存在"))) {
             return MODEL_ACCESS;
         }
 
+        /* InvalidRequest 必须先于网络关键词判断：HTTP 400 "request body is not json"
+           是请求问题，不是断流；以前会被 "not json" 误判成 TRANSIENT 然后换号重试。 */
         if (t instanceof InvalidRequest) return REQUEST;
-        if (Detect.isTransient(t) || Detect.isTransient(msg)) return TRANSIENT;
 
-        /* 401/402/403 一定是账号侧（429 会被 Throttled 捕获，走不到这里）。 */
-        if (msg.contains("401") || msg.contains("402") || msg.contains("403")
+        /* 网络/断流类：这些不是账号坏了，也不该写 lastError 让账号"不可用 30 分钟"。 */
+        if (t instanceof java.io.EOFException || t instanceof java.net.SocketException
+                || t instanceof java.net.UnknownHostException
+                || t instanceof javax.net.ssl.SSLException) {
+            return TRANSIENT;
+        }
+
+        /* 401/402/403 一定是账号侧（429 会被 Throttled 捕获，走不到这里）。
+           用边界匹配，避免业务码里的 40123 被当成 HTTP 401。 */
+        if (ACCOUNT_STATUS.matcher(msg).find()
                 || msg.contains("unauthorized") || msg.contains("invalid api key")
                 || msg.contains("authentication") || msg.contains("permission denied")) {
             return ACCOUNT;
         }
+
+        if (msg.contains("stream ended before") || msg.contains("empty upstream response")
+                || msg.contains("非 json") || msg.contains("not json")
+                || msg.contains("ssl") || msg.contains("handshake")
+                || msg.contains("certificate") || msg.contains("unexpected eof")
+                || msg.contains("eofexception")
+                || msg.contains("connection reset") || msg.contains("broken pipe")) {
+            return TRANSIENT;
+        }
+        if (Detect.isTransient(t) || Detect.isTransient(msg)) return TRANSIENT;
         return UNKNOWN;
     }
+
+    /** HTTP 401/402/403 的边界匹配。 */
+    private static final java.util.regex.Pattern ACCOUNT_STATUS =
+            java.util.regex.Pattern.compile("\\b40[123]\\b");
 
     /** 纯调用（点名模型）时，这个失败是否应该立刻停止换号重试。 */
     boolean stopDirect() {
         return this == MODEL_BAD || this == REQUEST;
     }
 
-    /** 轮换模式（auto*）时，这个失败是否应该把整个模型从本轮候选里排除。 */
+    /**
+     * 轮换模式（auto*）时，这个失败是否应该把整个模型从本轮候选里排除。
+     *
+     * 只有 MODEL_BAD（模型产出坏了）才按模型排除。MODEL_ACCESS 可能只是
+     * "这个账号没有该模型/没权限"，同模型的另一个账号可能完全正常，
+     * 所以只跳过当前候选，不封杀整个模型。
+     */
     boolean skipModelInRotation() {
-        return this == MODEL_BAD || this == MODEL_ACCESS;
+        return this == MODEL_BAD;
     }
 
     /** 轮换模式时，这个失败是否应该直接结束整轮选路（换个模型也没用）。 */

@@ -210,6 +210,14 @@ public final class Server {
                 Thread.currentThread().interrupt();
             }
         }
+        /* 关闭所有已建立连接：只关监听的话，旧 keep-alive 连接还能继续用旧配置发请求。 */
+        for (Socket s : new java.util.ArrayList<>(ACTIVE_SOCKS)) {
+            try {
+                s.close();
+            } catch (Throwable ignored) {
+            }
+        }
+        ACTIVE_SOCKS.clear();
         Log.i("gateway stopped");
     }
 
@@ -430,22 +438,28 @@ public final class Server {
             this.out = out;
         }
 
+        /* 同一把锁保护 buf 与 finished：竞速主线程可能在 180 秒超时后 finish()，
+           而胜者 racer 仍在写。没有这个保护，终止块之后会出现新 chunk，
+           或两个线程交叉写 chunk 头/body，客户端的帧解析直接坏掉。 */
         @Override
-        public void write(int b) {
+        public synchronized void write(int b) {
+            if (finished) return;
             buf.write(b);
         }
 
         @Override
-        public void write(byte[] b, int off, int len) {
+        public synchronized void write(byte[] b, int off, int len) {
+            if (finished) return;
             buf.write(b, off, len);
         }
 
         @Override
-        public void flush() throws java.io.IOException {
+        public synchronized void flush() throws java.io.IOException {
+            if (finished) return;
             flushChunk(false);
         }
 
-        private void flushChunk(boolean last) throws java.io.IOException {
+        private synchronized void flushChunk(boolean last) throws java.io.IOException {
             int n = buf.size();
             try {
                 if (n > 0) {
@@ -470,12 +484,12 @@ public final class Server {
             out.flush();
         }
 
-        void finish() throws java.io.IOException {
+        synchronized void finish() throws java.io.IOException {
             if (!finished) flushChunk(true);
         }
 
         @Override
-        public void close() throws java.io.IOException {
+        public synchronized void close() throws java.io.IOException {
             finish();
         }
     }
@@ -759,6 +773,14 @@ public final class Server {
     private static final java.util.concurrent.ConcurrentHashMap<OutputStream, Conn> CONNS =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * 已建立的客户端连接。stop() 要能主动关掉它们：
+     * 只关监听 socket 的话，keep-alive 连接还能继续发请求，
+     * 而且用的是 Server 构造时捕获的旧 Config（关局域网/换 Key 后旧策略仍然生效）。
+     */
+    private final java.util.Set<Socket> ACTIVE_SOCKS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     /** 这条响应流属于哪条连接：先查表（跨线程可靠），退化到当前线程。 */
     private static Conn connFor(OutputStream out) {
         if (out != null) {
@@ -784,13 +806,24 @@ public final class Server {
         }
     }
 
+    /** 单行上限：请求行/头/分块长度都走这里。 */
+    private static final int MAX_LINE_BYTES = 64 * 1024;
+    /** 整个请求头的上限：防止"很多条 64KB 头"把内存堆满。 */
+    private static final int MAX_HEADER_BYTES = 256 * 1024;
+    private static final int MAX_HEADER_COUNT = 256;
+
     private static String readLine(InputStream in) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         int c;
         while ((c = in.read()) != -1) {
             if (c == '\n') break;
             if (c != '\r') bos.write(c);
-            if (bos.size() > 65536) break;
+            /* 以前超限就 break 返回前半行，剩下的字节留在流里，
+               下一条 readLine 会把它当成新的请求行 —— keep-alive 连接从此错位。
+               超长行直接抛异常，让这条连接关闭，不留下解析歧义。 */
+            if (bos.size() > MAX_LINE_BYTES) {
+                throw new java.io.IOException("HTTP line too long (> " + MAX_LINE_BYTES + " bytes)");
+            }
         }
         if (c == -1 && bos.size() == 0) return null;
         return new String(bos.toByteArray(), StandardCharsets.UTF_8);
@@ -820,16 +853,60 @@ public final class Server {
             }
         }
         String h;
-        while ((h = readLine(in)) != null && !h.isEmpty()) {
+        int headerBytes = 0;
+        int headerCount = 0;
+        boolean headerEnd = false;
+        while ((h = readLine(in)) != null) {
+            if (h.isEmpty()) {
+                headerEnd = true;
+                break;
+            }
+            headerCount++;
+            headerBytes += h.length();
+            /* 单行有上限，但"很多条合法长度"的头仍然能堆满内存；总量也要挡。 */
+            if (headerCount > MAX_HEADER_COUNT || headerBytes > MAX_HEADER_BYTES) {
+                throw new java.io.IOException("request headers too large ("
+                        + headerCount + " headers, " + headerBytes + " bytes)");
+            }
             int c = h.indexOf(':');
-            if (c > 0) r.headers.put(h.substring(0, c).trim().toLowerCase(Locale.US), h.substring(c + 1).trim());
+            if (c > 0) {
+                String name = h.substring(0, c).trim().toLowerCase(Locale.US);
+                String value = h.substring(c + 1).trim();
+                /* 重复的 Content-Length / Transfer-Encoding 是请求走私的经典入口；
+                   同一个值也不接受，直接拒绝。 */
+                if (("content-length".equals(name) || "transfer-encoding".equals(name))
+                        && r.headers.containsKey(name)) {
+                    throw new java.io.IOException("duplicate " + name + " header");
+                }
+                r.headers.put(name, value);
+            }
         }
+        /* 头区没有以空行结束就 EOF：这是一条半截请求，不能当成完整请求执行。 */
+        if (!headerEnd) throw new java.io.IOException("truncated request headers");
         String conn = r.headers.get("connection");
         String version = parts.length >= 3 ? parts[2] : "HTTP/1.1";
         if (conn != null && conn.toLowerCase(java.util.Locale.US).contains("close")) r.keepAlive = false;
         else if (version.startsWith("HTTP/1.0")) r.keepAlive = false;
         String te = r.headers.get("transfer-encoding");
-        if (te != null && te.toLowerCase(Locale.US).contains("chunked")) {
+        String cl = r.headers.get("content-length");
+        /* TE 与 CL 同时出现是请求走私的典型形态；本地网关也不接受。 */
+        if (te != null && cl != null) {
+            throw new java.io.IOException("both Transfer-Encoding and Content-Length present");
+        }
+        boolean chunked = false;
+        if (te != null) {
+            for (String tok : te.split(",")) {
+                String t = tok.trim().toLowerCase(Locale.US);
+                if (t.isEmpty()) continue;
+                /* 只支持 chunked；"gzip, chunked" 这类我们不会解 gzip，不能假装看得懂。 */
+                if (!"chunked".equals(t)) {
+                    throw new java.io.IOException("unsupported Transfer-Encoding: " + te);
+                }
+                chunked = true;
+            }
+            if (!chunked) throw new java.io.IOException("empty Transfer-Encoding");
+        }
+        if (chunked) {
             /* 必须按字节累积、最后一次性解码：每个 chunk 单独 new String(..., UTF_8)
                会在多字节字符正好被 chunk 边界切开时各自产生 U+FFFD，
                中文 prompt 被静默破坏（客户端完全看不出，模型只是"变笨"）。 */
@@ -843,9 +920,12 @@ public final class Server {
                 try {
                     size = Integer.parseInt(sizeLine.trim(), 16);
                 } catch (Exception e) {
-                    break;
+                    /* 以前这里 break：把半截 chunk 当成完整请求返回，剩下的字节
+                       留在流里被当成下一条请求 —— keep-alive 连接从此错位。 */
+                    throw new java.io.IOException("invalid chunk size: " + sizeLine);
                 }
-                if (size <= 0) {
+                if (size < 0) throw new java.io.IOException("negative chunk size: " + size);
+                if (size == 0) {
                     /* 0 块之后是 trailer，必须读到空行为止；只读一行会把剩下的
                        trailer 留成"下一个请求的请求行"，keep-alive 连接从此错位。 */
                     String trailer;
@@ -870,20 +950,31 @@ public final class Server {
                 int read = 0;
                 while (read < size) {
                     int n = in.read(buf, read, size - read);
-                    if (n < 0) break;
+                    if (n < 0) throw new java.io.IOException("truncated chunk body");
                     read += n;
                 }
                 body.write(buf, 0, read);
-                readLine(in);
+                String crlf = readLine(in);
+                if (crlf == null) throw new java.io.IOException("truncated chunk terminator");
+                if (!crlf.isEmpty()) throw new java.io.IOException("malformed chunk terminator");
             }
             byte[] all = body.toByteArray();
             r.bodyBytes = all;
             r.body = new String(all, StandardCharsets.UTF_8);
         } else {
             int len = 0;
-            try {
-                len = Integer.parseInt(r.headers.getOrDefault("content-length", "0"));
-            } catch (Exception ignored) {
+            if (cl != null && !cl.trim().isEmpty()) {
+                String v = cl.trim();
+                /* 只接受纯十进制非负整数：负数/带符号/非数字都不猜，直接拒绝。
+                   以前 parse 失败按 0 处理，body 字节留在流里会被当成下一请求。 */
+                if (!v.matches("\\d+")) {
+                    throw new java.io.IOException("invalid Content-Length: " + cl);
+                }
+                try {
+                    len = Integer.parseInt(v);
+                } catch (Exception e) {
+                    throw new java.io.IOException("Content-Length out of range: " + cl);
+                }
             }
             // 上限：以前按 Content-Length 直接 new byte[len]，开了局域网就是一个 OOM 攻击面
             // （本机模式无所谓，但 lanAccess 是用户随时可能打开的开关）。超限直接拒绝这次请求。
@@ -931,6 +1022,9 @@ public final class Server {
         int perPeer = maxPerPeer();
         if (live > perPeer) {
             counter.decrementAndGet();
+            /* 计数归零就把表项删掉：LAN 模式下每个来源 IP 留一条，
+               IPv6 客户端可以换地址，长期下来这张表会无限增长。 */
+            PER_PEER.computeIfPresent(peerKey, (k, v) -> v.get() <= 0 ? null : v);
             /* 这条连接没进下面的 try/finally，必须在这里把 Capacity 减回去；
                否则每拒绝一条，inflight 就永久 +1，压力值和首请求时限都会被算歪。 */
             Capacity.leave();
@@ -948,6 +1042,7 @@ public final class Server {
             return;
         }
         try {
+            ACTIVE_SOCKS.add(s);
             s.setTcpNoDelay(true);
             s.setKeepAlive(true);
             s.setSoTimeout(firstRequestMs());   // 只等 10 秒：空连接别占着线程
@@ -959,7 +1054,7 @@ public final class Server {
             CURRENT.set(conn);
             CONNS.put(out, conn);
             int served = 0;
-            while (served < KEEPALIVE_MAX_REQUESTS) {
+            while (served < KEEPALIVE_MAX_REQUESTS && running) {
                 // 性能定位用：把"读请求"和"处理+写响应"分开计时（只在 debug 构建里打日志）
                 long netT0 = android.os.SystemClock.uptimeMillis();
                 Req r = readRequest(in);
@@ -976,6 +1071,13 @@ public final class Server {
                     if ((config.lanAccess && !wsHasKey) || (wsHasKey && wsUsed.isEmpty())) {
                         Log.w("Realtime 鉴权失败：客户端 Key 与服务端不一致");
                         writeError(out, r.path, 401, "invalid api key");
+                        break;
+                    }
+                    if (browserOriginBlocked(r)) {
+                        Log.w("拒绝浏览器跨源 Realtime 连接（未设置 API Key）："
+                                + r.header("origin"));
+                        writeError(out, r.path, 403,
+                                "cross-origin browser access requires an api key");
                         break;
                     }
                     try {
@@ -1132,8 +1234,14 @@ public final class Server {
                 s.close();
             } catch (Exception ignored) {
             }
+            ACTIVE_SOCKS.remove(s);
             java.util.concurrent.atomic.AtomicInteger c = PER_PEER.get(peerKey);
-            if (c != null) c.decrementAndGet();
+            if (c != null) {
+                c.decrementAndGet();
+                /* 归零即删。用 computeIfPresent 而不是 remove(key, c)：
+                   并发新连接可能刚把计数加回 1，这时不能把表项删掉。 */
+                PER_PEER.computeIfPresent(peerKey, (k, v) -> v.get() <= 0 ? null : v);
+            }
             Capacity.leave();
             Capacity.record(enterAt, System.currentTimeMillis() - enterAt);
         }
@@ -1141,6 +1249,53 @@ public final class Server {
 
     /** 上一次"客户端 Key 不对"的告警时间，用来限流（每客户端每秒重试一次会刷爆日志）。 */
     private static volatile long lastAuthWarnMs = 0L;
+    /** 上一次"拒绝浏览器跨源"的告警时间，同样避免刷屏。 */
+    private static volatile long lastCorsWarnMs = 0L;
+
+    /**
+     * 没设 API Key 时，这个请求是不是来自"外部网页"。
+     *
+     * 只看 Origin：原生客户端一般不发 Origin；浏览器发的是页面自己的源。
+     * 回环来源（面板、本机网页）放行；非 http(s) 的自定义 scheme 也放行，
+     * 因为远程网页无法伪造它。
+     */
+    private boolean browserOriginBlocked(Req r) {
+        if (config.apiKey != null && !config.apiKey.isEmpty()) return false;
+        return isForeignBrowserOrigin(r.header("origin"));
+    }
+
+    /** 纯函数，方便自检。origin 为空或非 http(s) 视为不是"外部网页"。 */
+    static boolean isForeignBrowserOrigin(String origin) {
+        if (origin == null) return false;
+        String o = origin.trim();
+        if (o.isEmpty()) return false;
+        /* sandbox iframe / data: / file: 页面会发 Origin: null；
+           远程恶意页面正是用这个绕过"只拦 http(s) 外部源"。没有 Key 时按外部源处理。 */
+        if ("null".equalsIgnoreCase(o)) return true;
+        String lower = o.toLowerCase(Locale.US);
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false;
+        try {
+            java.net.URI u = new java.net.URI(o);
+            String host = u.getHost();
+            if (host == null || host.isEmpty()) return true;
+            host = host.toLowerCase(Locale.US);
+            if (host.startsWith("[") && host.endsWith("]")) {
+                host = host.substring(1, host.length() - 1);
+            }
+            if ("localhost".equals(host) || "localhost.".equals(host)
+                    || host.endsWith(".localhost")   // RFC 6761：*.localhost 都指向回环
+                    || "::1".equals(host) || "0:0:0:0:0:0:0:1".equals(host)) {
+                return false;
+            }
+            /* 必须是完整的 127/8 地址，不能只看前缀：
+               127.0.0.1.evil.com 也以 "127." 开头，但它不是回环。 */
+            if (host.matches("127(\\.\\d{1,3}){1,3}")) return false;
+            if (host.matches("::ffff:127(\\.\\d{1,3}){1,3}")) return false;
+            return true;
+        } catch (Exception e) {
+            return true;
+        }
+    }
 
     private void route(Req r, OutputStream out, Socket s) throws Exception {
         String path = r.path;
@@ -1171,6 +1326,27 @@ public final class Server {
                         + "（客户端 Key=" + maskKey(usedKey) + "）");
             }
             writeError(out, path, 401, "invalid api key");
+            return;
+        }
+        /* 浏览器跨源防护（4.50.3）。
+         *
+         * 本机网关默认可以没有 API Key。浏览器里任何一个网页都能 fetch
+         * http://127.0.0.1:8321，而响应头又允许 CORS *：没有 Key 时，
+         * 一个恶意网页就能直接消耗用户的账号额度（DNS rebinding 也能绕过同源）。
+         *
+         * 规则：没设 Key 时，来源是 http(s) 且不是回环地址的浏览器请求一律拒绝；
+         * 原生客户端通常不带 Origin，不受影响；面板/本机网页同源或回环，放行。
+         * 设了 Key 之后正常鉴权已经覆盖，不再额外拦。
+         */
+        if (browserOriginBlocked(r)) {
+            long now = System.currentTimeMillis();
+            if (now - lastCorsWarnMs > 60000L) {
+                lastCorsWarnMs = now;
+                Log.w("拒绝浏览器跨源访问（未设置 API Key）：Origin=" + r.header("origin")
+                        + " · 如需从其它网页调用，请先在设置里设置客户端密钥");
+            }
+            writeError(out, path, 403,
+                    "cross-origin browser access requires an API key; set one in AHYU settings");
             return;
         }
         Conn selfConn = CURRENT.get();
@@ -2309,9 +2485,15 @@ public final class Server {
                     .append(", max=").append(KEEPALIVE_MAX_REQUESTS).append("\r\n");
         }
         h.append("\r\n");
-        out.write(h.toString().getBytes(StandardCharsets.UTF_8));
-        if (!noBody && body.length > 0) out.write(body);
-        out.flush();
+        try {
+            out.write(h.toString().getBytes(StandardCharsets.UTF_8));
+            if (!noBody && body.length > 0) out.write(body);
+            out.flush();
+        } catch (java.io.IOException io) {
+            /* 写客户端失败 = 客户端不在了，不是上游/账号的问题。
+               转成 ClientGone，避免被记成渠道失败、再换个号重发一次完整 completion。 */
+            throw new ClientGone("写客户端失败：" + io.getMessage());
+        }
     }
 
     private static void writeJson(OutputStream out, int status, String body) throws Exception {
@@ -2462,6 +2644,10 @@ public final class Server {
             /* keep-alive 连接可能已经空闲很久；从这一刻重新计时，
                否则新流刚开始就会被旧时间戳判成"上游静默 180 秒"。 */
             c.lastUpstreamAt = System.currentTimeMillis();
+            /* 看门狗用 lastPing 判"这条流超过 30 秒没写出心跳"。它只在连接构造时
+               初始化过一次；一条 keep-alive 连接超过 30 秒后再开流，第一次扫描
+               会在首个 10 秒 ping 之前关掉健康的新流。开流时同步重置。 */
+            c.lastPing = System.currentTimeMillis();
             try {
                 synchronized (writer) {
                     writer.write(": ready\n\n");
@@ -3129,10 +3315,17 @@ public final class Server {
         String key = p.name + "/" + um;
         if (err == null) {
             Router.recordOk(key, Math.max(1L, System.currentTimeMillis() - t0));
-        } else if (err instanceof ClientGone || err instanceof InvalidRequest || err instanceof RaceLost) {
-            Router.abortProbe(key);
-        } else if (!(err instanceof Throttled)) {
-            Router.recordFail(key, String.valueOf(err.getMessage()));
+        } else {
+            FailScope scope = FailScope.of(err);
+            /* 坏模型 / 坏请求只作废半开试探，不记账号失败：
+               连续 3 次坏工具参数就把健康账号打进 60s-600s 冷却，
+               正是 4.50.2 要修掉的"坏模型误伤账号"。 */
+            if (scope.modelScoped() || scope == FailScope.REQUEST
+                    || err instanceof ClientGone || err instanceof RaceLost) {
+                Router.abortProbe(key);
+            } else if (!(err instanceof Throttled)) {
+                Router.recordFail(key, String.valueOf(err.getMessage()));
+            }
         }
     }
 
@@ -3200,7 +3393,9 @@ public final class Server {
      */
     ConfirmedBlock confirmedBlock(List<Config.Provider> cands, String model, int tries) {
         ConfirmedBlock out = new ConfirmedBlock();
-        int n = Math.min(tries, cands == null ? 0 : cands.size());
+        /* 必须看**全部**可派发候选，不能只看 tries（2-4）：tries 只是本轮预算，
+           后面可能还有完全可用的账号，按前几个就宣布"全被限流"会误伤。 */
+        int n = cands == null ? 0 : cands.size();
         if (n == 0) return out;
         long latest = 0L;
         boolean allChannel = true;
@@ -3369,7 +3564,9 @@ public final class Server {
                             checked.incrementAndGet();
                             // 后台巡检必须用 ephemeral：否则每探一个模型都记一条用量、
                             // 还会被自己的"让路"逻辑当成真实流量，N 个模型把自己拖慢 N×4 秒。
-                            String reason = probeOne(p, m, 60000, true);
+                            // 走进程内 probeDirect，不再占本机 HTTP 连接线程：
+                            // 以前连接池满时自己的 503 会被当成"模型坏了"。
+                            String reason = probeDirect(p, m);
                             synchronized (p.badModels) {
                                 if (reason == null) {
                                     p.badModels.remove(m);
@@ -3427,7 +3624,13 @@ public final class Server {
                     "http://127.0.0.1:" + cfg.port + "/v1/chat/completions",
                     headers, payload, "application/json", 5000, readTimeoutMs, false);
             String text = resp.body;
-            if (resp.code >= 400) return shortenReason(text);
+            if (resp.code >= 400) {
+                String reason = shortenReason(text == null ? "" : text);
+                /* 空响应体不能返回空串：调用方把"非 null"当成模型坏了，
+                   空串会写进 badModels 且界面上看不到原因。 */
+                return reason.trim().isEmpty()
+                        ? ("HTTP " + resp.code + "（无响应体）") : reason;
+            }
             if (text.contains("\"error\"")) return shortenReason(text);
             return null;
         } catch (Exception e) {
@@ -3758,7 +3961,7 @@ public final class Server {
             // 真机实测：同一批 12 账号连跑三轮，失败数 2 / 0 / 1，变动的全是免费池的 429。
             /* 传异常对象而不是只看文本：Throttled 上挂着 LocalReason 时直接判定，
                不必再靠中文字面量猜"这是不是我们自己造成的"。 */
-            if (Detect.isTransient(e) || Detect.isTransient(why)) {
+            if (scope == FailScope.TRANSIENT || Detect.isTransient(e) || Detect.isTransient(why)) {
                 Log.i("上游暂时失败，不标记账号不可用：" + p.name + " · " + why);
             } else {
                 p.lastError = why;
@@ -3901,6 +4104,7 @@ public final class Server {
             } catch (Exception e) {
                 recordDirectOutcome(p, um, req.ephemeral, t0, e);
                 last = e;
+                if (e instanceof ClientGone) return;
                 if (!(e instanceof Throttled)) {
                     Log.w("ollama 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                 }
@@ -4185,6 +4389,7 @@ public final class Server {
         req.maxTokens = Proto.optInt(body, "max_tokens");
         req.temperature = Proto.optDouble(body, "temperature");
         req.topP = Proto.optDouble(body, "top_p");
+        req.topK = Proto.optInt(body, "top_k");
         Object stop = body.opt("stop");
         if (stop instanceof String) req.stop.add((String) stop);
         else if (stop instanceof JSONArray) {
@@ -4262,6 +4467,7 @@ public final class Server {
             } catch (Exception e) {
                 recordDirectOutcome(p, um, req.ephemeral, t0, e);
                 last = e;
+                if (e instanceof ClientGone) return;
                 if (!(e instanceof Throttled)) {
                     Log.w("completions 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                 }
@@ -4773,6 +4979,22 @@ public final class Server {
                 || wantsAudioOutput(body);
         req.rawResponse = wantRaw && req.tools.isEmpty()
                 && !Router.isVirtual(req.model);
+        if (wantRaw && !req.tools.isEmpty()) {
+            /* 带工具时不走 raw（工具参数修复/换号优先），但也不能把这些字段
+               原样发给上游：n>1 会按多份计费却只回一个 choice，logprobs 则会被
+               canonical 静默丢掉。统一去掉并留一条可见日志。 */
+            boolean stripped = false;
+            for (String k : new String[]{"n", "logprobs", "top_logprobs", "audio", "modalities"}) {
+                if (req.extraBody.has(k)) {
+                    req.extraBody.remove(k);
+                    stripped = true;
+                }
+            }
+            if (stripped) {
+                Log.w("工具请求暂不支持 n/logprobs/音频保真，已按 n=1、无 logprobs 转发："
+                        + req.model);
+            }
+        }
         if (Router.isVirtual(req.model)) {
             if (Router.AUTO_RACE.equalsIgnoreCase(req.model) && req.stream && req.tools.isEmpty()) {
                 serveRace(r, out, req);
@@ -4809,17 +5031,24 @@ public final class Server {
                     new Fronts.OpenAiFront.Streamer(w, req.model, !wantLogprobs);
             Exception last = null;
             for (int i = 0; i < tries; i++) {
+                /* 换号前清掉上一个候选压着的 role/音频分片，别把两个上游的流拼在一起。 */
+                if (i > 0) streamer.resetAttempt();
                 Config.Provider p = cands.get(i);
                 String um = upstreamModel(p, req.model);
                 long t0 = System.currentTimeMillis();
                 try {
                     serve(req.model, p, um, req, streamer);
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    if (req.rawResponse && !streamer.rawSeen()) {
+                        Log.w("保真请求被渠道降级为 canonical（该渠道不支持原样透传）："
+                                + p.name + "/" + um);
+                    }
                     last = null;
                     break;
                 } catch (Exception e) {
                     recordDirectOutcome(p, um, req.ephemeral, t0, e);
                     last = e;
+                    if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
                         Log.w("直连第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
@@ -4876,6 +5105,10 @@ public final class Server {
                 try {
                     serve(req.model, p, um, req, c);
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    if (req.rawResponse && c.rawBody == null) {
+                        Log.w("保真请求被渠道降级为 canonical（该渠道不支持原样透传）："
+                                + p.name + "/" + um);
+                    }
                     /* 保真模式拿到的是上游完整响应体：多 choice / logprobs 都在里面，
                        不再用 canonical 重新拼。上游不支持保真时 rawBody 为 null，
                        照旧走 render()，行为与以前完全一致。 */
@@ -4886,6 +5119,8 @@ public final class Server {
                 } catch (Exception e) {
                     recordDirectOutcome(p, um, req.ephemeral, t0, e);
                     last = e;
+                    /* 写响应时客户端断开：不能换号重发（会白烧一次完整 completion）。 */
+                    if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
                         Log.w("直连第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
@@ -5158,12 +5393,16 @@ public final class Server {
                     return;
                 } catch (Exception e) {
                     last = e;
+                    FailScope sc = FailScope.of(e);
                     if (e instanceof ClientGone) {
                         Log.i("候选调用期间客户端断开，不记失败：" + c.key());
                         Router.abortProbe(c.key());
-                    } else if (e instanceof InvalidRequest) {
-                        // 请求本身的问题：**不能**对每个候选各记一次失败，否则一次坏请求打残整组
-                        Log.w("候选被上游拒绝（请求问题，不记失败）：" + c.key() + " · " + e.getMessage());
+                    } else if (e instanceof InvalidRequest
+                            || sc.modelScoped() || sc == FailScope.REQUEST) {
+                        // 请求/模型问题：**不能**对每个候选各记一次失败，
+                        // 否则一次坏请求/坏模型会把整组账号打残。
+                        Log.w("候选被拒绝（模型/请求问题，不记账号失败）：" + c.key()
+                                + " · " + e.getMessage());
                         Router.abortProbe(c.key());
                     } else if (!(e instanceof Throttled)) {
                         // 限流/额度耗尽的记录在 serve() 里做过，这里只保证"不记失败"
@@ -5171,7 +5410,6 @@ public final class Server {
                     }
                     Log.w("虚拟模型 " + req.model + " 第 " + (i + 1) + " 个候选失败（"
                             + c.key() + "）：" + e.getMessage());
-                    FailScope sc = FailScope.of(e);
                     if (sc.stopRotation()) {
                         last = e;
                         break;
@@ -5221,11 +5459,14 @@ public final class Server {
                 return;
             } catch (Exception e) {
                 last = e;
+                FailScope sc = FailScope.of(e);
                 if (e instanceof ClientGone) {
                     Log.i("候选调用期间客户端断开，不记失败：" + c.key());
                     Router.abortProbe(c.key());
-                } else if (e instanceof InvalidRequest) {
-                    Log.w("候选被上游拒绝（请求问题，不记失败）：" + c.key() + " · " + e.getMessage());
+                } else if (e instanceof InvalidRequest
+                        || sc.modelScoped() || sc == FailScope.REQUEST) {
+                    Log.w("候选被拒绝（模型/请求问题，不记账号失败）：" + c.key()
+                            + " · " + e.getMessage());
                     Router.abortProbe(c.key());
                 } else if (!(e instanceof Throttled)) {
                     Router.recordFail(c.key(), String.valueOf(e.getMessage()));
@@ -5239,14 +5480,13 @@ public final class Server {
                         JSONObject err = new JSONObject();
                         err.put("error", new JSONObject()
                                 .put("message", String.valueOf(e.getMessage()))
-                                .put("type", "upstream_error"));
+                                .put("type", sc.clientType()));
                         dw.write("data: " + err + "\n\n");
                         dw.flush();
                     } catch (Exception ignored) {
                     }
                     return;
                 }
-                FailScope sc = FailScope.of(e);
                 if (sc.stopRotation()) {
                     last = e;
                     break;
@@ -5459,6 +5699,7 @@ public final class Server {
                 } catch (Exception e) {
                     recordDirectOutcome(p, um, req.ephemeral, t0, e);
                     last = e;
+                    if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
                         Log.w("Anthropic 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
@@ -5549,6 +5790,7 @@ public final class Server {
                 } catch (Exception e) {
                     recordDirectOutcome(p, um, req.ephemeral, t0, e);
                     last = e;
+                    if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
                         Log.w("Gemini 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
@@ -5631,6 +5873,11 @@ public final class Server {
         chat.put("stream", body.optBoolean("stream", false));
         Integer mt = Proto.optInt(body, "max_output_tokens");
         if (mt != null) chat.put("max_tokens", mt.intValue());
+        /* Responses 也有标准的 temperature / top_p；top_k 是非标准但常见的扩展。
+           以前这里只转 model/stream/max_tokens，采样参数被整个丢掉。 */
+        if (body.has("temperature")) chat.put("temperature", body.opt("temperature"));
+        if (body.has("top_p")) chat.put("top_p", body.opt("top_p"));
+        if (body.has("top_k")) chat.put("top_k", body.opt("top_k"));
         List<JSONObject> msgs = new ArrayList<>();
         String instructions = Proto.optString(body, "instructions", "");
         if (!instructions.isEmpty()) {
@@ -6021,6 +6268,7 @@ public final class Server {
                 } catch (Exception e) {
                     recordDirectOutcome(cp, cum, req.ephemeral, t0, e);
                     last = e;
+                    if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
                         Log.w("Responses 第 " + (i + 1) + " 个候选失败（" + cp.name + "）：" + e.getMessage());
                     }

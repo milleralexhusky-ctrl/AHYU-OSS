@@ -29,7 +29,15 @@ import java.util.UUID;
 public final class Realtime {
 
     private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    private static final int MAX_FRAME = 16 * 1024 * 1024;
+    /* Realtime 只传文本事件，1MB 单帧已经远大于正常使用（音频本来就不收）。
+       以前单帧 16MB、分片和会话消息都没有总上限，一个客户端可以一直发，
+       把 fragments / messages 堆到 OOM。 */
+    private static final int MAX_FRAME = 2 * 1024 * 1024;
+    /** 一条分片消息的总上限。 */
+    private static final int MAX_MESSAGE = 4 * 1024 * 1024;
+    /** 会话里保留的消息条数与总字符上限。 */
+    private static final int MAX_MESSAGES = 500;
+    private static final int MAX_CONTEXT_CHARS = 2 * 1024 * 1024;
 
     private Realtime() {
     }
@@ -56,6 +64,7 @@ public final class Realtime {
         if (model.isEmpty()) model = "auto";
         String instructions = "";
         List<JSONObject> messages = new ArrayList<>();
+        int contextChars = 0;
 
         JSONObject session = new JSONObject();
         session.put("id", sessionId);
@@ -121,10 +130,20 @@ public final class Realtime {
                     } else {
                         fragOpcode = 0x1;
                         fragments.reset();
+                        if (f.payload.length > MAX_MESSAGE) {
+                            sendError(out, "message too large");
+                            sendClose(out, new byte[]{0x03, (byte) 0xF1});
+                            return;
+                        }
                         fragments.write(f.payload);
                     }
                 } else if (f.opcode == 0x0) {
                     if (fragOpcode == 0x1) {
+                        if ((long) fragments.size() + f.payload.length > MAX_MESSAGE) {
+                            sendError(out, "message too large");
+                            sendClose(out, new byte[]{0x03, (byte) 0xF1});   // 1009 message too big
+                            return;
+                        }
                         fragments.write(f.payload);
                         if (f.fin) {
                             payload = fragments.toByteArray();
@@ -160,6 +179,13 @@ public final class Realtime {
                     JSONObject m = new JSONObject();
                     m.put("role", role);
                     m.put("content", text);
+                    int addChars = text == null ? 0 : text.length();
+                    if (messages.size() >= MAX_MESSAGES
+                            || (long) contextChars + addChars > MAX_CONTEXT_CHARS) {
+                        sendError(out, "conversation context too large");
+                        continue;
+                    }
+                    contextChars += addChars;
                     messages.add(m);
                     item.put("id", Proto.optString(item, "id", "item_" + UUID.randomUUID()
                             .toString().replace("-", "").substring(0, 12)));
@@ -365,7 +391,7 @@ public final class Realtime {
         return f;
     }
 
-    private static synchronized void writeFrame(OutputStream out, int opcode, byte[] payload)
+    private static void writeFrame(OutputStream out, int opcode, byte[] payload)
             throws Exception {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x80 | opcode);
@@ -381,8 +407,12 @@ public final class Realtime {
             for (int i = 7; i >= 0; i--) buf.write((int) (((long) len >> (8 * i)) & 0xFF));
         }
         if (len > 0) buf.write(payload);
-        out.write(buf.toByteArray());
-        out.flush();
+        /* 只锁本连接的写端，不用类锁：一个不读数据的 WS 客户端阻塞在 write 上时，
+           不应该把其它所有 Realtime 会话的 send/ping 一起冻住。 */
+        synchronized (out) {
+            out.write(buf.toByteArray());
+            out.flush();
+        }
     }
 
     private static void send(OutputStream out, String type, JSONObject extra) {

@@ -1,11 +1,12 @@
 package com.cpa.gateway.core;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 
@@ -84,9 +85,16 @@ public final class OAuth {
             long deadline = System.currentTimeMillis() + timeoutMs;
             while (System.currentTimeMillis() < deadline) {
                 final Socket client = server.accept();
-                String requestLine;
-                BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream(), "UTF-8"));
-                requestLine = in.readLine();
+                /* 回调只应来自本机浏览器：监听端口虽然绑在通配地址上（兼容 localhost
+                   解析成 ::1），但非回环来源一律不接受，避免局域网内伪造回调。 */
+                if (!client.getInetAddress().isLoopbackAddress()) {
+                    Log.w(providerLabel + " 回调来自非回环地址，已忽略："
+                            + client.getInetAddress());
+                    client.close();
+                    continue;
+                }
+                client.setSoTimeout(10_000);
+                String requestLine = readRequestLine(client, 8192);
                 String path = "/";
                 if (requestLine != null && requestLine.startsWith("GET ")) {
                     int http = requestLine.indexOf(" HTTP/");
@@ -114,7 +122,16 @@ public final class OAuth {
                 out.flush();
                 client.close();
 
-                if (error != null) throw new IllegalStateException("授权被拒绝：" + error + " " + (errorDesc == null ? "" : errorDesc));
+                if (error != null) {
+                    /* 没有正确 state 的 error 也不能当真：否则本机任意应用
+                       往回调端口塞一个 ?error=access_denied 就能打断用户登录。 */
+                    if (!stateOk) {
+                        Log.w(providerLabel + " 忽略无 state 的 error 回调（可能是别的应用发来的）");
+                        continue;
+                    }
+                    throw new IllegalStateException("授权被拒绝：" + error + " "
+                            + (errorDesc == null ? "" : errorDesc));
+                }
                 if (code != null && !code.isEmpty()) {
                     if (!stateOk) {
                         Log.w(providerLabel + " 回调 state 不匹配或缺失，已忽略（可能是别的应用发来的）");
@@ -134,6 +151,23 @@ public final class OAuth {
     }
 
     /** A previous attempt can leave the port bound until its timeout, so take it back deliberately. */
+    /**
+     * 有上限地读一行请求行。
+     *
+     * BufferedReader.readLine() 没有长度上限，回调端口又在登录期间一直开着；
+     * 一个本地连接发一条超长行就能把内存吃掉。这里最多读 max 字节。
+     */
+    private static String readRequestLine(Socket client, int max) throws Exception {
+        InputStream in = client.getInputStream();
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        int c;
+        while ((c = in.read()) != -1 && c != '\n') {
+            if (c != '\r') b.write(c);
+            if (b.size() > max) break;
+        }
+        return new String(b.toByteArray(), StandardCharsets.UTF_8);
+    }
+
     private static ServerSocket bind(String providerLabel, int port) throws Exception {
         try {
             return new ServerSocket(port);
@@ -157,8 +191,14 @@ public final class OAuth {
             long deadline = System.currentTimeMillis() + timeoutMs;
             while (System.currentTimeMillis() < deadline) {
                 Socket client = server.accept();
-                BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream(), "UTF-8"));
-                String requestLine = in.readLine();
+                if (!client.getInetAddress().isLoopbackAddress()) {
+                    Log.w(providerLabel + " 回调来自非回环地址，已忽略："
+                            + client.getInetAddress());
+                    client.close();
+                    continue;
+                }
+                client.setSoTimeout(10_000);
+                String requestLine = readRequestLine(client, 8192);
                 String target = "";
                 if (requestLine != null && requestLine.startsWith("GET ")) {
                     int http = requestLine.indexOf(" HTTP/");

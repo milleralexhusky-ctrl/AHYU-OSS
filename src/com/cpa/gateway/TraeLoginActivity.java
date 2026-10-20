@@ -83,7 +83,7 @@ public class TraeLoginActivity extends LoginPageBase {
                 web.loadUrl(authUrl);
             });
             String raw = OAuth.waitForRawQuery("Trae", Trae.CALLBACK_PORT, 10 * 60 * 1000L);
-            Log.i("trae 收到回调：" + Upstreams.shortenPublic(raw));
+            Log.i("trae 收到回调（凭据已脱敏，不写入日志）");
             post(() -> setStatus("正在换取凭据…", true));
             Trae.Account acc = Trae.parseCallback(raw);
             acc.machineId = machineId;

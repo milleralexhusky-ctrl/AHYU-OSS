@@ -346,10 +346,14 @@ public final class WorkBuddy {
             return out;
         }
         Account acc = probe;
-        Log.i("workbuddy 授权返回：uid=" + acc.uid + " realm=" + acc.realm + " 原始=" + Upstreams.shortenPublic(body));
-        if (acc == null || acc.accessToken.isEmpty()) {
+        if (acc == null) {
             Log.w("workbuddy 授权响应无法解析：" + Upstreams.shortenPublic(body));
-            throw new IllegalStateException("授权已返回但没解析到 access_token，原始响应已写日志：" + Upstreams.shortenPublic(body));
+            throw new IllegalStateException("授权已返回但没解析到 access_token，原始响应已写日志（已脱敏）");
+        }
+        Log.i("workbuddy 授权返回：uid=" + acc.uid + " realm=" + acc.realm);
+        if (acc.accessToken.isEmpty()) {
+            Log.w("workbuddy 授权响应没有 access_token：" + Upstreams.shortenPublic(body));
+            throw new IllegalStateException("授权已返回但没解析到 access_token，原始响应已写日志（已脱敏）");
         }
         if (acc.uid.isEmpty() || acc.nickname.isEmpty()) {
             try {
@@ -529,7 +533,7 @@ public final class WorkBuddy {
     public static Account ensureFresh(Config.Provider p) throws Exception {
         // 原来是 static synchronized（类级锁）：一个账号走网络刷新 token 时，
         // 同 Provider 的其他账号全被堵住。现在按账号加锁，各刷各的。
-        synchronized (FreshLocks.forKey(p.name)) {
+        synchronized (FreshLocks.of(p)) {
             return ensureFreshInner(p);
         }
     }

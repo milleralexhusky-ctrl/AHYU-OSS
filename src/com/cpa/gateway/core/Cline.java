@@ -111,7 +111,7 @@ public final class Cline {
      * 不把"续期失败"伪装成成功）。
      */
     public static Account ensureFresh(Config.Provider p) {
-        synchronized (FreshLocks.forKey(p == null ? "cline" : p.name)) {
+        synchronized (FreshLocks.of(p)) {
             return ensureFreshInner(p);
         }
     }

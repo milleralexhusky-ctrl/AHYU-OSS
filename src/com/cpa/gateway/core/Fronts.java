@@ -365,7 +365,32 @@ public final class Fronts {
              * roleSent 是第一个 chunk 的标记，拿它当"已提交"的判据最保守。
              */
             public boolean committed() {
-                return roleSent || rawWrote;
+                /* rawEnded 也算已提交：上游/中转可能发完 [DONE] 后不关连接，
+                   Http 层随后读超时；这时客户端已经拿完整流，不能再换号重写一份。 */
+                return roleSent || rawWrote || rawEnded;
+            }
+
+            /** 这次请求有没有真的走成 raw（用于回退 canonical 时留一条可观测日志）。 */
+            public boolean rawSeen() {
+                return rawWrote || rawEnded;
+            }
+
+            /**
+             * 换号重试前清掉上一次尝试的残留（4.50.3）。
+             *
+             * Streamer 建在重试循环外，rawPending 里可能还压着上一个候选的
+             * role 空壳/音频分片；不清的话，B 的第一条实质分片会把 A 的分片
+             * 一起冲出去，同一个流里出现两个上游的 id/音频。
+             */
+            public void resetAttempt() {
+                rawPending.clear();
+                rawStrippers.clear();
+                rawWrote = false;
+                rawEnded = false;
+                roleSent = false;
+                seen.setLength(0);
+                toolIndex = 0;
+                toolStarted[0] = false;
             }
 
             /* ------------------------------------------------ 响应保真（4.50.0） */
@@ -387,6 +412,10 @@ public final class Fronts {
                     if (!Proto.optString(d, "content", "").isEmpty()) return true;
                     if (!Proto.optString(d, "reasoning_content", "").isEmpty()) return true;
                     if (!Proto.optString(d, "reasoning", "").isEmpty()) return true;
+                    if (!Proto.optString(d, "refusal", "").isEmpty()) return true;
+                    /* 音频分片也是实质内容：不认它会把整段音频压进 rawPending，
+                       既不能增量下发，断流时还会换号重下。 */
+                    if (d.opt("audio") != null) return true;
                     JSONArray tc = d.optJSONArray("tool_calls");
                     if (tc != null && tc.length() > 0) return true;
                 }
@@ -420,6 +449,14 @@ public final class Fronts {
                 sse(w, chunk.toString());
             }
 
+            /** 把压着的 role/空壳分片写出去。写过就视为已提交。 */
+            private void flushPending() throws Exception {
+                if (rawPending.isEmpty()) return;
+                for (JSONObject p : rawPending) writeRaw(p);
+                rawPending.clear();
+                rawWrote = true;
+            }
+
             @Override
             public void rawChunk(JSONObject chunk) {
                 if (chunk == null) return;
@@ -430,10 +467,7 @@ public final class Fronts {
                         rawPending.add(chunk);
                         return;
                     }
-                    if (!rawWrote) {
-                        for (JSONObject p : rawPending) writeRaw(p);
-                        rawPending.clear();
-                    }
+                    flushPending();
                     rawWrote = true;
                     writeRaw(chunk);
                 } catch (Exception ignored) {
@@ -443,12 +477,15 @@ public final class Fronts {
             @Override
             public void rawDone() {
                 if (rawEnded) return;
-                rawEnded = true;
                 try {
+                    /* 只有 role 分片、没有正文的空 completion：至少把 role 写出去，
+                       否则客户端收到一条只有 [DONE] 的流。 */
+                    flushPending();
                     sse(w, "[DONE]");
                     w.flush();
                 } catch (Exception ignored) {
                 }
+                rawEnded = true;
             }
 
             private void chunk(JSONObject delta, String finishReason) throws Exception {
@@ -609,6 +646,8 @@ public final class Fronts {
             if (opts != null) {
                 if (opts.has("temperature")) out.put("temperature", opts.opt("temperature"));
                 if (opts.has("top_p")) out.put("top_p", opts.opt("top_p"));
+                /* Ollama 的 options.top_k 与 OpenAI 兼容端点的 top_k 同义。 */
+                if (opts.has("top_k")) out.put("top_k", opts.opt("top_k"));
                 if (opts.has("num_predict")) out.put("max_tokens", opts.opt("num_predict"));
                 Object stop = opts.opt("stop");
                 if (stop != null) out.put("stop", stop);

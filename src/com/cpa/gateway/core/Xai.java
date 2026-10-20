@@ -266,7 +266,7 @@ public final class Xai {
 
     /** 单一刷新入口（按账号加锁，各刷各的）。 */
     public static Account ensureFresh(Config.Provider p) throws Exception {
-        synchronized (FreshLocks.forKey(p.name)) {
+        synchronized (FreshLocks.of(p)) {
             return ensureFreshInner(p);
         }
     }

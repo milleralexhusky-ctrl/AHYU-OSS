@@ -186,7 +186,7 @@ public final class Codex {
     public static Account ensureFresh(Config.Provider p) throws Exception {
         // 原来是 static synchronized（类级锁）：一个账号走网络刷新 token 时，
         // 同 Provider 的其他账号全被堵住。现在按账号加锁，各刷各的。
-        synchronized (FreshLocks.forKey(p.name)) {
+        synchronized (FreshLocks.of(p)) {
             return ensureFreshInner(p);
         }
     }

@@ -68,26 +68,39 @@ DEBUG_SRC=src/com/cpa/gateway/core/Debug.java
 cp $DEBUG_SRC $OUT/Debug.java.bak
 restore_debug() { cp $OUT/Debug.java.bak $DEBUG_SRC 2>/dev/null || true; }
 
-# 构建期私密常量：公库为空，私库从 .private/signing.env 注入。
-# 和 Debug.java 一样，构建结束必须还原，否则密钥会被写进源码、下次提交就漏进公库。
-SECRETS_SRC=src/com/cpa/gateway/core/BuildSecrets.java
-cp $SECRETS_SRC $OUT/BuildSecrets.java.bak
-restore_secrets() { cp $OUT/BuildSecrets.java.bak $SECRETS_SRC 2>/dev/null || true; }
-restore_all() { restore_debug; restore_secrets; }
-trap restore_all EXIT INT TERM
+trap restore_debug EXIT INT TERM
 
-if [ -n "${ANTIGRAVITY_CLIENT_SECRET:-}" ]; then
-  # 只允许安全字符，避免把 sed 分隔符/引号带进生成的 Java 字面量。
-  case "$ANTIGRAVITY_CLIENT_SECRET" in
-    *[!A-Za-z0-9._~-]*)
-      echo "[错误] ANTIGRAVITY_CLIENT_SECRET 含有不支持的字符"; exit 1 ;;
-  esac
-  sed -i "s|static final String ANTIGRAVITY_CLIENT_SECRET = .*|static final String ANTIGRAVITY_CLIENT_SECRET = \"$ANTIGRAVITY_CLIENT_SECRET\";|" \
-    $SECRETS_SRC
-  echo "已注入 Antigravity OAuth Client Secret（来自构建环境）"
-else
-  echo "未提供 ANTIGRAVITY_CLIENT_SECRET：本包无法完成 Antigravity 账号登录（公库默认行为）"
-fi
+# 构建期私密常量**不放在源码树里**，而是生成到 out/gen（未跟踪）。
+# 以前是 sed 改写被跟踪的 BuildSecrets.java，再靠 trap 还原；SIGKILL/断电
+# 不会触发 trap，密钥就会留在工作区、被下一次 commit / sync-public 带走。
+# 现在生成物只存在于 out/（gitignore），源码树里根本没有这个文件。
+write_build_secrets() {
+  SECRET_VALUE="${ANTIGRAVITY_CLIENT_SECRET:-}"
+  if [ -n "$SECRET_VALUE" ]; then
+    # 只允许安全字符，避免把引号/反斜杠带进 Java 字面量。
+    case "$SECRET_VALUE" in
+      *[!A-Za-z0-9._~-]*)
+        echo "[错误] ANTIGRAVITY_CLIENT_SECRET 含有不支持的字符"; exit 1 ;;
+    esac
+  fi
+  mkdir -p "$OUT/gen/com/cpa/gateway/core"
+  cat > "$OUT/gen/com/cpa/gateway/core/BuildSecrets.java" <<JAVA
+package com.cpa.gateway.core;
+
+/** 构建期生成，不进入源码树；公库构建时为空串。 */
+final class BuildSecrets {
+    private BuildSecrets() {
+    }
+
+    static final String ANTIGRAVITY_CLIENT_SECRET = "$SECRET_VALUE";
+}
+JAVA
+  if [ -n "$SECRET_VALUE" ]; then
+    echo "已注入 Antigravity OAuth Client Secret（生成到 out/gen，不进源码树）"
+  else
+    echo "未提供 ANTIGRAVITY_CLIENT_SECRET：本包无法完成 Antigravity 账号登录（公库默认行为）"
+  fi
+}
 
 echo "构建版本 $VERSION_NAME ($VERSION_CODE)"
 echo "[1/6] aapt2 compile"
@@ -115,6 +128,8 @@ else
     src/com/cpa/gateway/core/Debug.java
   echo "发布构建：/v1/debug/* 已关闭"
 fi
+
+write_build_secrets
 
 echo "[3/6] javac"
 find src $OUT/gen -name '*.java' > $OUT/sources.txt

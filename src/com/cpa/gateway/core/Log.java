@@ -119,7 +119,41 @@ public final class Log {
         }
     }
 
+    /* ------------------------------------------------------- 日志脱敏（4.50.3）
+     *
+     * 登录回调、上游 token 响应、错误体都可能带凭据；日志会落盘并被打进诊断包。
+     * 在**入口**统一脱敏，比逐个调用点记得"别打印"可靠。
+     * 只处理明确的凭据形状，不动普通错误码（例如 {"code":14018} 保留）。
+     */
+    private static final java.util.regex.Pattern[] SECRET_PATTERNS = {
+            /* URL / query 里的 OAuth 参数 */
+            java.util.regex.Pattern.compile(
+                    "(?i)([?&](?:code|state|refreshToken|userJwt|userInfo|access_token|refresh_token)=)[^&\\s]+"),
+            /* JSON / 表单里的 token 字段 */
+            java.util.regex.Pattern.compile(
+                    "(?i)(\"?(?:access_token|refresh_token|id_token|refreshToken|userJwt|userInfo|authorization|x-api-key|x-goog-api-key|api[_-]?key|state)\"?\\s*[:=]\\s*\"?)([^\"\\s,&}]+)"),
+            /* Bearer / JWT */
+            java.util.regex.Pattern.compile("(?i)(Bearer\\s+)[A-Za-z0-9._~+/-]{8,}=*"),
+            java.util.regex.Pattern.compile(
+                    "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}"),
+            /* 常见厂商 key 形状 */
+            java.util.regex.Pattern.compile("(?i)(GOCSPX-|ghp_|github_pat_|sk-|AIza)[A-Za-z0-9._-]{8,}"),
+    };
+
+    /** 对一行日志做凭据脱敏。包可见，方便自检。 */
+    static String scrub(String msg) {
+        if (msg == null || msg.isEmpty()) return msg;
+        String out = msg;
+        out = SECRET_PATTERNS[0].matcher(out).replaceAll("$1***");
+        out = SECRET_PATTERNS[1].matcher(out).replaceAll("$1***");
+        out = SECRET_PATTERNS[2].matcher(out).replaceAll("$1***");
+        out = SECRET_PATTERNS[3].matcher(out).replaceAll("jwt:***");
+        out = SECRET_PATTERNS[4].matcher(out).replaceAll("$1***");
+        return out;
+    }
+
     private static void add(String level, String msg) {
+        msg = scrub(msg);
         String line = FMT.get().format(new Date()) + " [" + level + "] " + msg;
         toDisk(line);
         try {

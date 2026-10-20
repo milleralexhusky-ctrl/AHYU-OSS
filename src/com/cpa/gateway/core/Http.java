@@ -395,11 +395,21 @@ public final class Http {
         }
     }
 
+    /** 单个上游响应体的上限。音频/二进制也够用；再大就断开，别把手机堆吃穿。 */
+    private static final int MAX_RESP_BYTES = 32 * 1024 * 1024;
+
     private static byte[] readBytes(InputStream in) throws IOException {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         int n;
-        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        int total = 0;
+        while ((n = in.read(buf)) > 0) {
+            total += n;
+            if (total > MAX_RESP_BYTES) {
+                throw new IOException("upstream response too large (> " + MAX_RESP_BYTES + " bytes)");
+            }
+            bos.write(buf, 0, n);
+        }
         return bos.toByteArray();
     }
 
@@ -407,7 +417,14 @@ public final class Http {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         int n;
-        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        int total = 0;
+        while ((n = in.read(buf)) > 0) {
+            total += n;
+            if (total > MAX_RESP_BYTES) {
+                throw new IOException("upstream response too large (> " + MAX_RESP_BYTES + " bytes)");
+            }
+            bos.write(buf, 0, n);
+        }
         return new String(bos.toByteArray(), StandardCharsets.UTF_8);
     }
 

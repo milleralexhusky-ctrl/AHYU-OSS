@@ -81,6 +81,9 @@ public final class Selftest {
         add(out, "响应保真透传（logprobs / 多 choice / 正文不被改写）", Selftest::checkRawFidelity);
         add(out, "top_k 跨协议等价翻译（Anthropic ↔ Gemini）", Selftest::checkTopK);
         add(out, "失败作用域（坏模型 / 坏号 / 坏请求）", Selftest::checkFailScope);
+        add(out, "HTTP 头与行长度上限（防内存耗尽）", Selftest::checkHttpLimits);
+        add(out, "浏览器跨源防护（无 Key 时拒绝外部网页）", Selftest::checkBrowserOrigin);
+        add(out, "日志脱敏（token/state/JWT，不误伤业务码）", Selftest::checkLogScrub);
         return out;
     }
 
@@ -883,6 +886,92 @@ public final class Selftest {
      *
      * 这三条都是 4.37.0 修过的真实缺陷；用固定字节回放，防止以后改解析时回归。
      */
+    /**
+     * HTTP 头的内存上限（4.50.3）。
+     *
+     * 原来单行超过 64KB 只截断不报错，剩下的字节会留在流里被当成下一条请求；
+     * 头也没有总条数/总字节上限。LAN 模式下这两条都能被用来打内存或打乱 keep-alive。
+     */
+    private static String checkHttpLimits() {
+        try {
+            StringBuilder big = new StringBuilder("GET /health HTTP/1.1\r\nX-Big: ");
+            while (big.length() < 70 * 1024) big.append('a');
+            big.append("\r\n\r\n");
+            if (!readFails(big.toString())) return "超长请求头行没有被拒绝";
+
+            StringBuilder many = new StringBuilder("GET /health HTTP/1.1\r\n");
+            for (int i = 0; i < 300; i++) many.append("X-").append(i).append(": a\r\n");
+            many.append("\r\n");
+            if (!readFails(many.toString())) return "请求头条数没有上限";
+
+            Server.Req ok = Server.readRequest(new java.io.BufferedInputStream(
+                    new java.io.ByteArrayInputStream(("GET /health HTTP/1.1\r\n"
+                            + "Host: selftest\r\n\r\n").getBytes("UTF-8")), 8192));
+            if (ok == null || !"/health".equals(ok.path)) return "正常请求被上限误伤";
+            return null;
+        } catch (Throwable t) {
+            return "HTTP 上限自检异常：" + t;
+        }
+    }
+
+    /**
+     * 浏览器跨源防护（4.50.3）：没设 API Key 时，外部网页不能直接驱动本机网关。
+     *
+     * 这里只测纯函数；真正的拦截在 Server.route 与 Realtime 握手处。
+     */
+    private static String checkBrowserOrigin() {
+        String[][] cases = {
+                {"", "false"},
+                {"null", "true"},
+                {"app://local", "false"},
+                {"http://127.0.0.1:3000", "false"},
+                {"http://127.0.0.1", "false"},
+                {"http://localhost:8080", "false"},
+                {"http://tauri.localhost", "false"},
+                {"http://[::1]:8080", "false"},
+                {"https://evil.example", "true"},
+                {"http://localhost.evil.example", "true"},
+                {"http://127.0.0.1.evil.example", "true"},
+                {"http://evil.example/localhost", "true"},
+        };
+        for (String[] c : cases) {
+            boolean want = "true".equals(c[1]);
+            boolean got = Server.isForeignBrowserOrigin(c[0]);
+            if (got != want) {
+                return "Origin=" + c[0] + "：期望 " + (want ? "拦截" : "放行")
+                        + "，实际 " + (got ? "拦截" : "放行");
+            }
+        }
+        return null;
+    }
+
+    /** 日志脱敏（4.50.3）：凭据不能进日志/诊断包，普通业务码要保留。 */
+    private static String checkLogScrub() {
+        String raw = "GET /cb?refreshToken=abc123456&state=st987654&userJwt=xyz "
+                + "Authorization: Bearer sk-abcdef1234567890 "
+                + "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop";
+        String out = Log.scrub(raw);
+        for (String secret : new String[]{"abc123456", "st987654", "xyz",
+                "sk-abcdef1234567890", "eyJhbGciOiJIUzI1NiJ9"}) {
+            if (out.contains(secret)) return "日志里仍出现凭据：" + secret;
+        }
+        if (!out.contains("***")) return "脱敏后没有替换标记";
+        String biz = Log.scrub("{\"code\":14018,\"msg\":\"credits exhausted\"}");
+        if (!biz.contains("14018")) return "业务码 14018 被误脱敏：" + biz;
+        return null;
+    }
+
+    /** 这段原始请求是否会被 readRequest 拒绝。 */
+    private static boolean readFails(String raw) {
+        try {
+            Server.readRequest(new java.io.BufferedInputStream(
+                    new java.io.ByteArrayInputStream(raw.getBytes("UTF-8")), 8192));
+            return false;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     private static String checkHttpRequestReplay() {
         try {
             String body = "{\"q\":\"你好\"}";
@@ -1112,6 +1201,50 @@ public final class Selftest {
         if (out.contains("\"finish_reason\":\"stop\"")) {
             return "保真模式仍补写了 canonical 收尾分片";
         }
+
+        /* 换号残留：A 的 role 空壳不能跟着 B 的正文一起发出去。 */
+        java.io.StringWriter sw2 = new java.io.StringWriter();
+        Fronts.OpenAiFront.Streamer s2 = new Fronts.OpenAiFront.Streamer(
+                new java.io.BufferedWriter(sw2), "client-model", false);
+        JSONObject aRole = new JSONObject();
+        aRole.put("id", "id-from-A");
+        aRole.put("choices", new JSONArray().put(new JSONObject()
+                .put("index", 0).put("delta", new JSONObject().put("role", "assistant"))));
+        s2.rawChunk(aRole);
+        s2.resetAttempt();
+        JSONObject bBody = new JSONObject();
+        bBody.put("id", "id-from-B");
+        bBody.put("choices", new JSONArray().put(new JSONObject()
+                .put("index", 0).put("delta", new JSONObject().put("content", "B"))));
+        s2.rawChunk(bBody);
+        s2.rawDone();
+        if (sw2.toString().contains("id-from-A")) return "换号后残留了上一个候选的分片";
+        if (!sw2.toString().contains("id-from-B")) return "换号后的正常分片丢了";
+
+        /* 只有 role 的 completion：rawDone 要把 role 写出去，不能只剩 [DONE]。 */
+        java.io.StringWriter sw3 = new java.io.StringWriter();
+        Fronts.OpenAiFront.Streamer s3 = new Fronts.OpenAiFront.Streamer(
+                new java.io.BufferedWriter(sw3), "client-model", false);
+        JSONObject onlyRole = new JSONObject();
+        onlyRole.put("id", "role-only");
+        onlyRole.put("choices", new JSONArray().put(new JSONObject()
+                .put("index", 0).put("delta", new JSONObject().put("role", "assistant"))));
+        s3.rawChunk(onlyRole);
+        s3.rawDone();
+        if (!sw3.toString().contains("role-only")) return "只有 role 的空流把 role 丢了";
+        if (!sw3.toString().contains("data: [DONE]")) return "空流没补 [DONE]";
+
+        /* 音频分片必须算实质内容，不能压进 pending。 */
+        java.io.StringWriter sw4 = new java.io.StringWriter();
+        Fronts.OpenAiFront.Streamer s4 = new Fronts.OpenAiFront.Streamer(
+                new java.io.BufferedWriter(sw4), "client-model", false);
+        JSONObject audio = new JSONObject();
+        audio.put("id", "audio-1");
+        audio.put("choices", new JSONArray().put(new JSONObject()
+                .put("index", 0)
+                .put("delta", new JSONObject().put("audio", new JSONObject().put("data", "AAA")))));
+        s4.rawChunk(audio);
+        if (!sw4.toString().contains("audio-1")) return "音频分片被压进 pending，没有增量下发";
         return null;
     }
 
@@ -1202,7 +1335,21 @@ public final class Selftest {
                     "upstream HTTP 400 model gpt-x service info not found"));
             if (access != FailScope.MODEL_ACCESS) return "model not found 没归到模型接入";
             if (access.stopDirect()) return "model not found 不该在第一个账号就放弃（可能只是该号没有权限）";
-            if (!access.skipModelInRotation()) return "model not found 在轮换时没跳过该模型";
+            if (access.skipModelInRotation()) {
+                return "model not found 不该在轮换时封杀整个模型（可能只是当前账号没权限）";
+            }
+
+            FailScope trunc = FailScope.of(new ToolFix.BadToolCall("bash", "{oops", true));
+            if (trunc != FailScope.REQUEST) return "被 max_tokens 截断的坏工具参数没归到请求问题";
+            if (!trunc.stopDirect()) return "截断的坏工具参数还在换号重试";
+
+            FailScope badJson = FailScope.of(new InvalidRequest(400,
+                    "upstream HTTP 400 request body is not json"));
+            if (badJson != FailScope.REQUEST) return "请求体不是 JSON 被误判成网络/断流";
+
+            FailScope unsupported = FailScope.of(new InvalidRequest(400,
+                    "this model does not support tool_choice"));
+            if (unsupported != FailScope.REQUEST) return "模型不支持某参数被误判成模型接入问题";
 
             FailScope req = FailScope.of(new InvalidRequest(400,
                     "请求不合规（我们自己这侧，不是渠道问题）：tool_call 缺少 id"));
@@ -1216,6 +1363,14 @@ public final class Selftest {
             FailScope tr = FailScope.of(new java.io.IOException("connection timed out"));
             if (tr != FailScope.TRANSIENT) return "超时没归到暂时性失败";
             if (tr.stopDirect()) return "超时不该停止换号";
+
+            FailScope cut = FailScope.of(new java.io.IOException(
+                    "upstream stream ended before finish_reason"));
+            if (cut != FailScope.TRANSIENT) return "半截流没归到暂时性失败";
+            if (cut.stopDirect()) return "半截流不该停止换号";
+
+            FailScope ssl = FailScope.of(new javax.net.ssl.SSLHandshakeException("certificate"));
+            if (ssl != FailScope.TRANSIENT) return "TLS 握手失败没归到暂时性失败";
             return null;
         } catch (Throwable t) {
             return "失败作用域自检异常：" + t;

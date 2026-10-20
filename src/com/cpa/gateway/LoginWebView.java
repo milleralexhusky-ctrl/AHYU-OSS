@@ -104,6 +104,10 @@ final class LoginWebView {
 
     /** Wipes cookies, storage and cache so the next login page is a fresh, empty session. */
     static void clearSession(android.content.Context c) {
+        /* 登录页关闭时把内存里的明文凭据一起清掉，别让它驻留到进程结束。 */
+        lastAuthValue = "";
+        lastAuthHost = "";
+        lastAuthAt = 0L;
         try {
             CookieManager cm = CookieManager.getInstance();
             cm.setAcceptCookie(true);
@@ -205,8 +209,7 @@ final class LoginWebView {
                                 lastAuthValue = e.getValue().trim();
                                 lastAuthHost = request.getUrl() == null ? "" : request.getUrl().getHost();
                                 lastAuthAt = System.currentTimeMillis();
-                                Log.i("抓到网页登录凭据（" + lastAuthHost + "）："
-                                        + lastAuthValue.substring(0, Math.min(14, lastAuthValue.length())) + "…");
+                                Log.i("抓到网页登录凭据（" + lastAuthHost + "），内容不写入日志");
                                 java.util.function.BiConsumer<String, String> sink = AUTH_SINK;
                                 if (sink != null) {
                                     try {
@@ -285,7 +288,8 @@ final class LoginWebView {
             activity.startActivity(intent);
             return true;
         } catch (Throwable e) {
-            Log.w("没有任何应用能处理该链接：" + url);
+            /* URL 可能带 OAuth code/token，失败日志只说明"打不开"，不记完整地址。 */
+            Log.w("没有任何应用能处理该外部链接（URL 已省略）");
             return false;
         }
     }

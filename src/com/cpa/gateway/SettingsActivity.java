@@ -702,7 +702,15 @@ public class SettingsActivity extends Activity {
                 java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
                 byte[] buf = new byte[8192];
                 int n;
-                while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                int total = 0;
+                while ((n = in.read(buf)) > 0) {
+                    total += n;
+                    /* 先读后检查没有意义：超大文件已经把内存吃掉了。边读边限。 */
+                    if (total > 8 * 1024 * 1024) {
+                        throw new IllegalStateException("备份文件超过 8MB，拒绝加载");
+                    }
+                    bos.write(buf, 0, n);
+                }
                 in.close();
                 org.json.JSONObject restored = com.cpa.gateway.core.Backup
                         .importFrom(new String(bos.toByteArray(), "UTF-8"), password);
