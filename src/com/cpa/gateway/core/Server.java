@@ -1473,6 +1473,12 @@ public final class Server {
             writeJson(out, 200, wrap.toString(2));
             return;
         }
+        if ("/v1/debug/diagnostics".equals(path)) {
+            /* 调试包专用：直接下载诊断 zip，方便用 curl 取回，也方便测试。 */
+            byte[] zip = Diagnostics.build();
+            writeRaw(out, 200, "application/zip", zip, false);
+            return;
+        }
         if ("/v1/debug/selftest".equals(path)) {
             JSONObject out3 = new JSONObject();
             try {

@@ -194,6 +194,13 @@ public class SettingsActivity extends Activity {
         checkBtn.setOnClickListener(v -> runSelfCheck());
         dataCard.addView(checkBtn, Ui.lp(this, 12));
 
+        /* 排查支持：把版本/配置/日志/用量/自检打成一个 zip，避免用户到处找文件。 */
+        TextView diagBtn = Ui.outlineButton(this, "导出诊断包（排查用）");
+        diagBtn.setOnClickListener(v -> startDiagnostics());
+        dataCard.addView(diagBtn, Ui.lp(this, 10));
+        dataCard.addView(Ui.label(this, "包含脱敏配置、日志、用量、自检结果；"
+                + "rawcap 尾部可能含回答内容，发送前请自行检查。"), Ui.lp(this, 6));
+
         TextView exportBtn = Ui.outlineButton(this, "导出加密备份");
         exportBtn.setOnClickListener(v -> startExport());
         dataCard.addView(exportBtn, Ui.lp(this, 10));
@@ -476,6 +483,7 @@ public class SettingsActivity extends Activity {
 
     private static final int REQ_CREATE = 9001;
     private static final int REQ_OPEN = 9002;
+    private static final int REQ_DIAG = 9003;
 
     private void pickExportTarget(String password) {
         pendingPassword = password;
@@ -537,8 +545,48 @@ public class SettingsActivity extends Activity {
                     runOnUiThread(() -> toast("导出失败：" + t.getMessage()));
                 }
             });
+        } else if (req == REQ_DIAG) {
+            Threads.io(() -> {
+                try {
+                    java.io.OutputStream os = getContentResolver().openOutputStream(uri, "wt");
+                    if (os == null) throw new IllegalStateException("无法写入所选位置");
+                    try {
+                        com.cpa.gateway.core.Diagnostics.writeTo(os);
+                    } finally {
+                        os.close();
+                    }
+                    runOnUiThread(() -> {
+                        toast("诊断包已导出");
+                        /* 导出后直接拉起系统分享：用户不用再去文件管理器里找。 */
+                        try {
+                            Intent send = new Intent(Intent.ACTION_SEND);
+                            send.setType("application/zip");
+                            send.putExtra(Intent.EXTRA_STREAM, uri);
+                            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            startActivity(Intent.createChooser(send, "发送诊断包"));
+                        } catch (Throwable ignored) {
+                        }
+                    });
+                } catch (Throwable t) {
+                    Log.w("导出诊断包失败：" + t);
+                    runOnUiThread(() -> toast("导出诊断包失败：" + t.getMessage()));
+                }
+            });
         } else if (req == REQ_OPEN) {
             askImportPassword(uri);
+        }
+    }
+
+    /** 选一个位置，导出脱敏后的诊断 zip。 */
+    private void startDiagnostics() {
+        try {
+            Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("application/zip");
+            i.putExtra(Intent.EXTRA_TITLE, com.cpa.gateway.core.Diagnostics.suggestedName());
+            startActivityForResult(i, REQ_DIAG);
+        } catch (Throwable t) {
+            toast("这台 ROM 没有文件选择器，无法导出诊断包");
         }
     }
 

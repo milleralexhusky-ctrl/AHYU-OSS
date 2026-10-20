@@ -73,6 +73,7 @@ public final class Selftest {
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
+        add(out, "流式解析回放（OpenAI/Anthropic/Gemini）", Selftest::checkStreamReplay);
         return out;
     }
 
@@ -867,5 +868,180 @@ public final class Selftest {
         m.parts.add(Proto.Part.text("同一条内容"));
         req.messages.add(m);
         return req;
+    }
+
+    /* ------------------------------------------------------- 流式解析回放（4.39.0） */
+
+    /**
+     * 用本地假上游回放三种 SSE，断言解析器真的把内容/工具/responseId/usage 交出来。
+     *
+     * 为什么值得：以前改协议只能"再发一次真实请求看看"，既烧额度又不可重复。
+     * 这里把一段固定的 SSE 帧喂给真实的解析函数（openAiStream / anthropicStream /
+     * GeminiUp.chat），不碰外网，只连 127.0.0.1；失败时能直接指出是哪一种协议、
+     * 哪一个字段不对。
+     */
+    private static String checkStreamReplay() {
+        final String openAi = "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
+                + "\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],"
+                + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"
+                + "data: [DONE]\n\n";
+        try {
+            final Cap cap = new Cap();
+            replay(openAi, url -> Upstreams.openAiStream(url,
+                    new java.util.HashMap<String, String>(), new org.json.JSONObject(), cap));
+            if (!"你好".equals(cap.text.toString())) return "OpenAI 正文不对：" + cap.text;
+            if (!"bash".equals(cap.toolName)) return "OpenAI 工具名没解析出来";
+            if (!cap.toolArgs.contains("cmd")) return "OpenAI 工具参数没解析出来：" + cap.toolArgs;
+            if (!"chatcmpl-test".equals(cap.rid)) return "OpenAI responseId 没上报：" + cap.rid;
+            if (!"tool_calls".equals(cap.stop)) return "OpenAI stop 不对：" + cap.stop;
+            if (cap.in != 10 || cap.out != 5) return "OpenAI usage 不对：" + cap.in + "/" + cap.out;
+        } catch (Throwable t) {
+            return "OpenAI 回放异常：" + t;
+        }
+
+        final String anthropic = "event: message_start\n"
+                + "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\","
+                + "\"usage\":{\"input_tokens\":7}}}\n\n"
+                + "event: content_block_delta\n"
+                + "data: {\"type\":\"content_block_delta\",\"index\":0,"
+                + "\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n"
+                + "event: message_delta\n"
+                + "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+                + "\"usage\":{\"output_tokens\":3}}\n\n";
+        try {
+            final Cap cap = new Cap();
+            replay(anthropic, url -> Upstreams.anthropicStream(url,
+                    new java.util.HashMap<String, String>(), new org.json.JSONObject(), cap));
+            if (!"你好".equals(cap.text.toString())) return "Anthropic 正文不对：" + cap.text;
+            if (!"msg_test".equals(cap.rid)) return "Anthropic responseId 没上报：" + cap.rid;
+            if (!"stop".equals(cap.stop)) return "Anthropic stop 不对：" + cap.stop;
+            if (cap.in != 7 || cap.out != 3) return "Anthropic usage 不对：" + cap.in + "/" + cap.out;
+        } catch (Throwable t) {
+            return "Anthropic 回放异常：" + t;
+        }
+
+        final String gemini = "data: {\"responseId\":\"gem_test\",\"usageMetadata\":"
+                + "{\"promptTokenCount\":4,\"candidatesTokenCount\":2},"
+                + "\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你\"}]}}]}\n\n"
+                + "data: {\"responseId\":\"gem_test\",\"candidates\":[{\"content\":"
+                + "{\"parts\":[{\"text\":\"好\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        try {
+            final Cap cap = new Cap();
+            final Config.Provider p = new Config.Provider();
+            p.name = "selftest-gemini";
+            p.type = Config.TYPE_GEMINI;
+            p.apiKey = "";
+            final Proto.Req req = new Proto.Req();
+            req.model = "m";
+            Proto.Msg m = new Proto.Msg();
+            m.role = "user";
+            m.parts.add(Proto.Part.text("hi"));
+            req.messages.add(m);
+            replay(gemini, url -> {
+                p.baseUrl = url;
+                new Upstreams.GeminiUp(p).chat("m", req, cap);
+            });
+            if (!"你好".equals(cap.text.toString())) return "Gemini 正文不对：" + cap.text;
+            if (!"gem_test".equals(cap.rid)) return "Gemini responseId 没上报：" + cap.rid;
+            if (!"stop".equals(cap.stop)) return "Gemini stop 不对：" + cap.stop;
+            if (cap.in != 4 || cap.out != 2) return "Gemini usage 不对：" + cap.in + "/" + cap.out;
+        } catch (Throwable t) {
+            return "Gemini 回放异常：" + t;
+        }
+        return null;
+    }
+
+    /** 回放回调允许抛异常。 */
+    private interface ReplayCall {
+        void run(String url) throws Exception;
+    }
+
+    /** 起一个只服务一次的本地 HTTP 假上游，把固定 SSE 交给真实解析函数。 */
+    private static void replay(String sse, ReplayCall call) throws Exception {
+        java.net.ServerSocket server = new java.net.ServerSocket(
+                0, 1, java.net.InetAddress.getByName("127.0.0.1"));
+        final int port = server.getLocalPort();
+        Thread t = new Thread(() -> {
+            try {
+                java.net.Socket s = server.accept();
+                try {
+                    java.io.BufferedReader in = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
+                    String line;
+                    while ((line = in.readLine()) != null && !line.isEmpty()) {
+                        // 读掉请求头；body 很小，不读也不会阻塞
+                    }
+                    byte[] body = sse.getBytes("UTF-8");
+                    String head = "HTTP/1.1 200 OK\r\n"
+                            + "Content-Type: text/event-stream; charset=utf-8\r\n"
+                            + "Connection: close\r\n"
+                            + "Content-Length: " + body.length + "\r\n\r\n";
+                    java.io.OutputStream out = s.getOutputStream();
+                    out.write(head.getBytes("UTF-8"));
+                    out.write(body);
+                    out.flush();
+                } finally {
+                    s.close();
+                }
+            } catch (Throwable ignored) {
+            }
+        }, "selftest-upstream");
+        t.setDaemon(true);
+        t.start();
+        try {
+            call.run("http://127.0.0.1:" + port + "/v1/chat/completions");
+        } finally {
+            try {
+                server.close();
+            } catch (Throwable ignored) {
+            }
+            try {
+                t.join(2000);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 收集 Sink 回调，供回放断言。 */
+    private static final class Cap implements Proto.Sink {
+        final StringBuilder text = new StringBuilder();
+        String toolName = "";
+        String toolArgs = "";
+        String rid = "";
+        String stop = "";
+        int in;
+        int out;
+
+        @Override
+        public void text(String delta) {
+            if (delta != null) text.append(delta);
+        }
+
+        @Override
+        public void thinking(String delta) {
+        }
+
+        @Override
+        public void toolCall(String id, String name, String argsJson) {
+            toolName = name == null ? "" : name;
+            toolArgs = argsJson == null ? "" : argsJson;
+        }
+
+        @Override
+        public void finish(String stopReason, Proto.Usage usage) {
+            stop = stopReason == null ? "" : stopReason;
+            if (usage != null) {
+                in = usage.input;
+                out = usage.output;
+            }
+        }
+
+        @Override
+        public void responseId(String id) {
+            if (rid.isEmpty() && id != null) rid = id;
+        }
     }
 }
