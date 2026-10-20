@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini 兼容接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.37.0**（versionCode 629，见 `version.properties`）
+- 当前版本：**4.38.0**（versionCode 630，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -110,6 +110,19 @@ docs/research/             协议调查脚本
 | `core/WorkBuddy.java` 等 | 各渠道的账号与协议实现 |
 | `GatewayService.java` | 前台服务、看门狗、保活 |
 | `MainActivity.java` / `Ui.java` | 单页主页与共享 UI 组件 |
+
+## 资源占用
+
+实测（本机 1280×2772，`dumpsys meminfo com.ahyu`）：
+
+| 状态 | PSS | 说明 |
+| --- | --- | --- |
+| 无界面（开机自启 / 保活拉起） | ~27MB | Java 堆约 3.4MB；不再预分配底纹位图 |
+| 打开界面 | ~61MB | 大头是系统管理的窗口 GPU 缓冲（~18MB）与 HWUI 渲染缓冲 |
+
+底纹位图（约 3.5MB）在界面隐藏或内存压力时释放，下次打开重画（6–11ms）。
+界面态继续压缩需要改窗口格式或隐藏时销毁 UI，都会影响观感/返回栈，未默认启用。
+详见 `docs/changelog/AHYU-4.38.0-内存优化.md`。
 
 ## 接手与排查
 

@@ -242,8 +242,25 @@ final class DynamicBackdrop extends View {
         if (visibility == VISIBLE) start(); else stop();
     }
 
+    /**
+     * 窗口隐藏（Activity 进入 STOPPED）时也要停。
+     *
+     * onVisibilityChanged 只跟 View 自己的 visibility 有关：整个窗口被系统藏起来时
+     * 它仍然是 VISIBLE，于是 8fps 的 tick 还会继续投递。虽然帧会被系统节流，
+     * 但后台网关不需要任何动画，停掉更干净。
+     */
+    @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        if (visibility == VISIBLE) start(); else stop();
+    }
+
     private void start() {
         if (running) return;
+        if (!isAttachedToWindow() || getWindowVisibility() != VISIBLE
+                || getVisibility() != VISIBLE) {
+            return;
+        }
         running = true;
         lastFrameAt = SystemClock.elapsedRealtime();
         postDelayed(tick, FRAME_MS);

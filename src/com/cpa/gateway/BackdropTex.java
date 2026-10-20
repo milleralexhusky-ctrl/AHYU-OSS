@@ -4,7 +4,6 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.util.DisplayMetrics;
-import android.view.View;
 
 /**
  * 背景纹理：打开应用的第一帧就要是那张画。
@@ -26,68 +25,43 @@ public final class BackdropTex {
     private static int cachedH;
     /** 纹理相对屏幕的缩放（固定 1/2，留作采样矩阵用）。 */
     private static float cachedScale = 0.5f;
-    /** 底纹就绪后要刷新的那个视图（第一个挂载的页面）。 */
-    private static java.lang.ref.WeakReference<View> watcher;
 
     private BackdropTex() {
     }
 
     /** 配色模式变了（深↔浅）就作废：底纹里那层蒙版不一样，必须重画。 */
     static synchronized void invalidate() {
+        drop();
+    }
+
+    /**
+     * 界面隐藏或内存吃紧时释放底纹位图（4.38.0）。
+     *
+     * 这张图是 1/2 屏的 ARGB_8888（1280×2772 上约 3.5MB），而 AHYU 大多数时间
+     * 是后台网关，Activity 处于 STOPPED、根本不需要它。以前它从进程启动一直留到
+     * 进程结束；现在 UI 一隐藏就还给系统，下次打开由 {@link #warmSync} 重画（约 60ms）。
+     *
+     * 只回收像素：NavGlassDrawable 下次 draw() 会调用 get() 并发现 bitmap 换了，
+     * 自动重建 BitmapShader；Shader 对旧 bitmap 的引用随 GC 消失。
+     */
+    static synchronized boolean release() {
+        return drop();
+    }
+
+    private static boolean drop() {
         Bitmap old = bitmap;
         bitmap = null;
         builtWith = null;
         cachedW = 0;
         cachedH = 0;
+        cachedScale = 0.5f;
         if (old != null && !old.isRecycled()) {
             try {
                 old.recycle();
             } catch (Throwable ignored) {
             }
         }
-    }
-
-    /** 第一个挂载的页面：底纹从"兜底色斑"换成"真照片"时，请它重绘一次。 */
-    static void watch(View v) {
-        watcher = new java.lang.ref.WeakReference<>(v);
-    }
-
-    /** 照片解码完就调：在后台把整屏底纹先画好。 */
-    public static void prewarm(Context c) {
-        try {
-            get(c);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static boolean warmStarted;
-
-    /**
-     * 进程一起来就把底纹的活儿开出去（CpaApp 里调），和 Activity 启动并行。
-     *
-     * 这里不能等：Application 的回调不能被拖住。活儿交给后台线程，MainActivity 真正要画
-     * 第一帧时的 warmSync 会去抢同一把锁——抢到了说明活儿已经干完（0ms），抢不到就是在等
-     * "剩余时间"，而不是重新做一遍。
-     */
-    public static synchronized void startWarm(final Context c) {
-        if (warmStarted) return;
-        warmStarted = true;
-        com.cpa.gateway.core.Threads.io(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    warmSync(c);
-                } catch (Throwable ignored) {
-                }
-            }
-        });
-    }
-
-    /** 磁盘缓存文件名带上屏幕尺寸：换了屏幕/分辨率就自然失效，不需要清理逻辑。 */
-    private static java.io.File cacheFile(Context c) {
-        DisplayMetrics dm = c.getResources().getDisplayMetrics();
-        return new java.io.File(c.getFilesDir(),
-                "backdrop-" + dm.widthPixels + "x" + dm.heightPixels + (Ui.LIGHT ? "-light" : "") + ".webp");
+        return old != null;
     }
 
     /**
@@ -122,19 +96,6 @@ public final class BackdropTex {
         cachedScale = (float) bw / sw;
         builtWith = Swatch.stamp;
         return bitmap;
-    }
-
-    /** 照片迟到了：底纹已经重画，请第一屏再画一帧，不然静止的界面要等下次刷新才换画。 */
-    private static void notifyReady() {
-        final java.lang.ref.WeakReference<View> w = watcher;
-        if (w == null) return;
-        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-            @Override
-            public void run() {
-                View v = w.get();
-                if (v != null) v.invalidate();
-            }
-        });
     }
 
     /** 纹理相对屏幕的缩放比（位图像素 / 屏幕像素）。 */
