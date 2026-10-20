@@ -759,7 +759,8 @@ public class MainActivity extends Activity {
                 || Config.TYPE_CODEX.equals(t)) return false;
         for (String key : new String[]{"siliconflow", "moonshot", "bigmodel", "dashscope", "volces", "xiaomimimo",
                 "minimax", "spark", "qianfan", "sensenova", "longcat", "modelscope",
-                "silicon", "zhipu", "kimi", "qwen", "tencent", "baidu", "aliyun"}) {
+                "silicon", "zhipu", "kimi", "qwen", "tencent", "baidu", "aliyun",
+                "端侧", "本机", "llama.cpp", "ollama"}) {
             if (n.contains(key)) return true;
         }
         return false;
@@ -1447,6 +1448,9 @@ public class MainActivity extends Activity {
             p.type = Config.TYPE_ANTHROPIC;
             p.name = "Claude";
             p.baseUrl = "https://api.anthropic.com";
+            /* 官方只认 x-api-key；旧行为会同时带 Bearer，官方忽略但中转不一定。
+               新账号直接按官方风格。 */
+            p.authStyle = Config.AUTH_X_API_KEY;
             ProviderEditor.show(this, p, true, this::refreshStatus);
         });
         choiceRow(list, "gemini", "Google Gemini（API Key）", "Google AI Studio 的 Key", () -> {
@@ -1577,6 +1581,8 @@ public class MainActivity extends Activity {
                 "商汤日日新 SenseNova", "美团 LongCat", "魔搭 ModelScope",
                 "阶跃星辰 StepFun", "Pollinations（免注册）", "Venice AI",
                 "MiniMax 国际版（M2 免费期）",
+                "端侧模型 · llama.cpp（本机 :8080）",
+                "端侧模型 · Ollama（本机 :11434）",
                 "自建 / 其它中转"};
         final String[] bases = {
                 "https://openrouter.ai/api/v1", "https://api.deepseek.com/v1",
@@ -1601,6 +1607,8 @@ public class MainActivity extends Activity {
                 "https://text.pollinations.ai/openai",
                 "https://api.venice.ai/api/v1",
                 "https://api.minimax.io/v1",
+                "http://127.0.0.1:8080/v1",
+                "http://127.0.0.1:11434/v1",
                 ""};
         LinearLayout list = Ui.column(this);
         boolean domesticHeaderDone = false;
@@ -1620,6 +1628,11 @@ public class MainActivity extends Activity {
                 if (currentDialog != null) currentDialog.dismiss();
                 p.name = names[which];
                 p.baseUrl = bases[which];
+                /* 本机模型不需要认证头；其余保持 Bearer 默认。 */
+                if (bases[which].startsWith("http://127.0.0.1")
+                        || bases[which].startsWith("http://localhost")) {
+                    p.authStyle = Config.AUTH_NONE;
+                }
                 ProviderEditor.show(this, p, true, this::refreshStatus);
             });
             list.addView(row, Ui.lp(this, 8));

@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini 兼容接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.41.0**（versionCode 634，见 `version.properties`）
+- 当前版本：**4.42.0**（versionCode 635，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -23,8 +23,9 @@
 
 **账号与渠道**：WorkBuddy（CodeBuddy）、Trae、Loomy、Kimi、Antigravity、Claude、
 ChatGPT/Codex、DeepSeek、豆包、Cline、xAI、Kilo、OVH，以及自定义
-OpenAI/Anthropic/Gemini 兼容中转。登录方式按渠道支持 OAuth、设备码、WebView、
-API Key 等。
+OpenAI/Anthropic/Gemini 兼容中转，以及本机 llama.cpp / Ollama（回环、无认证）。
+登录方式按渠道支持 OAuth、设备码、WebView、API Key 等；每个账号可单独选择
+认证头风格（Bearer / x-api-key / 两者 / 不认证）。
 
 **选路与稳定性**：`auto` / `auto-code` / `auto-long` / `auto-race` 虚拟模型；
 按成功率、延迟、成本、额度、工具能力打分；首字节前自动换号；限流指数退避、

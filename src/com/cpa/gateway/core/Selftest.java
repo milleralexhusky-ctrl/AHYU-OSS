@@ -76,6 +76,7 @@ public final class Selftest {
         add(out, "流式解析回放（OpenAI/Anthropic/Gemini）", Selftest::checkStreamReplay);
         add(out, "HTTP 请求回放（chunked 中文/多请求对齐）", Selftest::checkHttpRequestReplay);
         add(out, "入口解析保留工具结果 id（OpenAI/Anthropic/Gemini）", Selftest::checkFrontToolResults);
+        add(out, "上游认证头按账号选择（Bearer/x-api-key/none）", Selftest::checkAuthStyles);
         return out;
     }
 
@@ -986,6 +987,47 @@ public final class Selftest {
         } catch (Throwable t) {
             return "入口解析回放异常：" + t;
         }
+    }
+
+    /** 认证头风格：第三方中转只认一种时，不能把另一种硬塞过去。 */
+    private static String checkAuthStyles() {
+        Config.Provider p = new Config.Provider();
+        p.apiKey = "k";
+
+        p.authStyle = Config.AUTH_BEARER;
+        java.util.Map<String, String> h = new java.util.HashMap<>();
+        Upstreams.applyAuth(h, p);
+        if (!"Bearer k".equals(h.get("Authorization"))) return "Bearer 没写对：" + h;
+        if (h.containsKey("x-api-key")) return "Bearer 模式不该带 x-api-key";
+
+        p.authStyle = Config.AUTH_X_API_KEY;
+        h.clear();
+        Upstreams.applyAuth(h, p);
+        if (!"k".equals(h.get("x-api-key"))) return "x-api-key 没写对：" + h;
+        if (h.containsKey("Authorization")) return "x-api-key 模式不该带 Authorization";
+
+        p.authStyle = Config.AUTH_BOTH;
+        h.clear();
+        Upstreams.applyAuth(h, p);
+        if (!"k".equals(h.get("x-api-key")) || !"Bearer k".equals(h.get("Authorization"))) {
+            return "both 模式缺头：" + h;
+        }
+
+        p.authStyle = Config.AUTH_NONE;
+        h.clear();
+        Upstreams.applyAuth(h, p);
+        if (!h.isEmpty()) return "none 模式不该写认证头：" + h;
+
+        /* 老配置没有 authStyle：Anthropic 仍按 both，其它按 Bearer。 */
+        Config.Provider old = new Config.Provider();
+        old.apiKey = "k";
+        old.type = Config.TYPE_ANTHROPIC;
+        h.clear();
+        Upstreams.applyAuth(h, old);
+        if (!h.containsKey("x-api-key") || !h.containsKey("Authorization")) {
+            return "老 Anthropic 配置没有沿用 both：" + h;
+        }
+        return null;
     }
 
     private static Proto.Part findPart(Proto.Req req, String type) {

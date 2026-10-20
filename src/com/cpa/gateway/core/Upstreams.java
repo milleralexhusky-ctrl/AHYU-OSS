@@ -187,11 +187,17 @@ public final class Upstreams {
 
     /** Pulls the upstream model list so the UI can offer one-tap configuration. */
     public static List<String> fetchModels(String type, String baseUrl, String apiKey) throws Exception {
+        return fetchModels(type, baseUrl, apiKey, Config.defaultAuthStyle(type));
+    }
+
+    /** 带认证风格的版本：自定义中转只认 x-api-key / Bearer 时按账号选择。 */
+    public static List<String> fetchModels(String type, String baseUrl, String apiKey,
+                                          String authStyle) throws Exception {
         // relay stations differ: some list models under /v1/models, some under /models
         Exception firstFailure = null;
         for (String candidate : modelUrlCandidates(type, baseUrl)) {
             try {
-                return fetchModelsFrom(type, candidate, apiKey);
+                return fetchModelsFrom(type, candidate, apiKey, authStyle);
             } catch (Exception e) {
                 if (firstFailure == null) firstFailure = e;
             }
@@ -222,18 +228,22 @@ public final class Upstreams {
     }
 
     static List<String> fetchModelsFrom(String type, String url, String apiKey) throws Exception {
+        return fetchModelsFrom(type, url, apiKey, Config.defaultAuthStyle(type));
+    }
+
+    static List<String> fetchModelsFrom(String type, String url, String apiKey,
+                                        String authStyle) throws Exception {
         List<String> out = new ArrayList<>();
         String url2 = url;
         Map<String, String> headers = new HashMap<>();
         if (Config.TYPE_ANTHROPIC.equals(type)) {
-            if (apiKey != null && !apiKey.isEmpty()) {
-                headers.put("x-api-key", apiKey);
-                headers.put("anthropic-version", "2023-06-01");
-            }
+            applyAuth(headers, authStyle, apiKey);
+            /* 版本头与认证无关：本机 Anthropic 风格服务也需要它。 */
+            headers.put("anthropic-version", "2023-06-01");
         } else if (Config.TYPE_GEMINI.equals(type)) {
             if (apiKey != null && !apiKey.isEmpty()) url2 = url2 + "?key=" + apiKey;
         } else {
-            if (apiKey != null && !apiKey.isEmpty()) headers.put("Authorization", "Bearer " + apiKey);
+            applyAuth(headers, authStyle, apiKey);
         }
         url = url2;
         String body = get(url, headers);
@@ -298,7 +308,7 @@ public final class Upstreams {
             if (!fetched.isEmpty()) return fetched;
             return new ArrayList<>(p.models);
         }
-        return fetchModels(p.type, p.baseUrl, p.apiKey);
+        return fetchModels(p.type, p.baseUrl, p.apiKey, p.effectiveAuthStyle());
     }
 
     static String get(String url, Map<String, String> headers) throws Exception {
@@ -442,6 +452,33 @@ public final class Upstreams {
         return get(url, headers);
     }
 
+    /**
+     * 按账号的 authStyle 写认证头（4.42.0）。
+     *
+     * 第三方中转不统一：多数要 Authorization: Bearer，Anthropic 风格要
+     * x-api-key，本机模型完全不要认证。以前两种类型各写死一套，遇到
+     * "只认另一种"的中转就只能改代码。
+     */
+    static void applyAuth(Map<String, String> headers, Config.Provider p) {
+        if (headers == null || p == null) return;
+        applyAuth(headers, p.effectiveAuthStyle(), p.apiKey);
+    }
+
+    static void applyAuth(Map<String, String> headers, String style, String apiKey) {
+        if (headers == null || apiKey == null || apiKey.isEmpty()) return;
+        if (Config.AUTH_NONE.equals(style)) return;
+        if (Config.AUTH_X_API_KEY.equals(style)) {
+            headers.put("x-api-key", apiKey);
+            return;
+        }
+        if (Config.AUTH_BOTH.equals(style)) {
+            headers.put("x-api-key", apiKey);
+            headers.put("Authorization", "Bearer " + apiKey);
+            return;
+        }
+        headers.put("Authorization", "Bearer " + apiKey);
+    }
+
     /* --------------------------------------------------- OpenAI-compatible up */
 
     static final class OpenAiUp implements Proto.Upstream {
@@ -455,7 +492,7 @@ public final class Upstreams {
         public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
             JSONObject body = openAiBody(model, req, true);
             Map<String, String> headers = new HashMap<>();
-            if (!p.apiKey.isEmpty()) headers.put("Authorization", "Bearer " + p.apiKey);
+            applyAuth(headers, p);
             headers.putAll(webSessionHeaders(p));
             openAiStream(url(openAiBase(p.baseUrl), "chat/completions"), headers, body, sink);
         }
@@ -1057,10 +1094,7 @@ public final class Upstreams {
         public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
             JSONObject body = anthropicBody(model, req);
             Map<String, String> headers = new HashMap<>();
-            if (!p.apiKey.isEmpty()) {
-                headers.put("x-api-key", p.apiKey);
-                headers.put("Authorization", "Bearer " + p.apiKey);
-            }
+            applyAuth(headers, p);
             headers.put("anthropic-version", "2023-06-01");
             anthropicStream(url(p.baseUrl, "v1/messages"), headers, body, sink);
         }

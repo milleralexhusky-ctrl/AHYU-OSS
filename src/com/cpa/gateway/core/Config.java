@@ -54,6 +54,25 @@ public final class Config {
     /** Cline（WorkOS 设备码登录）。 */
     public static final String TYPE_CLINE = "cline";
 
+    /*
+     * 上游认证头风格（4.42.0）。
+     *
+     * 以前是写死的：OpenAI 兼容只发 Authorization: Bearer，Anthropic 发
+     * x-api-key + Bearer 两套。但第三方中转并不统一——有的只认 x-api-key，
+     * 有的只认 Bearer，本机模型则完全不要认证。现在每个账号可以单独选。
+     */
+    public static final String AUTH_BEARER = "bearer";
+    public static final String AUTH_X_API_KEY = "x-api-key";
+    public static final String AUTH_BOTH = "both";
+    public static final String AUTH_NONE = "none";
+
+    /** 老配置没有 authStyle 时的默认值；保持 4.42.0 之前的行为。 */
+    public static String defaultAuthStyle(String type) {
+        if (TYPE_ANTHROPIC.equals(type)) return AUTH_BOTH;
+        if (TYPE_GEMINI.equals(type)) return AUTH_X_API_KEY;
+        return AUTH_BEARER;
+    }
+
     public int port = 8321;
     public boolean lanAccess = false;
     public boolean autostart = false;
@@ -143,6 +162,14 @@ public final class Config {
         public String type = TYPE_OPENAI;
         public String baseUrl = "";
         public String apiKey = "";
+        /**
+         * 认证头风格：bearer / x-api-key / both / none；空串 = 按 type 取默认。
+         *
+         * 为什么需要：第三方中转不统一——多数要 Authorization: Bearer，
+         * Anthropic 风格要 x-api-key，本机模型不要认证。以前是写死的，
+         * 遇到"只认另一种"的中转就只能改代码。
+         */
+        public String authStyle = "";
         /** Older keys stay valid so a client that still has the previous key keeps working. */
         public final List<String> apiKeyAliases = new ArrayList<>();
         public boolean enabled = true;
@@ -162,6 +189,12 @@ public final class Config {
         /** 能不能真正派发推理请求。目录-only 的账号只留着看，不进池子。 */
         public boolean dispatchable() {
             return enabled && !catalogOnly;
+        }
+
+        /** 实际使用的认证风格（空串按类型取默认）。 */
+        public String effectiveAuthStyle() {
+            String s = authStyle == null ? "" : authStyle.trim();
+            return s.isEmpty() ? defaultAuthStyle(type) : s;
         }
         public final List<String> models = new java.util.concurrent.CopyOnWriteArrayList<>();
         /**
@@ -416,6 +449,7 @@ public final class Config {
                 o.put("type", type);
                 o.put("baseUrl", baseUrl);
                 o.put("apiKey", apiKey);
+                if (authStyle != null && !authStyle.isEmpty()) o.put("authStyle", authStyle);
             JSONArray aliases = new JSONArray();
             for (String alias : apiKeyAliases) aliases.put(alias);
             o.put("apiKeyAliases", aliases);
@@ -510,6 +544,7 @@ public final class Config {
             p.type = Proto.optString(o, "type", TYPE_OPENAI);
             p.baseUrl = Proto.optString(o, "baseUrl", "");
             p.apiKey = Proto.optString(o, "apiKey", "");
+            p.authStyle = Proto.optString(o, "authStyle", "");
             p.enabled = o.optBoolean("enabled", true);
         p.catalogOnly = o.optBoolean("catalogOnly", false);
             JSONObject opts = o.optJSONObject("options");
