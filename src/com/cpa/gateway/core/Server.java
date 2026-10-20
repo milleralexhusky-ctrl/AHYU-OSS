@@ -732,6 +732,8 @@ public final class Server {
         boolean keepAlive = true;
         final Map<String, String> headers = new HashMap<>();
         String body = "";
+        /** 原始请求体字节：multipart / 音频这类不能按 UTF-8 文本转发。 */
+        byte[] bodyBytes;
 
         String header(String name) {
             String v = headers.get(name.toLowerCase(Locale.US));
@@ -831,7 +833,9 @@ public final class Server {
                 body.write(buf, 0, read);
                 readLine(in);
             }
-            r.body = new String(body.toByteArray(), StandardCharsets.UTF_8);
+            byte[] all = body.toByteArray();
+            r.bodyBytes = all;
+            r.body = new String(all, StandardCharsets.UTF_8);
         } else {
             int len = 0;
             try {
@@ -852,6 +856,7 @@ public final class Server {
                     if (n < 0) break;
                     read += n;
                 }
+                r.bodyBytes = java.util.Arrays.copyOf(buf, read);
                 r.body = new String(buf, 0, read, StandardCharsets.UTF_8);
             }
         }
@@ -1473,6 +1478,45 @@ public final class Server {
             writeJson(out, 200, wrap.toString(2));
             return;
         }
+        if ("/v1/debug/test-provider".equals(path) && "POST".equals(r.method)) {
+            /* 调试包专用：临时加/删一个 OpenAI 兼容账号，用来测非聊天转发。
+               名字必须以 debug- 开头，避免误删真实账号。 */
+            try {
+                JSONObject o = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                String name = Proto.optString(o, "name", "debug-fake");
+                if (!name.startsWith("debug-")) {
+                    writeError(out, path, 400, "测试账号名必须以 debug- 开头");
+                    return;
+                }
+                for (int i = config.providers.size() - 1; i >= 0; i--) {
+                    if (name.equals(config.providers.get(i).name)) config.providers.remove(i);
+                }
+                if (!"remove".equals(Proto.optString(o, "action", "add"))) {
+                    Config.Provider p = new Config.Provider();
+                    p.id = "debug-" + System.currentTimeMillis();
+                    p.name = name;
+                    p.type = Proto.optString(o, "type", Config.TYPE_OPENAI);
+                    p.baseUrl = Proto.optString(o, "baseUrl", "");
+                    p.apiKey = Proto.optString(o, "apiKey", "");
+                    JSONArray models = o.optJSONArray("models");
+                    if (models != null) {
+                        for (int i = 0; i < models.length(); i++) {
+                            String m = models.optString(i, "");
+                            if (!m.isEmpty()) p.models.add(m);
+                        }
+                    }
+                    config.providers.add(p);
+                }
+                config.save(Gateway.context(), true);
+                JSONObject res = new JSONObject();
+                res.put("ok", true);
+                res.put("providers", config.providers.size());
+                writeJson(out, 200, res.toString());
+            } catch (Throwable t) {
+                writeError(out, path, 400, String.valueOf(t.getMessage()));
+            }
+            return;
+        }
         if ("/v1/debug/diagnostics".equals(path)) {
             /* 调试包专用：直接下载诊断 zip，方便用 curl 取回，也方便测试。 */
             byte[] zip = Diagnostics.build();
@@ -1880,6 +1924,42 @@ public final class Server {
             handleOllama(r, out, true);
             return;
         }
+        if (("/api/embed".equals(path) || "/api/embeddings".equals(path))
+                && "POST".equals(r.method)) {
+            handleOllamaEmbed(r, out, "/api/embeddings".equals(path));
+            return;
+        }
+        if (path.startsWith("/api/pull") || path.startsWith("/api/create")
+                || path.startsWith("/api/copy") || path.startsWith("/api/delete")
+                || path.startsWith("/api/blobs")) {
+            writeError(out, path, 501, "AHYU 只做推理转发，不支持管理远程模型库");
+            return;
+        }
+        /* 非聊天 OpenAI 端点：原样转发给兼容上游，不做 canonical 转换。 */
+        if ("/v1/embeddings".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "embeddings", false);
+            return;
+        }
+        if ("/v1/moderations".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "moderations", false);
+            return;
+        }
+        if ("/v1/images/generations".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "images/generations", false);
+            return;
+        }
+        if ("/v1/audio/transcriptions".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "audio/transcriptions", false);
+            return;
+        }
+        if ("/v1/audio/translations".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "audio/translations", false);
+            return;
+        }
+        if ("/v1/audio/speech".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "audio/speech", true);
+            return;
+        }
         if ("/v1/messages".equals(path) && "POST".equals(r.method)) {
             handleAnthropic(r, out);
             return;
@@ -1899,6 +1979,10 @@ public final class Server {
             int colon = rest.indexOf(':');
             String model = colon > 0 ? rest.substring(0, colon) : rest;
             String verb = colon > 0 ? rest.substring(colon + 1) : "generateContent";
+            if ("embedContent".equals(verb) || "batchEmbedContents".equals(verb)) {
+                handleGeminiEmbed(r, out, model, verb);
+                return;
+            }
             if ("countTokens".equals(verb)) {
                 /* Gemini 客户端会先数 token 再决定怎么切上下文；404 会让它直接截断。 */
                 try {
@@ -3611,6 +3695,214 @@ public final class Server {
         }
         markResponseFailed(out);
         writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+    }
+
+    private static boolean openAiCompatible(Config.Provider p) {
+        return Config.TYPE_OPENAI.equals(p.type) || Config.TYPE_KILO.equals(p.type)
+                || Config.TYPE_OVH.equals(p.type);
+    }
+
+    /** 非聊天端点的候选：优先按 model 匹配，匹配不到就用所有 OpenAI 兼容账号。 */
+    private List<Config.Provider> nonChatCandidates(String model) {
+        List<Config.Provider> out = new ArrayList<>();
+        if (model != null && !model.isEmpty()) {
+            for (Config.Provider p : pickAll(model)) {
+                if (openAiCompatible(p)) out.add(p);
+            }
+        }
+        if (out.isEmpty()) {
+            for (Config.Provider p : config.providers) {
+                if (p.dispatchable() && openAiCompatible(p)) out.add(p);
+            }
+        }
+        return out;
+    }
+
+    private static void applyProxyAuth(Map<String, String> headers, Config.Provider p) {
+        if (headers == null || p == null || p.apiKey == null || p.apiKey.isEmpty()) return;
+        if (Config.TYPE_ANTHROPIC.equals(p.type)) {
+            headers.put("x-api-key", p.apiKey);
+            headers.put("anthropic-version", "2023-06-01");
+        } else {
+            headers.put("Authorization", "Bearer " + p.apiKey);
+        }
+    }
+
+    /**
+     * 非聊天 OpenAI 端点原样转发：embeddings / moderations / images / audio。
+     *
+     * canonical 请求模型只描述聊天，硬套会把 embedding 数组、multipart、二进制音频
+     * 弄坏；这些端点直接选一个 OpenAI 兼容账号，把原始字节和 Content-Type 转发过去，
+     * 再把上游状态码/响应体原样带回。
+     */
+    private void proxyOpenAi(Req r, OutputStream out, String tail, boolean binary) throws Exception {
+        String contentType = r.header("content-type");
+        if (contentType.isEmpty()) contentType = "application/json";
+        String model = "";
+        if (contentType.toLowerCase(Locale.US).contains("json") && !r.body.isEmpty()) {
+            try {
+                model = Proto.optString(new JSONObject(r.body), "model", "");
+            } catch (Exception ignored) {
+            }
+        }
+        List<Config.Provider> cands = nonChatCandidates(model);
+        if (cands.isEmpty()) {
+            writeError(out, r.path, 404, "没有可用于该接口的 OpenAI 兼容账号");
+            return;
+        }
+        byte[] payload = r.bodyBytes != null ? r.bodyBytes : r.body.getBytes(StandardCharsets.UTF_8);
+        Http.Resp lastText = null;
+        Http.Bin lastBin = null;
+        int tries = Math.min(3, cands.size());
+        for (int i = 0; i < tries; i++) {
+            Config.Provider p = cands.get(i);
+            try {
+                String url = Upstreams.url(Upstreams.openAiBase(p.baseUrl), tail);
+                Map<String, String> headers = new HashMap<>();
+                applyProxyAuth(headers, p);
+                if (binary) {
+                    Http.Bin b = Http.callBinary("POST", url, headers, payload, contentType,
+                            15000, 180000);
+                    if (b.code >= 200 && b.code < 300) {
+                        writeRaw(out, b.code, b.contentType == null
+                                ? "application/octet-stream" : b.contentType, b.body, false);
+                        return;
+                    }
+                    lastBin = b;
+                } else {
+                    Http.Resp resp = Http.call("POST", url, headers, payload, contentType,
+                            15000, 180000, false);
+                    if (resp.code >= 200 && resp.code < 300) {
+                        writeRaw(out, resp.code, "application/json",
+                                resp.body.getBytes(StandardCharsets.UTF_8), false);
+                        return;
+                    }
+                    lastText = resp;
+                }
+            } catch (Throwable t) {
+                Log.w("非聊天转发失败（" + p.name + "）：" + t);
+            }
+        }
+        if (binary && lastBin != null) {
+            writeRaw(out, lastBin.code, lastBin.contentType == null
+                    ? "application/octet-stream" : lastBin.contentType, lastBin.body, false);
+            return;
+        }
+        if (lastText != null) {
+            writeRaw(out, lastText.code, "application/json",
+                    lastText.body.getBytes(StandardCharsets.UTF_8), false);
+            return;
+        }
+        writeError(out, r.path, 502, "上游没有可用响应");
+    }
+
+    /** Ollama `/api/embed` 与旧版 `/api/embeddings`。 */
+    private void handleOllamaEmbed(Req r, OutputStream out, boolean legacy) throws Exception {
+        JSONObject body;
+        try {
+            body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+        } catch (Exception e) {
+            writeError(out, r.path, 400, "invalid JSON body");
+            return;
+        }
+        String model = Proto.optString(body, "model", "");
+        Object input = legacy ? body.opt("prompt") : body.opt("input");
+        if (input == null) {
+            writeError(out, r.path, 400, "missing " + (legacy ? "prompt" : "input"));
+            return;
+        }
+        JSONObject up = new JSONObject();
+        up.put("model", model);
+        up.put("input", input);
+        byte[] payload = up.toString().getBytes(StandardCharsets.UTF_8);
+        List<Config.Provider> cands = nonChatCandidates(model);
+        if (cands.isEmpty()) {
+            writeError(out, r.path, 404, "没有可用于 embeddings 的 OpenAI 兼容账号");
+            return;
+        }
+        Exception last = null;
+        int tries = Math.min(3, cands.size());
+        for (int i = 0; i < tries; i++) {
+            Config.Provider p = cands.get(i);
+            try {
+                String url = Upstreams.url(Upstreams.openAiBase(p.baseUrl), "embeddings");
+                Map<String, String> headers = new HashMap<>();
+                applyProxyAuth(headers, p);
+                Http.Resp resp = Http.call("POST", url, headers, payload,
+                        "application/json", 15000, 120000, false);
+                if (resp.code >= 200 && resp.code < 300) {
+                    JSONObject o = new JSONObject(resp.body);
+                    JSONArray data = o.optJSONArray("data");
+                    JSONArray embs = new JSONArray();
+                    if (data != null) {
+                        for (int k = 0; k < data.length(); k++) {
+                            JSONObject row = data.optJSONObject(k);
+                            if (row != null && row.opt("embedding") != null) {
+                                embs.put(row.opt("embedding"));
+                            }
+                        }
+                    }
+                    JSONObject result = new JSONObject();
+                    result.put("model", model);
+                    if (legacy) {
+                        result.put("embedding", embs.length() > 0 ? embs.opt(0) : new JSONArray());
+                    } else {
+                        result.put("embeddings", embs);
+                    }
+                    writeJson(out, 200, result.toString());
+                    return;
+                }
+                last = new IllegalStateException("HTTP " + resp.code);
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        writeError(out, r.path, 502, last == null ? "上游没有可用响应" : String.valueOf(last.getMessage()));
+    }
+
+    /** Gemini 的 embedContent / batchEmbedContents：原样转发给 Gemini 账号。 */
+    private void handleGeminiEmbed(Req r, OutputStream out, String model, String verb) throws Exception {
+        List<Config.Provider> cands = new ArrayList<>();
+        for (Config.Provider p : config.providers) {
+            if (!p.dispatchable() || !Config.TYPE_GEMINI.equals(p.type)) continue;
+            if (p.matches(model) || p.models.contains("*")) cands.add(p);
+        }
+        if (cands.isEmpty()) {
+            for (Config.Provider p : config.providers) {
+                if (p.dispatchable() && Config.TYPE_GEMINI.equals(p.type)) cands.add(p);
+            }
+        }
+        if (cands.isEmpty()) {
+            writeError(out, r.path, 404, "没有可用于 embeddings 的 Gemini 账号");
+            return;
+        }
+        byte[] payload = r.bodyBytes != null ? r.bodyBytes : r.body.getBytes(StandardCharsets.UTF_8);
+        Exception last = null;
+        int tries = Math.min(3, cands.size());
+        for (int i = 0; i < tries; i++) {
+            Config.Provider p = cands.get(i);
+            try {
+                String url = Upstreams.url(p.baseUrl,
+                        "v1beta/models/" + model + ":" + verb);
+                Map<String, String> headers = new HashMap<>();
+                if (p.apiKey != null && !p.apiKey.isEmpty()) {
+                    headers.put("x-goog-api-key", p.apiKey);
+                    url = url + (url.contains("?") ? "&" : "?") + "key="
+                            + java.net.URLEncoder.encode(p.apiKey, "UTF-8");
+                }
+                Http.Resp resp = Http.call("POST", url, headers, payload,
+                        "application/json", 15000, 120000, false);
+                if (resp.code >= 200 && resp.code < 300) {
+                    writeRaw(out, resp.code, "application/json",
+                            resp.body.getBytes(StandardCharsets.UTF_8), false);
+                    return;
+                }
+                last = new IllegalStateException("HTTP " + resp.code);
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        writeError(out, r.path, 502, last == null ? "上游没有可用响应" : String.valueOf(last.getMessage()));
     }
 
     /**

@@ -346,6 +346,63 @@ public final class Http {
         }
     }
 
+    /** 二进制响应（音频等）：不能先转成 UTF-8 文本。 */
+    public static final class Bin {
+        public final int code;
+        public final String contentType;
+        public final byte[] body;
+
+        Bin(int code, String contentType, byte[] body) {
+            this.code = code;
+            this.contentType = contentType;
+            this.body = body;
+        }
+    }
+
+    public static Bin callBinary(String method, String url, Map<String, String> headers,
+                                 byte[] payload, String contentType,
+                                 int connectMs, int readMs) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        boolean clean = false;
+        try {
+            conn.setRequestMethod(method);
+            conn.setConnectTimeout(connectMs);
+            conn.setReadTimeout(readMs);
+            conn.setRequestProperty("User-Agent", "CLIProxyAPI-Android/1.0");
+            if (contentType != null) conn.setRequestProperty("Content-Type", contentType);
+            applyHeaders(conn, headers);
+            if (payload != null) {
+                conn.setDoOutput(true);
+                conn.setFixedLengthStreamingMode(payload.length);
+                OutputStream os = conn.getOutputStream();
+                os.write(payload);
+                os.flush();
+                os.close();
+            }
+            int code = conn.getResponseCode();
+            InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            byte[] body = in == null ? new byte[0] : readBytes(in);
+            closeQuietly(in);
+            clean = true;
+            return new Bin(code, conn.getContentType(), body);
+        } finally {
+            if (!clean) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private static byte[] readBytes(InputStream in) throws IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        return bos.toByteArray();
+    }
+
     private static String readAll(InputStream in) throws IOException {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[8192];
