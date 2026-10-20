@@ -741,6 +741,19 @@ public final class WorkBuddy {
      * 没有可拼内容时官方不发这个字段，这里同样返回空串（交由调用方跳过）。
      */
     static String officialConversationId(org.json.JSONArray msgs) {
+        String seed = conversationSeed(msgs);
+        if (seed.isEmpty()) return "";
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(seed.getBytes("UTF-8"));
+            return "d-" + b64url(d, 8);
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** 官方 conversation_id 的哈希种子：所有 system 正文 + 第一条 user 正文。 */
+    private static String conversationSeed(org.json.JSONArray msgs) {
         if (msgs == null || msgs.length() == 0) return "";
         try {
             StringBuilder sb = new StringBuilder();
@@ -757,12 +770,87 @@ public final class WorkBuddy {
                 }
                 if (sb.length() > 4000) break;
             }
-            if (sb.length() == 0) return "";
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
-            byte[] d = md.digest(sb.toString().getBytes("UTF-8"));
-            return "d-" + b64url(d, 8);
+            return sb.toString();
         } catch (Throwable t) {
             return "";
+        }
+    }
+
+    /** 轮次种子：最后一条 user 正文。工具循环里它不变，所以一轮只算一个 turn。 */
+    private static String turnSeed(org.json.JSONArray msgs) {
+        if (msgs == null || msgs.length() == 0) return "";
+        try {
+            for (int i = msgs.length() - 1; i >= 0; i--) {
+                JSONObject m = msgs.optJSONObject(i);
+                if (m == null) continue;
+                if ("user".equals(Proto.optString(m, "role", ""))) {
+                    String t = textOf(m.opt("content"));
+                    return t.length() > 4000 ? t.substring(0, 4000) : t;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    /** 32 位小写十六进制（SHA-256 前 16 字节）。 */
+    private static String hex32(String seed) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(seed.getBytes("UTF-8"));
+            char[] hex = "0123456789abcdef".toCharArray();
+            StringBuilder sb = new StringBuilder(32);
+            for (int i = 0; i < 16; i++) {
+                int v = d[i] & 0xFF;
+                sb.append(hex[v >>> 4]).append(hex[v & 0x0F]);
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String randomHex32() {
+        try {
+            java.util.UUID u = java.util.UUID.randomUUID();
+            return (u.toString().replace("-", "")).toLowerCase(java.util.Locale.US);
+        } catch (Throwable t) {
+            return hex32("msg:" + System.nanoTime() + ":" + Math.random());
+        }
+    }
+
+    /**
+     * 2026-10-15 起，WorkBuddy 国际网关（www.codebuddy.ai / www.workbuddy.ai）要求
+     * 每次聊天请求带上官方客户端的会话头：
+     *
+     *   X-Conversation-ID          会话级，32 位十六进制，跨轮次稳定
+     *   X-Conversation-Request-ID  轮次级，工具循环/重试内稳定，新一轮变化
+     *   X-Conversation-Message-ID  每次调用新值
+     *   X-Request-ID               与 message id 相同
+     *
+     * 国际网关的渠道校验会看这组头；国内网关（copilot.tencent.com）没有这道检查。
+     * 注意：HTTP 400 + 11128 "Illegal API invocation from an unapproved channel"
+     * 并不只由缺头触发 —— 同一份带工具的大请求在某些模型上会被请求级风控拦住，
+     * 换模型就过（见 4.50.4 记录）。这里补头是必要条件，不是充分条件。
+     *
+     * 值必须由内容派生：官方客户端用会话键 / 首条 user 消息派生 conversation，
+     * 用当前轮最后一条 user 消息派生 request；随机值虽然也可能过校验，
+     * 但会让上游用量面板把同一段对话拆成一堆碎片。
+     */
+    static void applyConversationHeaders(Map<String, String> h, JSONObject body) {
+        if (h == null) return;
+        JSONArray msgs = body == null ? null : body.optJSONArray("messages");
+        String convSeed = conversationSeed(msgs);
+        if (convSeed.isEmpty()) convSeed = "session:" + (msgs == null ? "" : msgs.toString());
+        String conv = hex32("conv:" + convSeed);
+        String turnSeed = turnSeed(msgs);
+        String turn = hex32("turn:" + conv + ":" + turnSeed);
+        String msg = randomHex32();
+        if (!conv.isEmpty()) h.put("X-Conversation-ID", conv);
+        if (!turn.isEmpty()) h.put("X-Conversation-Request-ID", turn);
+        if (!msg.isEmpty()) {
+            h.put("X-Conversation-Message-ID", msg);
+            h.put("X-Request-ID", msg);
         }
     }
 
@@ -835,7 +923,25 @@ public final class WorkBuddy {
     static boolean looksLikeConvIdError(Throwable t) {
         String m = t == null ? "" : String.valueOf(t.getMessage()).toLowerCase(java.util.Locale.US);
         return m.contains("conversation id") || m.contains("channel verification")
-                || (m.contains("11128") && m.contains("conversation"));
+                || m.contains("unapproved channel") || m.contains("illegal api invocation")
+                || m.contains("未通过渠道校验") || m.contains("沒通過渠道校驗")
+                || (m.contains("11128") && (m.contains("conversation")
+                        || m.contains("channel") || m.contains("渠道")));
+    }
+
+    /**
+     * 是不是"请求级风控拦截，官方让重发"的那种渠道校验。
+     *
+     * 和账号级 11128（conversation id missing / request illegal）区分开：
+     * 账号级的重发多少次都一样，只会浪费往返；这一种上游明说 "Please send it again"，
+     * 同一账号原样重发一次通常就过。
+     */
+    static boolean resendableChannel(Throwable t) {
+        String m = t == null ? "" : String.valueOf(t.getMessage()).toLowerCase(java.util.Locale.US);
+        /* 新措辞本身就是请求级风控（官方文案："请求被拦截，请重新发送"）。
+           错误正文会被截到 400 字，短文案不一定保得住，所以只要看到
+           unapproved channel 就允许重发；旧的账号级措辞仍不重发。 */
+        return Http.softChannel(m);
     }
 
     /** 每次尝试都重新构造 body：重试绝不能复用被改过的对象。 */
@@ -892,6 +998,11 @@ public final class WorkBuddy {
             final int passes = tryIntl ? 2 : 1;
             final int shapes = hopeless(p, true) ? 1 : CONV_SHAPES.length;
             Throttled channelFail = null;
+            /* 上游偶尔回"风控拦截，请重新发送"：这种是请求级的，同一账号原样重发就可能过。
+               实测 400ms 一次不够（还会被同一波风控再挡），所以最多重发 2 次、间隔递增；
+               整个 chat() 有上限，避免把偶发拦截变成重试风暴。 */
+            final int[] resent = {0};
+            final int RESEND_MAX = 2;
             for (int pass = 0; pass < passes; pass++) {
                 String realm = pass == 0 ? acc.realm : REALM_GLOBAL;
                 boolean cross = pass > 0;
@@ -903,6 +1014,7 @@ public final class WorkBuddy {
                     JSONObject body = buildBody(model, req, acc.uid);
                     Map<String, String> hh = new HashMap<>(baseHeaders);
                     if (shape > 0) applyConvShape(shape, body, hh, convId, acc);
+                    applyConversationHeaders(hh, body);
                     try {
                         send(endpoint, hh, body, sink, model, req, acc);
                         if (shape > 0 || cross) {
@@ -910,21 +1022,60 @@ public final class WorkBuddy {
                         }
                         return;
                     } catch (Throttled t) {
-                        if (!"channel".equals(t.kind) || !looksLikeConvIdError(t)) {
-                            if (shape > 0 || cross) {
-                                noteConv(p, req, shape, cross ? "国际版身份仍失败" : "仍失败", t);
+                        Throttled err = t;
+                        /* "Illegal API invocation from an unapproved channel" 的官方提示就是
+                           “请重新发送”：同一账号最多重发 2 次（间隔 500ms / 1.5s）；
+                           账号被标记的旧 11128（conversation id missing / request illegal）
+                           不在此列，不要浪费往返。 */
+                        while (resendableChannel(err) && resent[0] < RESEND_MAX) {
+                            resent[0]++;
+                            noteConv(p, req, shape, "风控拦截，第 " + resent[0] + " 次重发", err);
+                            try {
+                                Thread.sleep(resent[0] == 1 ? 500L : 1500L);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
                             }
-                            throw t;
+                            try {
+                                JSONObject body2 = buildBody(model, req, acc.uid);
+                                Map<String, String> hh2 = new HashMap<>(baseHeaders);
+                                if (shape > 0) applyConvShape(shape, body2, hh2, convId, acc);
+                                applyConversationHeaders(hh2, body2);
+                                send(endpoint, hh2, body2, sink, model, req, acc);
+                                noteConv(p, req, shape, cross ? "重发通过（国际版身份）" : "重发通过", null);
+                                return;
+                            } catch (Throttled t2) {
+                                err = t2;
+                            }
                         }
-                        channelFail = t;
-                        noteConv(p, req, shape, cross ? "国际版身份被拒" : "被拒", t);
+                        if (!"channel".equals(err.kind) && !"channel_soft".equals(err.kind)) {
+                            if (shape > 0 || cross) {
+                                noteConv(p, req, shape, cross ? "国际版身份仍失败" : "仍失败", err);
+                            }
+                            throw err;
+                        }
+                        if ("channel_soft".equals(err.kind)) {
+                            /* 请求级风控：账号本身没问题，不写"试到底"标记，也别 6 小时回避。
+                               交给 Router 短暂避，下一个请求照常尝试。 */
+                            channelFail = err;
+                            noteConv(p, req, shape, "请求级风控仍未放行", err);
+                            throw err;
+                        }
+                        if (!looksLikeConvIdError(err)) {
+                            if (shape > 0 || cross) {
+                                noteConv(p, req, shape, cross ? "国际版身份仍失败" : "仍失败", err);
+                            }
+                            throw err;
+                        }
+                        channelFail = err;
+                        noteConv(p, req, shape, cross ? "国际版身份被拒" : "被拒", err);
                         /* 4.36.6：渠道校验是**账号级**判定，不随 body/UA 形状变（4.31.1 两轮
                            实验里 5 次回包 requestId 恒定就是证据）。形状已经在历史上被
                            驳倒过，就不必为了"再确认一次"每次白打 5 次 400：
                            本进程内只要记住这个号，直接跳到下一轮/下一个账号。 */
                         if (CONV_HOPELESS_SHAPES_KNOWN) {
                             if (shapes > 1) rememberHopeless(p.name, true);
-                            throw t;
+                            throw err;
                         }
                     } catch (Exception e) {
                         if (shape > 0 || cross) {

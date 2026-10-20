@@ -3306,6 +3306,11 @@ public final class Server {
         return head + "，约 " + sec + " 秒后恢复" + tail;
     }
 
+    /** 一次失败是不是"请求级风控"（channel_soft，换模型往往就过）。 */
+    private static boolean isSoftChannel(Throwable e) {
+        return e instanceof Throttled && "channel_soft".equals(((Throttled) e).kind);
+    }
+
     /** 直连路径一次尝试几个候选（首次 + 重试）。 */
     private static final int DIRECT_TRIES = 3;
 
@@ -5374,6 +5379,7 @@ public final class Server {
                坏请求直接结束整轮（换模型也没用）。 */
             java.util.Set<String> skipModels = new java.util.HashSet<>();
             int attempts = 0;
+            int softExtra = 0;
             for (int i = 0; i < cands.size() && attempts < tries; i++) {
                 Router.Pick c = cands.get(i);
                 if (skipModels.contains(c.model)) continue;
@@ -5410,6 +5416,13 @@ public final class Server {
                     }
                     Log.w("虚拟模型 " + req.model + " 第 " + (i + 1) + " 个候选失败（"
                             + c.key() + "）：" + e.getMessage());
+                    /* 请求级风控是"这个模型/这条请求"的组合判定：同一份 body 换
+                       glm/kimi 往往就过。它不该占本轮有限的重试预算，最多多给 3 个候选。 */
+                    if (isSoftChannel(e) && softExtra < 3) {
+                        softExtra++;
+                        tries = Math.min(cands.size(), tries + 1);
+                        Log.w("请求级风控，不占本轮预算，继续换模型（预算 → " + tries + "）");
+                    }
                     if (sc.stopRotation()) {
                         last = e;
                         break;
@@ -5434,6 +5447,7 @@ public final class Server {
         Exception last = null;
         java.util.Set<String> skipModels = new java.util.HashSet<>();
         int attempts = 0;
+        int softExtra = 0;
         for (int i = 0; i < cands.size() && attempts < tries; i++) {
             Router.Pick c = cands.get(i);
             if (skipModels.contains(c.model)) continue;
@@ -5498,6 +5512,11 @@ public final class Server {
                 }
                 Log.w("虚拟模型 " + req.model + " 第 " + (i + 1) + " 个候选失败（"
                         + c.key() + "），未提交，换下一个：" + e.getMessage());
+                if (isSoftChannel(e) && softExtra < 3) {
+                    softExtra++;
+                    tries = Math.min(cands.size(), tries + 1);
+                    Log.w("请求级风控，不占本轮预算，继续换模型（预算 → " + tries + "）");
+                }
             }
         }
         if (last != null && FailScope.of(last) == FailScope.REQUEST) {

@@ -95,8 +95,10 @@ public final class Upstreams {
             // 用 " |BODY| " 做分隔符。
             /* 调试抓包也必须有上限：一个 8MB 的图片请求 × 12 条会吃掉上百 MB。 */
             String bs = body == null ? "" : body.toString();
-            if (bs.length() > 64 * 1024) {
-                bs = bs.substring(0, 64 * 1024) + "...(truncated, " + bs.length() + " chars)";
+            /* 256KB：带工具的 agent 请求里 messages 很容易占满 64KB，
+               tools 排在后面就永远看不到 —— 而排查"上游为什么拒绝"恰恰需要它。 */
+            if (bs.length() > 256 * 1024) {
+                bs = bs.substring(0, 256 * 1024) + "...(truncated, " + bs.length() + " chars)";
             }
             String rec = "URL " + url + " |BODY| " + bs;
             synchronized (CAPTURED) {

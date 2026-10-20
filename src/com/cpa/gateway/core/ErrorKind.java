@@ -60,7 +60,8 @@ final class ErrorKind {
                 case "rate": return RATE;
                 case "quota": return QUOTA;
                 case "auth": return AUTH;
-                case "channel": return CHANNEL;
+                case "channel":
+                case "channel_soft": return CHANNEL;
                 default: return OTHER;
             }
         }

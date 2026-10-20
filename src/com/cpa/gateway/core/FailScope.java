@@ -64,6 +64,18 @@ enum FailScope {
             return MODEL_ACCESS;
         }
 
+        /* 渠道校验必须先于 InvalidRequest：WorkBuddy 现在用 HTTP 400 + code 11128
+           "Illegal API invocation from an unapproved channel" 表达"这个号/这次调用
+           没通过渠道校验"。它是账号侧问题（换号有意义），不是请求不合法；
+           以前会归成 REQUEST，纯调用直接失败、轮换整轮中止，一个号被拦就连累
+           所有别的渠道。 */
+        if (msg.contains("unapproved channel") || msg.contains("illegal api invocation")
+                || msg.contains("channel verification") || msg.contains("未通过渠道校验")
+                || (msg.contains("11128") && (msg.contains("conversation")
+                        || msg.contains("channel") || msg.contains("渠道")))) {
+            return ACCOUNT;
+        }
+
         /* InvalidRequest 必须先于网络关键词判断：HTTP 400 "request body is not json"
            是请求问题，不是断流；以前会被 "not json" 误判成 TRANSIENT 然后换号重试。 */
         if (t instanceof InvalidRequest) return REQUEST;

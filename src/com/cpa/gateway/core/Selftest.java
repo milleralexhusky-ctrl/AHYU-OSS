@@ -70,6 +70,7 @@ public final class Selftest {
         add(out, "检测失败归类（业务码里的数字不算 HTTP 状态码）", Selftest::checkDetectClassify);
         add(out, "检测采样跳过非聊天模型", Selftest::checkDetectSampling);
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
+        add(out, "WorkBuddy 会话头与新版风控归类", Selftest::checkWorkBuddyChannel);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -773,6 +774,101 @@ public final class Selftest {
         }
         if (WorkBuddy.REALM_GLOBAL.equals(cn.get("User-Agent")) || cn.get("User-Agent").isEmpty()) {
             return "国内版身份没有 UA";
+        }
+        return null;
+    }
+
+    /**
+     * 2026-10 的 WorkBuddy 网关：
+     *   · 国际网关要求聊天带 X-Conversation-* 头；
+     *   · 新的 11128 "unapproved channel / please send it again" 是请求级风控：
+     *     不能按请求错误直接失败，也不能按账号标记冷却 6 小时；
+     *   · 官方提示"请重新发送"的那一种可以在同账号重发；
+     *   · 旧的 conversation id missing / request illegal 仍是账号级，不重发。
+     */
+    private static String checkWorkBuddyChannel() {
+        String body = "{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\","
+                + "\"displayMsg\":{\"en\":\"Request blocked. Please send it again\","
+                + "\"zh\":\"请求被拦截，请重新发送\"}}";
+        if (!Http.channel(body)) return "unapproved channel 没被认成渠道校验";
+        Exception e = Http.upstreamError(400, body);
+        if (!(e instanceof Throttled)) return "HTTP 400 + 11128 没按退避处理：" + e;
+        if (!"channel_soft".equals(((Throttled) e).kind)) {
+            return "请求级风控没归到 channel_soft：" + ((Throttled) e).kind;
+        }
+        if (!Http.softChannel(body)) return "softChannel 没认出新措辞";
+        if (FailScope.of(e) != FailScope.ACCOUNT) {
+            return "渠道校验没归到账号作用域：" + FailScope.of(e);
+        }
+        if (!WorkBuddy.resendableChannel(e)) return "“请重新发送”的拦截没有触发同账号重发";
+        Exception old = Http.upstreamError(400,
+                "{\"code\":11128,\"msg\":\"conversation id missing\"}");
+        if (FailScope.of(old) != FailScope.ACCOUNT) return "账号级 11128 没归到账号作用域";
+        if (WorkBuddy.resendableChannel(old)) return "账号级 11128 不该原样重发";
+        if (FailScope.of(new InvalidRequest(400, "upstream HTTP 400 request body is not json"))
+                != FailScope.REQUEST) {
+            return "普通 400 被渠道校验规则误伤了";
+        }
+
+        JSONObject one = new JSONObject();
+        JSONArray msgs = new JSONArray();
+        try {
+            msgs.put(new JSONObject().put("role", "system").put("content", "sys"));
+            msgs.put(new JSONObject().put("role", "user").put("content", "hi"));
+            one.put("messages", msgs);
+        } catch (Exception ex) {
+            return "构造样例失败：" + ex;
+        }
+        java.util.Map<String, String> h1 = new java.util.HashMap<>();
+        WorkBuddy.applyConversationHeaders(h1, one);
+        for (String k : new String[]{"X-Conversation-ID", "X-Conversation-Request-ID",
+                "X-Conversation-Message-ID", "X-Request-ID"}) {
+            String v = h1.get(k);
+            if (v == null || !v.matches("[0-9a-f]{32}")) {
+                return k + " 缺失或不是 32 位十六进制：" + v;
+            }
+        }
+        if (!h1.get("X-Conversation-Message-ID").equals(h1.get("X-Request-ID"))) {
+            return "X-Request-ID 没有镜像 message id";
+        }
+        java.util.Map<String, String> h2 = new java.util.HashMap<>();
+        WorkBuddy.applyConversationHeaders(h2, one);
+        if (!h1.get("X-Conversation-ID").equals(h2.get("X-Conversation-ID"))) {
+            return "同一会话的 X-Conversation-ID 不稳定";
+        }
+        if (!h1.get("X-Conversation-Request-ID").equals(h2.get("X-Conversation-Request-ID"))) {
+            return "同一轮的 X-Conversation-Request-ID 不稳定（重试会被当成新轮次）";
+        }
+        if (h1.get("X-Conversation-Message-ID").equals(h2.get("X-Conversation-Message-ID"))) {
+            return "两次调用的 X-Conversation-Message-ID 相同（应为每次新值）";
+        }
+        /* 工具循环：最后一条是 tool 结果，最后一条 user 没变 → 仍属同一轮。 */
+        try {
+            one.getJSONArray("messages").put(new JSONObject().put("role", "assistant")
+                    .put("content", ""));
+            one.getJSONArray("messages").put(new JSONObject().put("role", "tool")
+                    .put("tool_call_id", "c1").put("content", "ok"));
+        } catch (Exception ex) {
+            return "追加工具消息失败：" + ex;
+        }
+        java.util.Map<String, String> h3 = new java.util.HashMap<>();
+        WorkBuddy.applyConversationHeaders(h3, one);
+        if (!h2.get("X-Conversation-Request-ID").equals(h3.get("X-Conversation-Request-ID"))) {
+            return "工具循环被拆成了新的轮次";
+        }
+        /* 新的 user 消息 = 新一轮，但会话不变。 */
+        try {
+            one.getJSONArray("messages").put(new JSONObject().put("role", "user").put("content", "again"));
+        } catch (Exception ex) {
+            return "追加用户消息失败：" + ex;
+        }
+        java.util.Map<String, String> h4 = new java.util.HashMap<>();
+        WorkBuddy.applyConversationHeaders(h4, one);
+        if (h4.get("X-Conversation-Request-ID").equals(h3.get("X-Conversation-Request-ID"))) {
+            return "新一轮的 request id 没有变化";
+        }
+        if (!h4.get("X-Conversation-ID").equals(h3.get("X-Conversation-ID"))) {
+            return "同一会话跨轮次换了 X-Conversation-ID";
         }
         return null;
     }

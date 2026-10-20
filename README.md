@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.50.3**（versionCode 646，见 `version.properties`）
+- 当前版本：**4.50.4**（versionCode 647，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -159,8 +159,10 @@ docs/research/             协议调查脚本
 
 ## 已知限制
 
-- WorkBuddy 3 的 `11128 request illegal`（渠道校验）到 4.37.0 仍未证实根因；
-  4.36.5–4.36.8 已按官方客户端补齐头与 body 派生字段，但缺少下一次真机回包证据。
+- WorkBuddy 国际网关从 2026-10-15 起校验官方客户端的 `X-Conversation-*` 头；
+  4.50.4 已按官方形状补齐。新版 11128（`Illegal API invocation from an unapproved
+  channel`）是请求级风控、上游提示“请重新发送”：网关最多同账号重发 2 次，
+  仍失败只短回避 20 秒，不再把模型锁 6 小时。账号被标记的旧 11128 仍按账号问题处理。
 - Antigravity 的 OAuth Client Secret 由私库构建时注入（`.private/signing.env` 的
   `ANTIGRAVITY_CLIENT_SECRET`）；用公库源码自行构建时该项为空，登录会停在 token 交换。
 - 多数渠道依赖网页/客户端私有协议，上游改版后可能失效；这类问题优先看

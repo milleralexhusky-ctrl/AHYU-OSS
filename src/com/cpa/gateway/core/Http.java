@@ -67,17 +67,45 @@ public final class Http {
         if (code == 402 || quota(body)) return "quota";
         /* 渠道校验（WorkBuddy 的 11128 "channel verification"）：账号/会话被上游标记，
            退避没有意义、换号才有用 —— 单列一类，别混进"限流"。 */
-        if (channel(body)) return "channel";
+        if (channel(body)) return softChannel(body) ? "channel_soft" : "channel";
         return "rate";
     }
 
-    /** 正文是不是"渠道校验"这类拒绝（不看 HTTP 码，只看上游原话）。 */
+    /**
+     * 渠道校验里的"请求级风控"：上游明说"请重新发送"的那一种。
+     *
+     * 和账号被标记（`conversation id missing` / `request illegal`）区分：
+     * 后者换号/重新登录才有用；前者等一两秒原样重发就可能过，
+     * 不该把账号按 6 小时不可用处理。
+     */
+    static boolean softChannel(String body) {
+        if (body == null) return false;
+        String b = body.length() > 4000 ? body.substring(0, 4000) : body;
+        b = b.toLowerCase(java.util.Locale.US);
+        return b.contains("unapproved channel")
+                || (b.contains("illegal api invocation")
+                    && (b.contains("send it again") || b.contains("resend")
+                        || b.contains("重新发送") || b.contains("重新傳送")));
+    }
+
+    /**
+     * 正文是不是"渠道校验"这类拒绝（不看 HTTP 码，只看上游原话）。
+     *
+     * 2026-10 起 WorkBuddy 国际网关换了措辞：HTTP 400 + code 11128
+     * `Illegal API invocation from an unapproved channel`，displayMsg 是
+     * "Request blocked. Please send it again"。旧关键词（channel verification /
+     * request illegal）不再出现，所以以前这条会被当成普通 400 请求错误 ——
+     * 既不换号，也不重试，直接把上游原文丢给客户端。
+     */
     static boolean channel(String body) {
         if (body == null) return false;
         String b = body.length() > 4000 ? body.substring(0, 4000) : body;
         b = b.toLowerCase(java.util.Locale.US);
         return b.contains("channel verification") || b.contains("可能不是官方客户端")
-                || (b.contains("11128") && b.contains("request illegal"));
+                || b.contains("unapproved channel") || b.contains("illegal api invocation")
+                || b.contains("未通过渠道校验") || b.contains("沒通過渠道校驗")
+                || (b.contains("11128") && (b.contains("request illegal")
+                        || b.contains("channel") || b.contains("渠道")));
     }
 
     /* ================================================== 失败原因分类（凭证健康度） */
@@ -225,7 +253,7 @@ public final class Http {
      */
     static Exception upstreamError(int code, String body) {
         if (code == 429 || code == 402 || code == 401 || code == 403
-                || throttled(code) || quota(body)) {
+                || throttled(code) || quota(body) || channel(body)) {
             long resetAt = parseResetAtMs(body);
             long backoff = defaultBackoffMs(code);
             /* 上游明说了恢复时刻，就按它退避（前提是比默认退避更远）。
@@ -560,7 +588,8 @@ public final class Http {
                 closeQuietly(in);
                 firstArrived.set(true);   // 错也是"有回音"，别让看门狗多事
                 clean = true;   // 错误体读完了，连接干净
-                if (throttled(code) || code == 401 || code == 402 || code == 403 || quota(errBody)) {
+                if (throttled(code) || code == 401 || code == 402 || code == 403
+                        || quota(errBody) || channel(errBody)) {
                     throw new Throttled(code, retryAfterMs(conn, defaultBackoffMs(code)),
                             kindOf(code, errBody), "upstream HTTP " + code + " " + shorten(errBody));
                 }
