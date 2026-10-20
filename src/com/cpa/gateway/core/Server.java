@@ -1974,6 +1974,14 @@ public final class Server {
             handleResponses(r, out);
             return;
         }
+        /* Assistants / Threads：有状态接口，单独一套存储与执行。 */
+        if (path.equals("/v1/assistants")
+                || path.startsWith("/v1/assistants/")
+                || path.equals("/v1/threads")
+                || path.startsWith("/v1/threads/")) {
+            handleAssistants(r, out);
+            return;
+        }
         if (path.startsWith("/v1beta/models/") && "POST".equals(r.method)) {
             String rest = URLDecoder.decode(path.substring("/v1beta/models/".length()), "UTF-8");
             int colon = rest.indexOf(':');
@@ -4107,6 +4115,287 @@ public final class Server {
             } catch (Throwable ignored) {
             }
         }
+    }
+
+    /**
+     * Assistants / Threads 路由（4.45.0）。
+     *
+     * 只做同步 run：创建后立即执行并返回 completed/failed；状态落在
+     * {@link Assistants} 的 assistants.json。工具调用（requires_action）暂不支持，
+     * 会以 failed + last_error 明确告知，而不是假装成功。
+     */
+    private void handleAssistants(Req r, OutputStream out) throws Exception {
+        String path = r.path;
+        String method = r.method;
+        try {
+            if ("/v1/assistants".equals(path)) {
+                if ("GET".equals(method)) {
+                    writeJson(out, 200, Assistants.listObject(Assistants.listAssistants()).toString());
+                    return;
+                }
+                if ("POST".equals(method)) {
+                    writeJson(out, 200, Assistants.createAssistant(new JSONObject(
+                            r.body.isEmpty() ? "{}" : r.body)).toString());
+                    return;
+                }
+            }
+            if (path.startsWith("/v1/assistants/")) {
+                String id = URLDecoder.decode(path.substring("/v1/assistants/".length()), "UTF-8");
+                if ("GET".equals(method)) {
+                    writeJson(out, 200, Assistants.getAssistant(id).toString());
+                    return;
+                }
+                if ("DELETE".equals(method)) {
+                    Assistants.deleteAssistant(id);
+                    JSONObject o = new JSONObject();
+                    o.put("id", id);
+                    o.put("object", "assistant.deleted");
+                    o.put("deleted", true);
+                    writeJson(out, 200, o.toString());
+                    return;
+                }
+            }
+            if ("/v1/threads".equals(path) && "POST".equals(method)) {
+                writeJson(out, 200, Assistants.createThread(new JSONObject(
+                        r.body.isEmpty() ? "{}" : r.body)).toString());
+                return;
+            }
+            if ("/v1/threads/runs".equals(path) && "POST".equals(method)) {
+                JSONObject body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                JSONObject thread = Assistants.createThread(
+                        body.optJSONObject("thread") == null ? new JSONObject()
+                                : body.optJSONObject("thread"));
+                String tid = thread.getString("id");
+                JSONArray msgs = body.optJSONObject("thread") == null ? null
+                        : body.optJSONObject("thread").optJSONArray("messages");
+                if (msgs != null) {
+                    for (int i = 0; i < msgs.length(); i++) {
+                        JSONObject m = msgs.optJSONObject(i);
+                        if (m != null) Assistants.addMessage(tid, m);
+                    }
+                }
+                JSONObject run = executeAssistantRun(tid, body);
+                writeAssistantsRun(out, body, run);
+                return;
+            }
+            if (path.startsWith("/v1/threads/")) {
+                String rest = path.substring("/v1/threads/".length());
+                int slash = rest.indexOf('/');
+                String tid = URLDecoder.decode(slash < 0 ? rest : rest.substring(0, slash), "UTF-8");
+                String tail = slash < 0 ? "" : rest.substring(slash + 1);
+                if (tail.isEmpty()) {
+                    if ("GET".equals(method)) {
+                        writeJson(out, 200, Assistants.getThread(tid).toString());
+                        return;
+                    }
+                    if ("DELETE".equals(method)) {
+                        Assistants.deleteThread(tid);
+                        JSONObject o = new JSONObject();
+                        o.put("id", tid);
+                        o.put("object", "thread.deleted");
+                        o.put("deleted", true);
+                        writeJson(out, 200, o.toString());
+                        return;
+                    }
+                }
+                if ("messages".equals(tail)) {
+                    if ("GET".equals(method)) {
+                        int limit = parseIntOr(queryParam(r, "limit"), 20);
+                        JSONArray data = Assistants.listMessages(tid, limit,
+                                queryParam(r, "order"));
+                        writeJson(out, 200, Assistants.listObject(data).toString());
+                        return;
+                    }
+                    if ("POST".equals(method)) {
+                        JSONObject body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                        writeJson(out, 200, Assistants.addMessage(tid, body).toString());
+                        return;
+                    }
+                }
+                if (tail.startsWith("messages/") && "GET".equals(method)) {
+                    String mid = URLDecoder.decode(tail.substring("messages/".length()), "UTF-8");
+                    writeJson(out, 200, Assistants.getMessage(tid, mid).toString());
+                    return;
+                }
+                if ("runs".equals(tail)) {
+                    if ("GET".equals(method)) {
+                        writeJson(out, 200, Assistants.listObject(
+                                Assistants.listRuns(tid)).toString());
+                        return;
+                    }
+                    if ("POST".equals(method)) {
+                        JSONObject body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                        JSONObject run = executeAssistantRun(tid, body);
+                        writeAssistantsRun(out, body, run);
+                        return;
+                    }
+                }
+                if (tail.startsWith("runs/")) {
+                    String[] parts = tail.substring("runs/".length()).split("/");
+                    String rid = URLDecoder.decode(parts[0], "UTF-8");
+                    if (parts.length == 1 && "GET".equals(method)) {
+                        writeJson(out, 200, Assistants.getRun(tid, rid).toString());
+                        return;
+                    }
+                    if (parts.length == 2 && "cancel".equals(parts[1])
+                            && "POST".equals(method)) {
+                        JSONObject run = Assistants.getRun(tid, rid);
+                        if (!"completed".equals(run.optString("status"))
+                                && !"failed".equals(run.optString("status"))) {
+                            run.put("status", "cancelled");
+                            run.put("cancelled_at", System.currentTimeMillis() / 1000);
+                            Assistants.updateRun(tid, run);
+                        }
+                        writeJson(out, 200, run.toString());
+                        return;
+                    }
+                    if (parts.length == 2 && "steps".equals(parts[1])
+                            && "GET".equals(method)) {
+                        JSONArray steps = Assistants.listSteps(tid, rid);
+                        writeJson(out, 200, Assistants.listObject(steps).toString());
+                        return;
+                    }
+                    if (parts.length == 2 && "submit_tool_outputs".equals(parts[1])) {
+                        writeError(out, path, 400,
+                                "AHYU 的 Assistants 兼容层暂不支持工具调用（requires_action）");
+                        return;
+                    }
+                }
+            }
+            writeError(out, path, 404, "unknown assistants route: " + path);
+        } catch (Assistants.NotFound nf) {
+            writeError(out, path, 404, nf.getMessage());
+        }
+    }
+
+    private static int parseIntOr(String s, int def) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /** 同步执行一次 run，返回最终的 run 对象。 */
+    private JSONObject executeAssistantRun(String threadId, JSONObject body) throws Exception {
+        JSONObject run = Assistants.createRun(threadId, body);
+        String runId = run.getString("id");
+        String assistantId = run.optString("assistant_id", "");
+        JSONObject assistant = null;
+        try {
+            if (!assistantId.isEmpty()) assistant = Assistants.getAssistant(assistantId);
+        } catch (Throwable ignored) {
+        }
+
+        JSONArray additional = body.optJSONArray("additional_messages");
+        if (additional != null) {
+            for (int i = 0; i < additional.length(); i++) {
+                JSONObject m = additional.optJSONObject(i);
+                if (m != null) Assistants.addMessage(threadId, m);
+            }
+        }
+
+        String model = run.optString("model", "");
+        if (model.isEmpty() && assistant != null) model = assistant.optString("model", "");
+        if (model.isEmpty()) model = "auto";
+        String instructions = run.optString("instructions", "");
+        if (instructions.isEmpty() && assistant != null) {
+            instructions = assistant.optString("instructions", "");
+        }
+        JSONArray tools = run.optJSONArray("tools");
+        if ((tools == null || tools.length() == 0) && assistant != null) {
+            tools = assistant.optJSONArray("tools");
+        }
+
+        run.put("model", model);
+        if (!instructions.isEmpty()) run.put("instructions", instructions);
+        if (tools != null) run.put("tools", tools);
+        run.put("status", "in_progress");
+        run.put("started_at", System.currentTimeMillis() / 1000);
+        Assistants.updateRun(threadId, run);
+
+        try {
+            JSONArray messages = new JSONArray();
+            if (!instructions.isEmpty()) {
+                messages.put(new JSONObject().put("role", "system").put("content", instructions));
+            }
+            JSONArray history = Assistants.modelMessages(threadId);
+            for (int i = 0; i < history.length(); i++) messages.put(history.opt(i));
+            if (messages.length() == 0) {
+                messages.put(new JSONObject().put("role", "user").put("content", ""));
+            }
+            JSONObject chat = new JSONObject();
+            chat.put("model", model);
+            chat.put("messages", messages);
+            chat.put("stream", false);
+            if (tools != null && tools.length() > 0) chat.put("tools", tools);
+
+            Map<String, String> headers = new HashMap<>();
+            if (config.apiKey != null && !config.apiKey.isEmpty()) {
+                headers.put("Authorization", "Bearer " + config.apiKey);
+            }
+            Http.Resp resp = Http.call("POST",
+                    "http://127.0.0.1:" + config.port + "/v1/chat/completions",
+                    headers, chat.toString().getBytes(StandardCharsets.UTF_8),
+                    "application/json", 10000, 120000, false);
+            if (resp.code < 200 || resp.code >= 300) {
+                throw new IllegalStateException("chat HTTP " + resp.code + ": " + resp.body);
+            }
+            JSONObject reply = new JSONObject(resp.body);
+            JSONArray choices = reply.optJSONArray("choices");
+            JSONObject msg = choices != null && choices.length() > 0
+                    ? choices.optJSONObject(0).optJSONObject("message") : null;
+            if (msg == null) throw new IllegalStateException("chat 响应里没有 message");
+            if (msg.optJSONArray("tool_calls") != null && msg.optJSONArray("tool_calls").length() > 0) {
+                throw new IllegalStateException("模型要求工具调用；Assistants 兼容层暂不支持");
+            }
+            String text = msg.optString("content", "");
+            JSONObject stored = Assistants.addAssistantMessage(threadId, text, runId, assistantId);
+            run.put("status", "completed");
+            run.put("completed_at", System.currentTimeMillis() / 1000);
+            JSONObject usage = reply.optJSONObject("usage");
+            if (usage != null) {
+                JSONObject u = new JSONObject();
+                u.put("prompt_tokens", usage.optInt("prompt_tokens", 0));
+                u.put("completion_tokens", usage.optInt("completion_tokens", 0));
+                u.put("total_tokens", usage.optInt("total_tokens", 0));
+                run.put("usage", u);
+            }
+            Assistants.updateRun(threadId, run);
+            JSONObject details = new JSONObject();
+            details.put("type", "message_creation");
+            details.put("message_creation", new JSONObject().put("message_id", stored.optString("id")));
+            Proto.Usage pu = new Proto.Usage();
+            if (usage != null) {
+                pu.input = usage.optInt("prompt_tokens", 0);
+                pu.output = usage.optInt("completion_tokens", 0);
+            }
+            Assistants.addStep(threadId, runId, assistantId, "message_creation", details, pu);
+        } catch (Throwable t) {
+            run.put("status", "failed");
+            run.put("failed_at", System.currentTimeMillis() / 1000);
+            JSONObject err = new JSONObject();
+            err.put("code", "server_error");
+            err.put("message", String.valueOf(t.getMessage()));
+            run.put("last_error", err);
+            Assistants.updateRun(threadId, run);
+        }
+        return run;
+    }
+
+    private void writeAssistantsRun(OutputStream out, JSONObject body, JSONObject run) throws Exception {
+        if (body.optBoolean("stream", false)) {
+            BufferedWriter w = startSse(out);
+            String event = "failed".equals(run.optString("status"))
+                    ? "thread.run.failed" : "thread.run.completed";
+            w.write("event: thread.run.created\ndata: " + run.toString() + "\n\n");
+            w.write("event: thread.run.in_progress\ndata: " + run.toString() + "\n\n");
+            w.write("event: " + event + "\ndata: " + run.toString() + "\n\n");
+            w.write("event: done\ndata: [DONE]\n\n");
+            w.flush();
+            return;
+        }
+        writeJson(out, 200, run.toString());
     }
 
     private void handleOpenAiChat(Req r, OutputStream out) throws Exception {

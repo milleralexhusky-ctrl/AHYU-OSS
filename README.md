@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.44.0**（versionCode 637，见 `version.properties`）
+- 当前版本：**4.45.0**（versionCode 638，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -23,6 +23,7 @@
 | `POST /v1/embeddings`、`/v1/moderations`、`/v1/images/generations` | OpenAI 非聊天端点（原样转发） |
 | `POST /v1/audio/transcriptions`、`/v1/audio/speech` | 语音转写 / 合成（multipart / 二进制） |
 | `POST /v1beta/models/{model}:embedContent` / `:batchEmbedContents` | Gemini 向量化 |
+| `/v1/assistants`、`/v1/threads`、`.../messages`、`.../runs` | OpenAI Assistants / Threads（有状态，同步 run） |
 | `/openai/deployments/{deployment}/chat/completions` | Azure OpenAI 路径 |
 | `GET /v1/models`、`GET /health`、`GET /v1/capacity` | 模型目录、健康、容量 |
 | `GET /panel` | 手机浏览器里的状态面板 |
