@@ -190,6 +190,16 @@ public final class Proto {
         public Integer seed;
         /** 请求来自哪套协议（openai / anthropic / gemini），出口翻译时要用。 */
         public String protocol = "";
+        /**
+         * 入口协议里**没有单独建模**的顶层字段（top_k / logprobs / service_tier /
+         * metadata / safetySettings …）。
+         *
+         * 同协议转发时原样并回出站 body，避免"网关把不认识的参数悄悄丢掉"。
+         * 跨协议不合并——字段语义不同，硬塞过去只会 400。
+         */
+        public final JSONObject extraBody = new JSONObject();
+        /** Gemini generationConfig 里没有单独建模的字段（topK / seed / candidateCount…）。 */
+        public final JSONObject extraGenerationConfig = new JSONObject();
         /** 被丢弃的能力参数名（非空时由 Server 记一条可见日志，不静默丢）。 */
         public final List<String> droppedParams = new ArrayList<>();
         /** Internal: gateway-side liveness checks that must not leave traces in the user's account. */

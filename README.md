@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.48.0**（versionCode 641，见 `version.properties`）
+- 当前版本：**4.49.0**（versionCode 642，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -122,6 +122,12 @@ docs/research/             协议调查脚本
 | `core/WorkBuddy.java` 等 | 各渠道的账号与协议实现 |
 | `GatewayService.java` | 前台服务、看门狗、保活 |
 | `MainActivity.java` / `Ui.java` | 单页主页与共享 UI 组件 |
+
+## 性能与保真
+
+- 150 次 keep-alive 真机压测：`/v1/models` p50 0.77ms、`/health` 0.99ms、`/v1/capacity` 1.18ms。
+- 同协议转发时保留未建模字段（`top_k` / `service_tier` / `metadata` / `safetySettings` 等），
+  不因网关不认识而丢掉；跨协议不硬塞。
 
 ## 资源占用
 

@@ -32,6 +32,22 @@ public final class Fronts {
         return fixed;
     }
 
+    /** 把入口里未建模的顶层字段复制到 req.extraBody（同协议出口再并回去）。 */
+    private static void copyExtra(JSONObject src, JSONObject dst, String... known) {
+        if (src == null || dst == null) return;
+        java.util.Set<String> skip = new java.util.HashSet<>(
+                java.util.Arrays.asList(known));
+        java.util.Iterator<String> it = src.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (skip.contains(k)) continue;
+            try {
+                dst.put(k, src.opt(k));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     /* ------------------------------------------------------------- collector */
 
     /** Non-streaming sink: accumulates the canonical stream so it can be emitted as one JSON body. */
@@ -216,6 +232,12 @@ public final class Fronts {
                             fn.optJSONObject("parameters")));
                 }
             }
+            copyExtra(body, req.extraBody,
+                    "model", "messages", "stream", "max_tokens", "max_completion_tokens",
+                    "max_output_tokens", "temperature", "top_p", "tool_choice",
+                    "response_format", "reasoning", "reasoning_effort",
+                    "parallel_tool_calls", "presence_penalty", "frequency_penalty",
+                    "seed", "stop", "tools", "stream_options");
             return req;
         }
 
@@ -804,6 +826,9 @@ public final class Fronts {
                             t.optJSONObject("input_schema")));
                 }
             }
+            copyExtra(body, req.extraBody,
+                    "model", "messages", "stream", "max_tokens", "temperature", "top_p",
+                    "tool_choice", "thinking", "system", "stop_sequences", "tools");
             return req;
         }
 
@@ -1118,6 +1143,15 @@ public final class Fronts {
                                 d.optJSONObject("parameters")));
                     }
                 }
+            }
+            copyExtra(body, req.extraBody,
+                    "contents", "systemInstruction", "system_instruction",
+                    "generationConfig", "generation_config", "tools", "toolConfig");
+            if (gen != null) {
+                copyExtra(gen, req.extraGenerationConfig,
+                        "maxOutputTokens", "max_output_tokens", "temperature", "topP",
+                        "stopSequences", "thinkingConfig", "responseMimeType",
+                        "responseSchema");
             }
             return req;
         }

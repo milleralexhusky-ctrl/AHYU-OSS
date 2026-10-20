@@ -481,28 +481,39 @@ public final class Server {
     }
 
     /** Counts bytes written so a stalled upstream can be detected without touching the writers. */
-    private static final class CountingStream extends java.io.FilterOutputStream {
+    /**
+     * 计数写端。**不要**继承 FilterOutputStream：某些 Android 版本的
+     * FilterOutputStream.write(byte[],off,len) 会按字节转发，21KB 响应会变成
+     * 两万次小写入（实测 241ms）；直接委托底层 write 后是 0–2ms。
+     */
+    private static final class CountingStream extends OutputStream {
+        private final OutputStream out;
         volatile long count;
 
         CountingStream(OutputStream out) {
-            super(out);
+            this.out = out;
         }
 
         @Override
         public void write(int b) throws java.io.IOException {
-            super.write(b);
+            out.write(b);
             count++;
         }
 
         @Override
         public void write(byte[] b, int off, int len) throws java.io.IOException {
-            super.write(b, off, len);
+            out.write(b, off, len);
             count += len;
         }
 
         @Override
         public void flush() throws java.io.IOException {
-            super.flush();
+            out.flush();
+        }
+
+        @Override
+        public void close() throws java.io.IOException {
+            out.close();
         }
     }
 
@@ -977,7 +988,10 @@ public final class Server {
                 }
                 long netT1 = android.os.SystemClock.uptimeMillis();
                 served++;
-                conn.keepAlive = r.keepAlive;
+                /* 第 KEEPALIVE_MAX_REQUESTS 条响应就明确告诉客户端 close：
+                   只靠 Keep-Alive: max 的话，忽略这个头的客户端会复用一条
+                   即将被关掉的连接，下一条请求就 Connection reset。 */
+                conn.keepAlive = r.keepAlive && served < KEEPALIVE_MAX_REQUESTS;
                 long started = System.currentTimeMillis();
                 // 探活回环不算"真实流量"：原来探活打自己的请求也会刷新这个时间戳，
                 // 导致 verifyModelsAsync 的让路循环把自己当流量、越让越慢（N 个模型被拉长 N×4 秒）
@@ -1242,6 +1256,7 @@ public final class Server {
             long stamp = configStamp();
             String cached = cacheModelsStamp == stamp ? cacheModelsJson : null;
             if (cached == null) {
+                Log.i("models 缓存重建：stamp " + cacheModelsStamp + " → " + stamp);
                 cached = modelsOpenAi().toString();
                 cacheModelsJson = cached;
                 cacheModelsStamp = stamp;

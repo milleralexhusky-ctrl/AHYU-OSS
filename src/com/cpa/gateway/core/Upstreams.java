@@ -324,6 +324,23 @@ public final class Upstreams {
     }
 
     /** Builds an OpenAI chat-completions body from a canonical request (shared by several upstreams). */
+    /**
+     * 同协议出口把入口里未建模的字段并回去（不覆盖已经明确构造的字段）。
+     * 跨协议不合并：字段语义不同，硬塞只会 400。
+     */
+    private static void mergeExtra(JSONObject dst, JSONObject extra) {
+        if (dst == null || extra == null) return;
+        java.util.Iterator<String> it = extra.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (dst.has(k)) continue;
+            try {
+                dst.put(k, extra.opt(k));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     static JSONObject openAiBody(String model, Proto.Req req, boolean stream) throws Exception {
         JSONObject body = new JSONObject();
         body.put("model", model);
@@ -381,6 +398,7 @@ public final class Upstreams {
             } catch (Exception ignored) {
             }
         }
+        if ("openai".equals(req.protocol)) mergeExtra(body, req.extraBody);
         return body;
     }
 
@@ -1177,6 +1195,7 @@ public final class Upstreams {
         Object th = XParams.thinking(req.protocol, req.thinkingParams, "anthropic");
         if (th != null) body.put("thinking", th);
         else if (req.thinkingParams != null) note("thinking", req);
+        if ("anthropic".equals(req.protocol)) mergeExtra(body, req.extraBody);
         return body;
     }
 
@@ -1401,6 +1420,13 @@ public final class Upstreams {
                             .put("parameters", t.schema == null ? new JSONObject().put("type", "object") : t.schema));
                 }
                 body.put("tools", new JSONArray().put(new JSONObject().put("functionDeclarations", declarations)));
+            }
+            if ("gemini".equals(req.protocol)) {
+                mergeExtra(body, req.extraBody);
+                JSONObject eg = body.optJSONObject("generationConfig");
+                if (eg == null) eg = new JSONObject();
+                mergeExtra(eg, req.extraGenerationConfig);
+                if (eg.length() > 0) body.put("generationConfig", eg);
             }
 
             String base = trimSlash(p.baseUrl);

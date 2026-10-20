@@ -77,6 +77,7 @@ public final class Selftest {
         add(out, "HTTP 请求回放（chunked 中文/多请求对齐）", Selftest::checkHttpRequestReplay);
         add(out, "入口解析保留工具结果 id（OpenAI/Anthropic/Gemini）", Selftest::checkFrontToolResults);
         add(out, "Ollama 请求翻译与响应形状", Selftest::checkOllamaProtocol);
+        add(out, "同协议未知参数透传（top_k/service_tier/metadata）", Selftest::checkExtraBody);
         return out;
     }
 
@@ -986,6 +987,50 @@ public final class Selftest {
             return null;
         } catch (Throwable t) {
             return "入口解析回放异常：" + t;
+        }
+    }
+
+    /**
+     * 同协议未知参数必须原样透传；跨协议不能硬塞。
+     * 这是"网关把不认识的参数悄悄丢掉"的直接回归测试。
+     */
+    private static String checkExtraBody() {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("model", "m");
+            o.put("messages", new JSONArray().put(new JSONObject()
+                    .put("role", "user").put("content", "hi")));
+            o.put("top_k", 5);
+            o.put("service_tier", "flex");
+            o.put("metadata", new JSONObject().put("k", "v"));
+            Proto.Req req = Fronts.OpenAiFront.parse(o);
+            JSONObject body = Upstreams.openAiBody("m", req, true);
+            if (body.optInt("top_k", 0) != 5) return "OpenAI top_k 没透传";
+            if (!"flex".equals(body.optString("service_tier", ""))) return "OpenAI service_tier 没透传";
+            if (!"v".equals(body.optJSONObject("metadata") == null ? ""
+                    : body.optJSONObject("metadata").optString("k", ""))) {
+                return "OpenAI metadata 没透传";
+            }
+            JSONObject cross = Upstreams.anthropicBody("m", req);
+            if (cross.has("top_k")) return "跨协议不该把 OpenAI 的 top_k 塞给 Anthropic";
+
+            JSONObject a = new JSONObject();
+            a.put("model", "m");
+            a.put("max_tokens", 16);
+            a.put("messages", new JSONArray().put(new JSONObject()
+                    .put("role", "user").put("content", "hi")));
+            a.put("top_k", 7);
+            a.put("metadata", new JSONObject().put("user_id", "u1"));
+            Proto.Req ar = Fronts.AnthropicFront.parse(a);
+            JSONObject ab = Upstreams.anthropicBody("m", ar);
+            if (ab.optInt("top_k", 0) != 7) return "Anthropic top_k 没透传";
+            if (!"u1".equals(ab.optJSONObject("metadata") == null ? ""
+                    : ab.optJSONObject("metadata").optString("user_id", ""))) {
+                return "Anthropic metadata 没透传";
+            }
+            return null;
+        } catch (Throwable t) {
+            return "未知参数透传自检异常：" + t;
         }
     }
 
