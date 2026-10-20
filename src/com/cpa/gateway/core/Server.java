@@ -64,8 +64,11 @@ public final class Server {
     private volatile String cacheHealthJson;
     private volatile String cacheModelsJson;
     private ServerSocket socket;
+    /** IPv6 回环监听（::1）：客户端写 localhost 时经常会先解析到它。失败不影响主监听。 */
+    private volatile ServerSocket socket6;
     private volatile boolean running;
     private volatile Thread acceptThread;
+    private volatile Thread acceptThread6;
     private final AtomicInteger rr = new AtomicInteger();
 
     Server(Config config) {
@@ -124,14 +127,40 @@ public final class Server {
             }
             throw e;
         }
+        /* 本机模式下同时监听 ::1：有的客户端把 localhost 解析成 IPv6，
+           只绑 127.0.0.1 会表现为"地址没错但连不上"。局域网模式不绑 ::，
+           避免与 0.0.0.0 的 dual-stack 冲突。 */
+        ServerSocket sock6 = null;
+        if (!config.lanAccess) {
+            try {
+                ServerSocket s6 = new ServerSocket();
+                s6.setReuseAddress(true);
+                s6.bind(new InetSocketAddress(java.net.InetAddress.getByName("::1"),
+                        config.port), 128);
+                sock6 = s6;
+            } catch (Throwable t) {
+                Log.i("IPv6 回环未启用（不影响 127.0.0.1）：" + t.getMessage());
+            }
+        }
+
         socket = sock;
+        socket6 = sock6;
         running = true;
-        Log.i("gateway listening on " + host + ":" + config.port + (config.lanAccess ? " (LAN)" : " (localhost only)"));
+        Log.i("gateway listening on " + host + ":" + config.port
+                + (sock6 == null ? "" : " + [::1]")
+                + (config.lanAccess ? " (LAN)" : " (localhost only)"));
         ensureStreamWatchdog();
-        Thread accept = new Thread(this::acceptLoop, "cpa-accept");
+        Thread accept = new Thread(() -> acceptLoop(sock), "cpa-accept");
         accept.setDaemon(true);
         acceptThread = accept;
         accept.start();
+        if (sock6 != null) {
+            final ServerSocket s6 = sock6;
+            Thread accept6 = new Thread(() -> acceptLoop(s6), "cpa-accept6");
+            accept6.setDaemon(true);
+            acceptThread6 = accept6;
+            accept6.start();
+        }
     }
 
     void stop() {
@@ -144,6 +173,12 @@ public final class Server {
         socket = null;
         try {
             if (sock != null) sock.close();
+        } catch (Exception ignored) {
+        }
+        ServerSocket sock6 = socket6;
+        socket6 = null;
+        try {
+            if (sock6 != null) sock6.close();
         } catch (Exception ignored) {
         }
         /*
@@ -165,6 +200,15 @@ public final class Server {
                 Thread.currentThread().interrupt();
             }
             if (t.isAlive()) Log.w("accept 线程未在 500ms 内退出（旧监听已关闭，不影响新实例）");
+        }
+        Thread t6 = acceptThread6;
+        acceptThread6 = null;
+        if (t6 != null && t6 != Thread.currentThread()) {
+            try {
+                t6.join(500);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
         }
         Log.i("gateway stopped");
     }
@@ -191,23 +235,11 @@ public final class Server {
                         return t;
                     });
 
-    private void acceptLoop() {
+    private void acceptLoop(ServerSocket sock) {
         while (running) {
-            /*
-             * 必须先把 socket 取进局部变量再判断。
-             *
-             * 原来的写法是 `final Socket s = socket.accept();` —— 每轮都从字段读一次，
-             * 而 stop() 会把 socket 置成 null。于是 stop() 之后，这个线程只要还醒着，
-             * 每一轮都在 socket == null 上抛 NPE：被下面的 catch (Throwable) 吞掉，
-             * 又因为 running 已是 false 连日志都不打，只 sleep(120) 继续转。
-             *
-             * 后果是"假活"：老 Server 的 accept 线程活得好好、名字还叫 cpa-accept，
-             * 但一个监听都没有 —— 客户端不停重连，服务端一声不响。
-             *
-             * 现在：取局部引用，为 null 或已关闭时直接退出，不再空转。
-             */
-            ServerSocket sock = socket;
-            if (!running || sock == null || sock.isClosed()) return;
+            /* 监听由参数传入：IPv4 与 IPv6 回环各一条 accept 线程，共用同一个连接池。
+               stop() 关闭对应 socket 后 accept() 抛异常，这里按 running=false 正常退场。 */
+            if (sock == null || sock.isClosed()) return;
             try {
                 final Socket s = sock.accept();
                 try {
@@ -1159,7 +1191,12 @@ public final class Server {
                 cacheHealthJson = cached;
                 cacheHealthStamp = stamp;
             }
-            writeJson(out, 200, cached);
+            /* 连接数/容量是实时变化的，不能进缓存；在缓存的基础 JSON 上补两个字段。 */
+            JSONObject live = new JSONObject(cached);
+            live.put("connections", CONNS.size());
+            live.put("capacity", Capacity.state());
+            live.put("ipv6_loopback", socket6 != null);
+            writeJson(out, 200, live.toString());
             return;
         }
         if (path.startsWith("/v1/models/") && "GET".equals(r.method)) {

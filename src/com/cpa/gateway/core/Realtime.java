@@ -68,27 +68,80 @@ public final class Realtime {
         session.put("output_audio_format", JSONObject.NULL);
         send(out, "session.created", new JSONObject().put("session", session));
 
-        while (true) {
-            Frame f = readFrame(in);
-            if (f == null) return;
-            if (f.opcode == 0x8) {                 // close
-                sendClose(out, f.payload);
-                return;
-            }
-            if (f.opcode == 0x9) {                 // ping
-                writeFrame(out, 0xA, f.payload);
-                continue;
-            }
-            if (f.opcode == 0xA) continue;          // pong
-            if (f.opcode != 0x1) continue;          // 只处理文本帧
-            JSONObject ev;
+        /* 升级完成后不再用 HTTP 的 60 秒空闲超时：Realtime 客户端可以长时间不发帧。
+           服务端每 30 秒 ping 一次，180 秒收不到任何帧才判定断开。 */
+        try {
+            socket.setSoTimeout(0);
+        } catch (Throwable ignored) {
+        }
+        final long[] lastClient = {System.currentTimeMillis()};
+        final boolean[] closed = {false};
+        final ByteArrayOutputStream fragments = new ByteArrayOutputStream();
+        Thread pinger = new Thread(() -> {
             try {
-                ev = new JSONObject(new String(f.payload, StandardCharsets.UTF_8));
-            } catch (Throwable t) {
-                sendError(out, "invalid JSON: " + t.getMessage());
-                continue;
+                while (!closed[0]) {
+                    Thread.sleep(30000);
+                    if (closed[0]) return;
+                    if (System.currentTimeMillis() - lastClient[0] > 180000) {
+                        sendClose(out, new byte[]{0x03, (byte) 0xE8});
+                        try {
+                            socket.close();
+                        } catch (Throwable ignored) {
+                        }
+                        return;
+                    }
+                    writeFrame(out, 0x9, new byte[0]);
+                }
+            } catch (InterruptedException ignored) {
+            } catch (Throwable ignored) {
             }
-            String type = Proto.optString(ev, "type", "");
+        }, "cpa-ws-ping");
+        pinger.setDaemon(true);
+        pinger.start();
+
+        int fragOpcode = -1;
+        try {
+            while (true) {
+                Frame f = readFrame(in);
+                if (f == null) return;
+                lastClient[0] = System.currentTimeMillis();
+                if (f.opcode == 0x8) {                 // close
+                    sendClose(out, f.payload);
+                    return;
+                }
+                if (f.opcode == 0x9) {                 // ping
+                    writeFrame(out, 0xA, f.payload);
+                    continue;
+                }
+                if (f.opcode == 0xA) continue;          // pong
+                byte[] payload = null;
+                if (f.opcode == 0x1) {
+                    if (f.fin) {
+                        payload = f.payload;
+                    } else {
+                        fragOpcode = 0x1;
+                        fragments.reset();
+                        fragments.write(f.payload);
+                    }
+                } else if (f.opcode == 0x0) {
+                    if (fragOpcode == 0x1) {
+                        fragments.write(f.payload);
+                        if (f.fin) {
+                            payload = fragments.toByteArray();
+                            fragments.reset();
+                            fragOpcode = -1;
+                        }
+                    }
+                }
+                if (payload == null) continue;          // 还没收完 / 非文本
+                JSONObject ev;
+                try {
+                    ev = new JSONObject(new String(payload, StandardCharsets.UTF_8));
+                } catch (Throwable t) {
+                    sendError(out, "invalid JSON: " + t.getMessage());
+                    continue;
+                }
+                String type = Proto.optString(ev, "type", "");
             if ("session.update".equals(type)) {
                 JSONObject s = ev.optJSONObject("session");
                 if (s != null) {
@@ -127,6 +180,10 @@ public final class Realtime {
             } else {
                 sendError(out, "unsupported event type: " + type);
             }
+            }
+        } finally {
+            closed[0] = true;
+            pinger.interrupt();
         }
     }
 
@@ -267,6 +324,7 @@ public final class Realtime {
     /* --------------------------------------------------------------- websocket */
 
     private static final class Frame {
+        boolean fin;
         int opcode;
         byte[] payload;
     }
@@ -277,6 +335,7 @@ public final class Realtime {
         int b1 = in.read();
         if (b1 < 0) return null;
         Frame f = new Frame();
+        f.fin = (b0 & 0x80) != 0;
         f.opcode = b0 & 0x0F;
         boolean masked = (b1 & 0x80) != 0;
         long len = b1 & 0x7F;

@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.47.0**（versionCode 640，见 `version.properties`）
+- 当前版本：**4.48.0**（versionCode 641，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -46,8 +46,8 @@ OpenAI/Anthropic/Gemini 兼容中转。
 可疑响应留原始样本；日志页内直接看「行为画像」和「最近请求对账」。
 
 **其它**：账号备份/恢复（导出加密）、一键诊断包（脱敏配置/日志/用量/自检）、
-前台服务 + 看门狗 + 定时保活、局域网访问（强制 API Key）、多套配色、
-无图片的程序化背景。
+前台服务 + 看门狗 + 定时保活、局域网访问（强制 API Key）、IPv4/IPv6 回环、
+多套配色、无图片的程序化背景。
 
 ## 构建
 

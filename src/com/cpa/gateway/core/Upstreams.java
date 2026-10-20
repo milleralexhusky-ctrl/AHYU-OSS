@@ -547,12 +547,16 @@ public final class Upstreams {
         final String[] finish = {""};
         final boolean[] wrote = {false};
         final boolean[] idReported = {false};      // 内容是否已经流给客户端（决定坏 tool_call 能不能重来）
+        final boolean[] doneSeen = {false};         // 上游有没有明确结束（[DONE] 或 finish_reason）
 
         postStream(endpoint, headers, body, line -> {
             // HTTP 200 也可能是错误。两种形态都要挡：
             //   a) 裸 JSON 错误体（没有 SSE 前缀）：Grok 的 "version outdated" 就是这个样子；
             //   b) 错误塞在 SSE 的第一个 data 块里。
             String raw = line == null ? "" : line.trim();
+            if (raw.equals("data: [DONE]") || raw.equals("data:[DONE]")) {
+                doneSeen[0] = true;
+            }
             if (raw.startsWith("{") && raw.contains("\"error\"")) {
                 try {
                     JSONObject j = new JSONObject(raw);
@@ -627,8 +631,19 @@ public final class Upstreams {
                 }
             }
             String fr = Proto.optString(c0, "finish_reason", "");
-            if (!fr.isEmpty() && !"null".equals(fr)) finish[0] = fr;
+            if (!fr.isEmpty() && !"null".equals(fr)) {
+                finish[0] = fr;
+                doneSeen[0] = true;
+            }
         });
+
+        /* 没有 finish_reason、也没有 [DONE]：上游是被掐断的。
+           以前这里会当成正常完成，客户端收到一段没有结束标记的半截回答；
+           现在抛出去，让上层决定"没出内容就换号 / 出了内容就发错误帧"。 */
+        if (!doneSeen[0]) {
+            Log.w("上游流在 finish_reason/[DONE] 之前结束，判定为连接中断");
+            throw new java.io.IOException("upstream stream ended before finish_reason");
+        }
 
         for (JSONObject acc : toolAcc.values()) {
             String id = Proto.optString(acc, "id", "");
@@ -1173,12 +1188,15 @@ public final class Upstreams {
         /* 4.37.0：上游 response id。Anthropic 只在 message_start 里给一次
            （message.id，形如 msg_...），后面没有重复，所以要在这里就报上去。 */
         final boolean[] idReported = {false};
+        final boolean[] stopSeen = {false};
 
         postStream(endpoint, headers, body, line -> {
             JSONObject ev = sseData(line);
             if (ev == null) return;
             String type = Proto.optString(ev, "type", "");
-            if ("message_start".equals(type)) {
+            if ("message_stop".equals(type)) {
+                stopSeen[0] = true;
+            } else if ("message_start".equals(type)) {
                 JSONObject msg = ev.optJSONObject("message");
                 if (msg != null) {
                     applyUsage(usage, msg.optJSONObject("usage"), "input_tokens", "output_tokens", "cache_read_input_tokens");
@@ -1239,6 +1257,11 @@ public final class Upstreams {
                 applyUsage(usage, ev.optJSONObject("usage"), "input_tokens", "output_tokens", "cache_read_input_tokens");
             }
         });
+
+        if (!stopSeen[0] && finish[0].isEmpty()) {
+            Log.w("Anthropic 流在 message_stop 之前结束，判定为连接中断");
+            throw new java.io.IOException("anthropic stream ended before message_stop");
+        }
 
         boolean anyTool = false;
         for (Map.Entry<Integer, String[]> e : blockInfo.entrySet()) {
@@ -1394,6 +1417,7 @@ public final class Upstreams {
             /* 4.37.0：Gemini 的 SSE 每个块可能带 responseId（新版 API 才有），
                老版本没有这个字段就照旧留空，不算错误。 */
             final boolean[] idReported = {false};
+            final boolean[] finished = {false};
 
             postStream(endpoint, headers, body, line -> {
                 JSONObject ev = sseData(line);
@@ -1438,8 +1462,16 @@ public final class Upstreams {
                     }
                 }
                 String fr = Proto.optString(c0, "finishReason", "");
-                if (!fr.isEmpty() && !"FINISH_REASON_UNSPECIFIED".equals(fr)) finish[0] = fr;
+                if (!fr.isEmpty() && !"FINISH_REASON_UNSPECIFIED".equals(fr)) {
+                    finish[0] = fr;
+                    finished[0] = true;
+                }
             });
+
+            if (!finished[0]) {
+                Log.w("Gemini 流在 finishReason 之前结束，判定为连接中断");
+                throw new java.io.IOException("gemini stream ended before finishReason");
+            }
 
             for (String[] c : calls) sink.toolCall(c[0], c[1], c[2]);
             sink.finish(Proto.canonicalStop(finish[0], !calls.isEmpty()), usage);
