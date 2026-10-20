@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini 兼容接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.38.0**（versionCode 630，见 `version.properties`）
+- 当前版本：**4.38.1**（versionCode 631，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 

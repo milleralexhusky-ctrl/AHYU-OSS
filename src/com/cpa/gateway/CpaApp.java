@@ -84,7 +84,11 @@ public class CpaApp extends Application {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && BackdropTex.release()) {
+        /* 只在界面不可见时释放。RUNNING_CRITICAL(15) 是"可见但内存吃紧"：
+           这时回收底纹，下一帧 NavGlassDrawable 又立刻 get() 重画，
+           只会制造"释放 → 重画"的抖动，实际省不下来。 */
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+                && startedActivities == 0 && BackdropTex.release()) {
             com.cpa.gateway.core.Log.i("内存回收：level=" + level + "，释放底纹位图");
         }
     }
@@ -92,6 +96,6 @@ public class CpaApp extends Application {
     @Override
     public void onLowMemory() {
         super.onLowMemory();
-        BackdropTex.release();
+        if (startedActivities == 0) BackdropTex.release();
     }
 }
