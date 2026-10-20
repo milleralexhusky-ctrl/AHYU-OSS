@@ -606,7 +606,7 @@ public final class WorkBuddy {
      * 因为"渠道校验/不是官方客户端"这句话指向的正是身份，而不是会话字段。
      *
      * 上限：某个账号 5 种形状都被拒之后，本进程内**不再重试**（否则每探一次就是 5 次 400 往返），
-     * 但仍保留"原样"那一轮——上游若改回去，原样自己就会通；进程重启后重试标记清空。
+     * 但仍保留"原样"那一轮——上游若改回去，原样自己就会通；标记会落盘，重启后仍生效。
      */
     /** 5 种形状都被拒过的账号；持久化到 gateway.json，重启不再从头试一遍。 */
     private static final java.util.Set<String> CONV_HOPELESS =
@@ -626,7 +626,7 @@ public final class WorkBuddy {
     }
 
     /**
-     * 按**国际版身份**重发也被拒过的账号：本进程内不再试（重启即忘）。
+     * 按**国际版身份**重发也被拒过的账号：不再试（标记落盘，重启后仍生效）。
      *
      * 为什么要这条"国际版重发"：
      *   - WorkBuddy 是两个区域体系（codebuddy.cn / workbuddy.ai），渠道校验实现不同；
@@ -644,6 +644,25 @@ public final class WorkBuddy {
                     new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
 
     /**
+     * "试到底"标记的统一查询：内存 Set + 落盘的 Provider.hopeless 都要看。
+     *
+     * 4.36.6 只做了"写盘"，没有任何地方"读回"：Config.Provider.hopeless 存着，
+     * 但判断仍只查内存 Set，进程一重启就又从 0 开始打 10 次 400。
+     * 这里在查询时顺带灌回内存，读写两端就闭环了。
+     */
+    private static boolean hopeless(Config.Provider p, boolean conv) {
+        if (p == null || p.name == null) return false;
+        java.util.Set<String> mem = conv ? CONV_HOPELESS : INTL_HOPELESS;
+        if (mem.contains(p.name)) return true;
+        String kind = conv ? "conv" : "intl";
+        if (p.hopeless != null && p.hopeless.contains(kind)) {
+            mem.add(p.name);
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * 这个账号这次要不要给"国际版身份重发"一次机会。
      *
      * 只有国内区域账号、且没被本进程拉黑、且用户没关这个开关时才走。
@@ -652,7 +671,7 @@ public final class WorkBuddy {
     static boolean intlFallbackFor(Config.Provider p, Account acc) {
         if (p == null || acc == null) return false;
         if (REALM_GLOBAL.equalsIgnoreCase(acc.realm)) return false;
-        if (INTL_HOPELESS.contains(p.name)) return false;
+        if (hopeless(p, false)) return false;
         String flag = Proto.optString(p.options, "intl_fallback", "true");
         return !"false".equalsIgnoreCase(flag);
     }
@@ -867,7 +886,7 @@ public final class WorkBuddy {
             /* 渠道校验的两条路：先按账号自己的区域身份，再（可选）按国际版身份重发一次。 */
             final boolean tryIntl = intlFallbackFor(p, acc);
             final int passes = tryIntl ? 2 : 1;
-            final int shapes = CONV_HOPELESS.contains(p.name) ? 1 : CONV_SHAPES.length;
+            final int shapes = hopeless(p, true) ? 1 : CONV_SHAPES.length;
             Throttled channelFail = null;
             for (int pass = 0; pass < passes; pass++) {
                 String realm = pass == 0 ? acc.realm : REALM_GLOBAL;

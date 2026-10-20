@@ -29,7 +29,9 @@ import javax.crypto.spec.SecretKeySpec;
  *   · Secret 用 Android Keystore 的密钥，**只在本机、本签名下有效**，卸载即失效 —— 这正是
  *     它不能用来做迁移的原因：搬到新手机必然解不开。所以导出用「用户密码 + PBKDF2」，
  *     密钥由密码算出来，跨设备可复现。
- *   · 文件里是完整的 gateway.json（含密码学保护后的敏感字段），不带明文。
+ *   · 文件里是完整的 gateway.json（plaintext），整体再用密码派生的密钥加密。
+ *     4.37.0 起不再把 Secret（本机 Keystore）密文塞进 payload——那种密文
+ *     换机必然解不开，会让"换机迁移"这个唯一用途失效。
  *
  * 文件格式（外层是可读 JSON，便于用户/工具确认"这是一个 AHYU 备份"）：
  * {
@@ -77,7 +79,7 @@ public final class Backup {
     /**
      * 把配置 JSON 加密成备份文本。
      *
-     * @param config   当前配置（由 Config.toJson 一类的出口产出，敏感字段已由 Secret 处理过）
+     * @param config   当前配置的明文 JSON（Config.exportJson()；不要传 Secret 密文）
      * @param password 用户密码（调用方负责非空校验）
      * @return 备份文件内容（UTF-8 文本，JSON）
      */

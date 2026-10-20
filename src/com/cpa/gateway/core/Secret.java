@@ -130,6 +130,42 @@ public final class Secret {
         return !v.isEmpty() && !isSealed(v);
     }
 
+    /**
+     * 备份导入前检查：有没有"本机密钥解不开"的密文。
+     *
+     * 4.37.0 之前的备份会把本机 Keystore 密的字段直接装进密码加密的 payload，
+     * 换机后这些值必然解不开。旧代码把解不开当成空串继续导入，结果是
+     * 账号看起来都恢复了、其实全没有凭据。这里在导入前先说清楚，
+     * 返回第一个解不开的字段名（null 表示都能解/本来就没有密文）。
+     */
+    public static String unreadableSealed(JSONObject root) {
+        if (root == null) return null;
+        try {
+            String top = unreadable(root, "apiKey");
+            if (top != null) return "apiKey";
+            JSONArray arr = root.optJSONArray("providers");
+            for (int i = 0; arr != null && i < arr.length(); i++) {
+                JSONObject p = arr.optJSONObject(i);
+                if (p == null) continue;
+                if (unreadable(p, "apiKey") != null) {
+                    return "providers[" + i + "].apiKey";
+                }
+                if (unreadable(p, "credentials") != null) {
+                    return "providers[" + i + "].credentials";
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static String unreadable(JSONObject o, String field) {
+        if (o == null || !o.has(field)) return null;
+        String v = Proto.optString(o, field, "");
+        if (!isSealed(v)) return null;
+        return open(v).isEmpty() ? field : null;
+    }
+
     /** 读盘后：把密文换回明文。 */
     public static JSONObject open(JSONObject root) {
         if (root == null) return null;

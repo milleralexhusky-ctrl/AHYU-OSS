@@ -12,6 +12,7 @@ keystore.jks
 # （build.sh 从这个文件/环境变量读口令，源码里不再出现明文）
 .env
 .env.*
+!.env.example
 *.secrets
 
 # 本地临时

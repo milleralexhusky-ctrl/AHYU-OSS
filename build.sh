@@ -31,10 +31,37 @@ else
 fi
 PLATFORM=$SDK/platforms/android-35/android.jar
 OUT=$ROOT/out
+
+# 版本号只有一个来源：根目录 version.properties。
+# 以前 versionCode/versionName 直接写在这条 aapt2 命令里，改版本要同时改
+# 构建脚本、README、Release 说明，忘一处就会出现"装的包和文档对不上"。
+VERSION_FILE=${VERSION_FILE:-$ROOT/version.properties}
+VERSION_CODE=$(sed -n 's/^version\.code=//p' "$VERSION_FILE" | tr -d '[:space:]')
+VERSION_NAME=$(sed -n 's/^version\.name=//p' "$VERSION_FILE" | tr -d '[:space:]')
+case "$VERSION_CODE" in
+    ''|*[!0-9]*)
+        echo "version.properties 里的 version.code 缺失或不是整数：'$VERSION_CODE'"
+        exit 1
+        ;;
+esac
+if [ -z "$VERSION_NAME" ]; then
+    echo "version.properties 里的 version.name 缺失"
+    exit 1
+fi
+
 cd $ROOT
 rm -rf $OUT
 mkdir -p $OUT/compiled $OUT/gen $OUT/classes $OUT/dex
 
+# 构建期间会临时改写 Debug.java（发布包必须是 false）。改完必须还原，
+# 否则 `./build.sh --debug` 会把 ON=true 留在工作区，下一次提交就可能把
+# 19 个 /v1/debug/* 接口带进发布包。trap 保证成功、失败、Ctrl-C 都还原。
+DEBUG_SRC=src/com/cpa/gateway/core/Debug.java
+cp $DEBUG_SRC $OUT/Debug.java.bak
+restore_debug() { cp $OUT/Debug.java.bak $DEBUG_SRC 2>/dev/null || true; }
+trap restore_debug EXIT INT TERM
+
+echo "构建版本 $VERSION_NAME ($VERSION_CODE)"
 echo "[1/6] aapt2 compile"
 $AAPT2 compile --dir res -o $OUT/compiled/res.zip
 
@@ -44,7 +71,7 @@ $AAPT2 link -o $OUT/base.apk -I $PLATFORM \
   -R $OUT/compiled/res.zip \
   --java $OUT/gen \
   --min-sdk-version 26 --target-sdk-version 35 \
-  --version-code 628 --version-name 4.36.8 \
+  --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" \
   --rename-manifest-package com.ahyu \
   --custom-package com.cpa.gateway \
   --auto-add-overlay
@@ -134,7 +161,8 @@ if [ ! -f "$KS" ]; then
 KEYMSG
   exit 1
 fi
-apksigner sign --ks "$KS" --ks-pass "pass:$KS_STOREPASS" --key-pass "pass:$KS_KEYPASS" --out $ROOT/cpa-gateway.apk $OUT/aligned.apk 2>&1 | grep -v WARNING || true
-apksigner verify --print-certs $ROOT/cpa-gateway.apk 2>&1 | grep -v WARNING | head -6
-ls -la $ROOT/cpa-gateway.apk
+APK=$ROOT/AHYU-$VERSION_NAME.apk
+apksigner sign --ks "$KS" --ks-pass "pass:$KS_STOREPASS" --key-pass "pass:$KS_KEYPASS" --out "$APK" $OUT/aligned.apk 2>&1 | grep -v WARNING || true
+apksigner verify --print-certs "$APK" 2>&1 | grep -v WARNING | head -6
+ls -la "$APK"
 echo BUILD_OK

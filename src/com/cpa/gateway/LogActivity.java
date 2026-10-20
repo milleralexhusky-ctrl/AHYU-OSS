@@ -210,15 +210,20 @@ public class LogActivity extends Activity {
     }
 
     /** 用量明细：近 7 天，按接口 / 渠道 / 模型 / 天各列前几名。 */
-    /** 行为画像：按渠道/模型看可用率、空回复、工具失败率。 */
+    /** 行为画像 + 最近请求对账：按渠道/模型看可用率，按上游 ID/会话 ID 追一次请求。 */
     private void profileDialog() {
         try {
             String text = com.cpa.gateway.core.QualityStats.report(7);
             LinearLayout box = Ui.column(this);
             box.addView(Ui.label(this, text));
-            Ui.dialog(this, "行为画像", Ui.scroller(this, box), "关闭", null, null, null);
+            /* 4.37.0：4.36.0 落盘的上游 ID / 会话 ID 到这里终于有了界面入口。
+               画像看"整体靠不靠得住"，对账看"这一次到底发给了谁"。 */
+            box.addView(Ui.sectionTitle(this, "最近请求对账"), Ui.lp(this, 18));
+            box.addView(Ui.text(this, com.cpa.gateway.core.QualityStats.traceReport(20),
+                    11.5f, Ui.MUTED, false), Ui.lp(this, 6));
+            Ui.dialog(this, "行为画像与对账", Ui.scroller(this, box), "关闭", null, null, null);
         } catch (Throwable t) {
-            Ui.dialog(this, "行为画像", Ui.label(this, "统计失败：" + t), "关闭", null, null, null);
+            Ui.dialog(this, "行为画像与对账", Ui.label(this, "统计失败：" + t), "关闭", null, null, null);
         }
     }
 

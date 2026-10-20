@@ -59,18 +59,12 @@ public final class Config {
     public boolean autostart = false;
     public boolean keepAlive = true;
     /**
-     * 用户**主动**把网关停下来了。
-     *
-     * 为什么需要它：keepAlive 的 JobService 只看 `cfg.keepAlive && !Gateway.isRunning()`，
-     * 分不清"用户自己按了停止"和"网关意外掉了"。于是用户点停止之后，下一次巡检
-     * （以及各种被积压的加急任务）会把它重新拉起来 —— 用户看到的是"停止无效"。
-     * 反过来，App 刚打开时积压任务先跑，网关被后台抢先拉起，界面上还写着
-     * 「启动网关」，用户一按就走了停止分支 —— 用户看到的是"启动无效，按第二次才行"。
-     * 两者的根都是这一条缺省语义。
-     *
-     * 语义：只有用户点「停止网关」才置 true，用户点「启动网关」立刻置 false，
-     * 保活任务看到 true 就不再自动拉起。
+     * @deprecated 4.30.22 起由 {@link GatewayState} 的单一状态源取代，
+     *             不再参与任何判断。字段保留只为读旧配置/旧备份时不丢数据，
+     *             新代码不要再写它。历史上它承担过"用户主动停止"的语义，
+     *             但会和"网关仍在运行"组合出矛盾状态（4.30.19 真发生过）。
      */
+    @Deprecated
     public boolean userStopped = false;
 
     /** 浅色模式：整套配色换一套值（见 Ui.applyTheme）。 */
@@ -113,6 +107,11 @@ public final class Config {
      *     那条判断在 Server 里，不依赖这个默认值。
      */
     public String apiKey = "";
+    /**
+     * 本次加载时发现磁盘上的 apiKey 解不开（Keystore 重建 / 换机 / 换签名）。
+     * 不落盘：只用于告诉 {@link Gateway#reload()} 不要拿这个值覆盖内存里的旧 Key。
+     */
+    public boolean apiKeyUnreadable = false;
     /** Older client keys stay valid, so changing the key never locks a working client out. */
     public final List<String> apiKeyAliases = new ArrayList<>();
     /**
@@ -164,7 +163,7 @@ public final class Config {
         public boolean dispatchable() {
             return enabled && !catalogOnly;
         }
-        public final List<String> models = new ArrayList<>();
+        public final List<String> models = new java.util.concurrent.CopyOnWriteArrayList<>();
         /**
          * 用户手填的模型名。
          *
@@ -187,7 +186,7 @@ public final class Config {
          */
         public final JSONObject options = new JSONObject();
 
-        public final List<String> manualModels = new ArrayList<>();
+        public final List<String> manualModels = new java.util.concurrent.CopyOnWriteArrayList<>();
         /**
          * manualModels 是否已经确定过。
          *
@@ -222,7 +221,7 @@ public final class Config {
         public long dayTokens = 0L;
         public int quotaDay = 0;
         /** Models the upstream lists but refuses to serve (probe-verified). */
-        public final List<String> badModels = new ArrayList<>();
+        public final List<String> badModels = new java.util.concurrent.CopyOnWriteArrayList<>();
         /**
          * 「什么时候被判坏的」：模型名 → 标记时间（epoch 秒）。
          *
@@ -339,7 +338,10 @@ public final class Config {
          * "卡一秒、报错、再卡一秒、再报错"。上游若改回去，客户端的"原样"第一轮
          * 仍然会去试，所以记住它不会让我们错过恢复。
          */
-        public final java.util.Set<String> hopeless = new java.util.LinkedHashSet<>();
+        /* 并发集合：请求线程读、刷新线程写；LinkedHashSet 并发读写会抛
+           ConcurrentModificationException。 */
+        public final java.util.Set<String> hopeless =
+                java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
         /**
          * 限流状态：上游说什么时候恢复（epoch 秒），0 = 当前不在限流中。
          *
@@ -629,18 +631,19 @@ public final class Config {
     }
 
     /**
-     * 导出用：拿到"已加密"的配置 JSON。
+     * 导出用：内存里的**明文**配置 JSON。
      *
-     * 与 toJson() 的区别只有一个：敏感字段先过 {@link Secret#seal(JSONObject)}。
-     * 导出文件最终还会被用户密码再包一层加密，但两层是不同性质的保护 ——
-     * Secret 那层保证"即使有人拿到中间产物（临时文件、崩溃转储、被拦截的写入）
-     * 也看不到明文 token"；用户密码那层保证"文件跨设备传输时是安全的"。
-     * 任何一层都不该省。
+     * 这里必须用 toJson()，不能用 {@link Secret#seal(JSONObject)} ——
+     * Secret 用的是本机 Android Keystore 密钥，**换机/重装后必然解不开**，
+     * 而备份的唯一用途恰恰是换机迁移。4.37.0 之前的实现就是先 seal 再交给
+     * Backup 用密码加密，结果导入后所有账号凭据和网关 Key 都变成空串，
+     * 而且没有任何报错。
      *
-     * 注意不要把这里换成 toJson()：那会把明文 token 交到导出流程的下一环。
+     * 跨设备的保护由 {@link Backup} 的「用户密码 + PBKDF2 + AES-GCM」负责；
+     * 导出文件不会以明文落到磁盘（见 Backup.export）。
      */
     public JSONObject exportJson() {
-        return Secret.seal(toJson());
+        return toJson();
     }
 
     public JSONObject toJson() {
@@ -813,7 +816,26 @@ public final class Config {
             }
             in.close();
             if (n <= 0) throw new IllegalStateException("配置文件是空的");
-            Config loaded = fromJson(Secret.open(new JSONObject(new String(buf, 0, n, "UTF-8"))));
+            JSONObject raw = new JSONObject(new String(buf, 0, n, "UTF-8"));
+            /* 必须在 Secret.open(raw) 之前判断：open() 会就地把它换成空串，
+               之后就再也分不清"本来就没有 Key"和"Key 解不开"了。 */
+            String rawKey = Proto.optString(raw, "apiKey", "");
+            boolean keyLost = Secret.isSealed(rawKey) && Secret.open(rawKey).isEmpty();
+            Config loaded = fromJson(Secret.open(raw));
+            if (keyLost) {
+                /* 绝不能把"解不开"当成"用户清空了 Key"（旧行为：本机模式下直接不校验）。
+                   这里生成一把新 Key 并立刻落盘（用当前 Keystore 加密），
+                   鉴权保持开启；用户到设置页重新复制一次给客户端即可。 */
+                loaded.apiKey = "sk-cpa-" + java.util.UUID.randomUUID().toString().replace("-", "");
+                loaded.apiKeyUnreadable = true;
+                Log.e("客户端 Key 解不开（Keystore 重建或换机），已生成新 Key；"
+                        + "请到设置页把「客户端密钥」重新复制给客户端");
+                try {
+                    loaded.save(ctx);
+                } catch (Throwable t) {
+                    Log.w("新 Key 落盘失败（本次运行仍生效）：" + t);
+                }
+            }
             if (loaded.providers.isEmpty()) {
                 loaded = recoverFromSnapshot(ctx, loaded);
             }

@@ -96,7 +96,12 @@ public final class OAuth {
                 String state = queryParam(path, "state");
                 String error = queryParam(path, "error");
                 String errorDesc = queryParam(path, "error_description");
-                boolean ok = error == null && code != null && !code.isEmpty();
+                /* state 必须存在且逐字节相等。以前写成
+                   `expectedState != null && state != null && !equals`，
+                   攻击者只要不带 state 就能绕过——本机任意应用都能往回环端口
+                   塞一个自己的 code，把自己的账号绑进这台网关。 */
+                boolean stateOk = stateMatches(expectedState, state);
+                boolean ok = error == null && code != null && !code.isEmpty() && stateOk;
                 String title = ok ? "登录完成" : "登录未完成";
                 String detail = ok ? "可以回到 CLIProxyAPI 应用了。" : ("原因：" + (error == null ? "没有拿到授权码" : error + " " + (errorDesc == null ? "" : errorDesc)));
                 String body = "<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -111,8 +116,8 @@ public final class OAuth {
 
                 if (error != null) throw new IllegalStateException("授权被拒绝：" + error + " " + (errorDesc == null ? "" : errorDesc));
                 if (code != null && !code.isEmpty()) {
-                    if (expectedState != null && state != null && !expectedState.equals(state)) {
-                        Log.w(providerLabel + " 回调 state 不匹配，已忽略");
+                    if (!stateOk) {
+                        Log.w(providerLabel + " 回调 state 不匹配或缺失，已忽略（可能是别的应用发来的）");
                         continue;
                     }
                     return code;
@@ -179,6 +184,20 @@ public final class OAuth {
             } catch (Exception ignored) {
             }
             if (ACTIVE.get(port) == null || ACTIVE.get(port).isClosed()) ACTIVE.remove(port);
+        }
+    }
+
+    /**
+     * state 比对：expected 为空表示调用方没有用 state（当前所有 waitForCode 调用都会传），
+     * 否则 actual 必须存在且完全相等。用定长比较，避免把 state 当可测时间侧信道。
+     */
+    private static boolean stateMatches(String expected, String actual) {
+        if (expected == null || expected.isEmpty()) return true;
+        if (actual == null) return false;
+        try {
+            return MessageDigest.isEqual(expected.getBytes("UTF-8"), actual.getBytes("UTF-8"));
+        } catch (Exception e) {
+            return false;
         }
     }
 

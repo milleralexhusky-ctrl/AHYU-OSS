@@ -23,7 +23,9 @@ import java.util.Map;
  *      偶尔问两遍同样的话也不该被拦。
  *   2. **只在第 N 次才拦**。前两次照常转发（用户可能是真心想问两遍），
  *      第三次才开始报错，并且报错里带上次数。
- *   3. **只对付费和虚拟模型路径生效**。探活、竞速这些内部请求不参与判定。
+ *   3. **计数覆盖所有推理请求**（直连模型也要拿到 quality=retry 信号），
+ *      但"主动拦截"仍只在虚拟模型入口做——直连的流式响应可能已经写出头，
+ *      这时再回头报错只会把流写坏。探活/竞速等 ephemeral 请求不参与计数。
  */
 public final class Repeats {
 
@@ -58,9 +60,22 @@ public final class Repeats {
      * @return null 表示放行；非 null 是给用户看的原因（含出现次数）
      */
     public static String check(Proto.Req req) {
-        if (req == null || req.ephemeral) return null;
+        int n = note(req);
+        return n > ALLOW_TIMES ? String.valueOf(n) : null;
+    }
+
+    /**
+     * 只记录、不拦截（4.37.0）。所有推理入口在 serve() 里各记一次，
+     * 直连模型的质量标签才拿得到真实的"用户又发了一遍"信号。
+     *
+     * 同一个 Req 对象被多次调用（换号重试）时不会重复计数：计数在第一次
+     * note 时就写进 Req.repeatCount，后续直接复用。
+     */
+    static int note(Proto.Req req) {
+        if (req == null || req.ephemeral) return 0;
+        if (req.repeatRecorded) return req.repeatCount;
         String fp = fingerprint(req);
-        if (fp == null) return null;
+        if (fp == null) return 0;
 
         long now = System.currentTimeMillis();
         synchronized (SEEN) {
@@ -77,25 +92,9 @@ public final class Repeats {
             }
             e.lastAt = now;
             e.count++;
-            if (e.count <= ALLOW_TIMES) return null;
-            return String.valueOf(e.count);
-        }
-    }
-
-    /**
-     * 这条请求在窗口内被发过几次（4.35.0）。
-     *
-     * 和 check() 的区别：check() 只在超过容忍次数时才返回非空（用来拦），
-     * 这里返回**原始次数**——第 2 次就说明"用户又发了一遍"，
-     * 那是最真实的"这次回答不行"信号，不该等到第 3 次才记。
-     */
-    static int seenCount(Proto.Req req) {
-        if (req == null || req.ephemeral) return 0;
-        String fp = fingerprint(req);
-        if (fp == null) return 0;
-        synchronized (SEEN) {
-            Rec e = SEEN.get(fp);
-            return e == null ? 0 : e.count;
+            req.repeatRecorded = true;
+            req.repeatCount = e.count;
+            return e.count;
         }
     }
 

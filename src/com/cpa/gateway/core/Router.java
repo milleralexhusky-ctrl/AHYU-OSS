@@ -10,19 +10,23 @@ import java.util.Map;
 /**
  * 虚拟模型 + 打分选路 + 自动换号 + 冷却。
  *
- * 客户端只写一个名字（auto / auto-code / auto-long），网关自己决定走哪个账号的哪个模型；
- * 失败了自动换下一个，客户端无感。
+ * 客户端只写一个名字（auto / auto-code / auto-long / auto-race），网关自己决定
+ * 走哪个账号的哪个模型；失败了自动换下一个，客户端无感。
  *
  * 打分公式（在 cctapi 那套上按我们**实际有的数据**裁过——没有的数据就不装）：
  *
  *     score = 100
- *           - (priority - 1) * 5          优先级
  *           + 成功率 * 30
  *           - 错误率 * 50
+ *           + 模型先验
+ *           ± 延迟项   -6 .. +5.4（按样本量打可信度折扣）
+ *           - 成本项   -1 .. +2（只有价格表查得到时）
  *           - 200   额度用尽
  *           - 100   冷却中
- *           - 50    刚报过错
- *           + 40    工具能力匹配（留给问题三，暂时恒为 0）
+ *           - 50    两分钟内刚报过错
+ *           + 40    工具实测会调 / -60 实测打嘴炮
+ *
+ * 详细权重与取舍见 {@code score(Pick, boolean)} 的注释。
  */
 public final class Router {
 
@@ -31,7 +35,7 @@ public final class Router {
 
     /* ------------------------------------------------------------ 虚拟模型 */
 
-    /** 三个内置虚拟模型。 */
+    /** 四个内置虚拟模型。 */
     public static final String AUTO = "auto";
     public static final String AUTO_CODE = "auto-code";
     public static final String AUTO_LONG = "auto-long";

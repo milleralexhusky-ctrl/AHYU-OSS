@@ -71,6 +71,8 @@ public final class Selftest {
         add(out, "检测采样跳过非聊天模型", Selftest::checkDetectSampling);
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
+        add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
+        add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
         return out;
     }
 
@@ -812,5 +814,58 @@ public final class Selftest {
         } catch (Throwable t) {
             return "body 派生字段自检异常：" + t;
         }
+    }
+
+    /**
+     * 图片 URL 只允许公网 http/https。
+     *
+     * 用 IP 字面量，不依赖 DNS：这类地址不需要真的发起连接，纯字符串→地址解析即可判定。
+     */
+    private static String checkImageUrlGuard() {
+        String[] blocked = {
+                "http://127.0.0.1/x.png",
+                "http://localhost/x.png",
+                "http://10.0.0.1/x.png",
+                "http://172.16.0.1/x.png",
+                "http://192.168.1.1/x.png",
+                "http://169.254.169.254/latest/meta-data",
+                "http://[::1]/x.png",
+                "file:///etc/passwd",
+                "data:image/png;base64,AAAA",
+        };
+        for (String u : blocked) {
+            if (Upstreams.isPublicHttpUrl(u)) return "没有拦下内网/非 http 地址：" + u;
+        }
+        if (!Upstreams.isPublicHttpUrl("http://8.8.8.8/x.png")) {
+            return "公网 IP 被误拦：http://8.8.8.8/x.png";
+        }
+        return null;
+    }
+
+    /** 重复请求计数：同一个 Req 多候选重试只记一次；内容相同的新 Req 才递增。 */
+    private static String checkRepeatCount() {
+        /* 每次自检用独立指纹：自检在启动时可能跑两遍，固定内容会从 4 开始计数。 */
+        String nonce = "repeat-selftest-" + System.nanoTime();
+        Proto.Req a = repeatSample(nonce);
+        if (Repeats.note(a) != 1) return "第一次 note 应为 1";
+        if (Repeats.note(a) != 1) return "同一个 Req 被重复计数（换号重试会虚增次数）";
+        Proto.Req b = repeatSample(nonce);
+        if (Repeats.note(b) != 2) return "内容相同的新请求应计 2";
+        if (Repeats.check(b) != null) return "第 2 次不该拦";
+        Proto.Req c = repeatSample(nonce);
+        if (Repeats.note(c) != 3) return "第三次应为 3";
+        if (!"3".equals(Repeats.check(c))) return "第 3 次应返回次数 3";
+        return null;
+    }
+
+    private static Proto.Req repeatSample(String nonce) {
+        Proto.Req req = new Proto.Req();
+        req.model = "selftest-repeat";
+        req.system = nonce;
+        Proto.Msg m = new Proto.Msg();
+        m.role = "user";
+        m.parts.add(Proto.Part.text("同一条内容"));
+        req.messages.add(m);
+        return req;
     }
 }

@@ -160,6 +160,93 @@ public final class QualityStats {
         return sb.toString();
     }
 
+    /**
+     * 最近请求的可追溯记录（4.37.0）。
+     *
+     * 4.36.0 把上游 responseId 与会话 ID 落进了 usage.tsv 的第 19/20 列，
+     * 但一直没有界面入口，只能在命令行里 awk。这里把最后 N 条带标识的记录
+     * 排成一屏可读的文本：
+     *
+     *   · 上游 ID 是和上游对账的唯一键（报障时把这一行给对方即可）；
+     *   · 会话 ID 相同表示**同一份请求内容**——网关换号重试时会复用同一个值，
+     *     所以它也能直接暴露"一次请求在几个账号上撞过"。
+     *
+     * 只展示有标记的行：4.36.0 之前的旧行没有这两列，混进来只会是一屏空白。
+     */
+    public static String traceReport(int limit) {
+        android.content.Context ctx = Gateway.context();
+        if (ctx == null) return "拿不到应用上下文。";
+        File f = new File(ctx.getFilesDir(), "usage.tsv");
+        if (!f.isFile()) return "还没有用量记录。";
+
+        java.util.ArrayDeque<String[]> keep = new java.util.ArrayDeque<>();
+        try {
+            BufferedReader in = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"));
+            try {
+                String line;
+                while ((line = in.readLine()) != null) {
+                    String[] c = line.split("\t", -1);
+                    /* 第 19 列 responseId → c[18]，第 20 列 conversationId → c[19]。
+                       只要有一个非空就值得展示。 */
+                    if (c.length < 20) continue;
+                    if (c[18].trim().isEmpty() && c[19].trim().isEmpty()) continue;
+                    keep.addLast(c);
+                    while (keep.size() > Math.max(1, limit)) keep.removeFirst();
+                }
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+            return "读取用量记录失败：" + t;
+        }
+
+        if (keep.isEmpty()) {
+            return "还没有带上游 ID / 会话 ID 的记录。\n\n"
+                    + "从 4.36.0 起，每次上游返回的响应 ID 会写进用量表；\n"
+                    + "正常发几次请求后再回来这里就有内容了。";
+        }
+
+        java.text.SimpleDateFormat fmt =
+                new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US);
+        StringBuilder sb = new StringBuilder();
+        sb.append("最近 ").append(keep.size()).append(" 条（时间 · 渠道 / 模型 · 质量）\n");
+        sb.append("上游 ID 用于对账；会话 ID 相同 = 同一份请求内容（重试会复用）。\n\n");
+        for (String[] c : keep) {
+            long ts;
+            try {
+                ts = Long.parseLong(c[0]) * 1000L;
+            } catch (Throwable bad) {
+                continue;
+            }
+            String provider = c[3].trim();
+            String model = c[2].trim();
+            String quality = c[17].trim();
+            sb.append(fmt.format(new java.util.Date(ts)))
+              .append("  ").append(provider.isEmpty() ? "—" : provider)
+              .append(" / ").append(model.isEmpty() ? "—" : model);
+            if (!quality.isEmpty()) sb.append("  ").append(quality);
+            if ("probe".equals(c[12].trim())) sb.append("  [探活]");
+            sb.append('\n');
+            sb.append("  上游 ").append(shortId(c[18], 26))
+              .append("   会话 ").append(shortId(c[19], 18)).append('\n');
+            int tools = parseInt(c[13]);
+            if (tools > 0) {
+                sb.append("  工具 ").append(tools)
+                  .append("  ").append(c[14].trim())
+                  .append('/').append(c[15].trim()).append('\n');
+            }
+            sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static String shortId(String s, int max) {
+        String v = s == null ? "" : s.trim();
+        if (v.isEmpty()) return "—";
+        if (v.length() <= max) return v;
+        return v.substring(0, Math.max(1, max - 1)) + "…";
+    }
+
     private static String pct(double v) {
         if (v < 0) return "—";
         return Math.round(v * 100) + "%";

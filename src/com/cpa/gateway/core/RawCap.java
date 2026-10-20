@@ -17,13 +17,12 @@ import java.io.FileOutputStream;
  *   · 只在**可疑**的请求上留样：响应为空、正文里像有调用、或上游报错。
  *     正常请求不留，否则一天几十 MB。
  *   · 单条最多 8KB，超出截断并标注。
- *   · 全部写进一个文件，按天滚动，只留最近 3 天。
+ *   · 全部写进一个文件，超过 2MB 直接重置（只留一份，不做多天滚动）。
  *   · 内容脱敏：不写 Authorization、key 之类的头（这里只存响应体，不含请求头）。
  */
 final class RawCap {
 
     private static final long MAX_PER_ENTRY = 8 * 1024;
-    private static final int KEEP_DAYS = 3;
     private static final Object LOCK = new Object();
 
     private RawCap() {

@@ -152,6 +152,14 @@ public final class Proto {
         public final List<String> stop = new ArrayList<>();
         public final List<Tool> tools = new ArrayList<>();
         public boolean stream;
+        /**
+         * 重复请求计数的"本次请求"快照（4.37.0）。
+         *
+         * 一个客户端请求可能被同一个网关请求对象用于多个候选（换号重试），
+         * 计数只能在入口记一次，否则一次请求会被算成 2~4 次重发。
+         */
+        public boolean repeatRecorded;
+        public int repeatCount;
 
         /* ------------------------------------------------------------------
          * 能力相关参数的透传（"别把模型用傻"）

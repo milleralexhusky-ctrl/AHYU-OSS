@@ -38,7 +38,10 @@ public final class Usage {
      *     stop（正常）在数据里没有任何区别，截断彻底不可见。
      *
      * 三样都是**零成本**：全部来自已有的回调点，不额外请求、不改协议、不改上游。
-     * 旧行只有 9 列，读取端按长度判断，缺列当 0/空处理。
+     *
+     * 4.33.0 起又在末尾追加了 10 列观测上下文（见 {@link Obs} 与 record()），
+     * 现在一共 22 列。读取端一律按长度判断，缺列当 0/空处理——旧行不能因为
+     * "没有新列"就被算成失败或零值。
      */
     private static final String FILE = "usage.tsv";
     private static final long KEEP_MS = 30L * 24 * 3600 * 1000;

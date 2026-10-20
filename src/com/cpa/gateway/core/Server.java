@@ -45,6 +45,9 @@ public final class Server {
             h = h * 31 + p.name.hashCode();
             h = h * 31 + p.type.hashCode();
             h = h * 31 + (p.enabled ? 1 : 0);
+            /* catalogOnly 会改变 /v1/models 的内容（该账号的模型是否对外出现），
+               不进指纹的话，用户切换"仅目录可用"后缓存不会失效。 */
+            h = h * 31 + (p.catalogOnly ? 1 : 0);
             h = h * 31 + p.models.hashCode();
             h = h * 31 + p.badModels.hashCode();
         }
@@ -347,6 +350,36 @@ public final class Server {
         return routeOk && hadProvider && !responseFailed;
     }
 
+    /**
+     * 把竞速胜者的观测字段搬到连接对象上。
+     *
+     * 三路 racer 以前共用同一个 Conn，并且各自无锁地 `+=`/赋值：outChars 会丢更新，
+     * seenTextHint 会被交错拼接，渠道/模型/token/responseId 取决于最后写入者——
+     * 一条竞速记录可能拿着输家的渠道名去污染质量统计。现在每路用自己的 Conn，
+     * 只把胜者的观测合并回来。
+     */
+    private static void copyObs(Conn from, Conn to) {
+        if (from == null || to == null) return;
+        to.apiProvider = from.apiProvider;
+        to.apiModel = from.apiModel;
+        to.toolsSent = from.toolsSent;
+        to.hasToolHistory = from.hasToolHistory;
+        to.toolNames = from.toolNames;
+        to.askedHint = from.askedHint;
+        to.clientRetried = from.clientRetried;
+        to.conversationId = from.conversationId;
+        to.outChars = from.outChars;
+        to.seenTextHint = from.seenTextHint;
+        to.sawToolCall = from.sawToolCall;
+        to.stopReason = from.stopReason;
+        to.tokIn = from.tokIn;
+        to.tokOut = from.tokOut;
+        to.parseOutcome = from.parseOutcome;
+        to.responseShape = from.responseShape;
+        to.upstreamResponseId = from.upstreamResponseId;
+        to.errorKind = from.errorKind;
+    }
+
     /** 当前响应报告了错误，不影响后续同一 keep-alive 连接上的请求。 */
     private static void markResponseFailed(OutputStream out) {
         Conn c = connFor(out);
@@ -495,6 +528,13 @@ public final class Server {
         volatile String errorKind = "";
         /** 最近一次心跳真的写出去了的时间；写被阻塞时它就不动了。 */
         volatile long lastPing = System.currentTimeMillis();
+        /**
+         * 最近一次**上游真的给了内容**的时间。
+         *
+         * 不能拿 CountingStream 的字节数判断"上游静默"：那个计数连我们自己的
+         * `: ping` 也算，于是每轮都"有变化"，stalls 永远不会增长，180 秒超时形同虚设。
+         */
+        volatile long lastUpstreamAt = System.currentTimeMillis();
         java.util.concurrent.ScheduledFuture<?> pinger;
 
         Conn(OutputStream out, Socket sock) {
@@ -745,7 +785,10 @@ public final class Server {
         else if (version.startsWith("HTTP/1.0")) r.keepAlive = false;
         String te = r.headers.get("transfer-encoding");
         if (te != null && te.toLowerCase(Locale.US).contains("chunked")) {
-            StringBuilder sb = new StringBuilder();
+            /* 必须按字节累积、最后一次性解码：每个 chunk 单独 new String(..., UTF_8)
+               会在多字节字符正好被 chunk 边界切开时各自产生 U+FFFD，
+               中文 prompt 被静默破坏（客户端完全看不出，模型只是"变笨"）。 */
+            java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
             while (true) {
                 String sizeLine = readLine(in);
                 if (sizeLine == null) break;
@@ -758,7 +801,12 @@ public final class Server {
                     break;
                 }
                 if (size <= 0) {
-                    readLine(in);
+                    /* 0 块之后是 trailer，必须读到空行为止；只读一行会把剩下的
+                       trailer 留成"下一个请求的请求行"，keep-alive 连接从此错位。 */
+                    String trailer;
+                    while ((trailer = readLine(in)) != null && !trailer.isEmpty()) {
+                        // 忽略 trailer 内容，但要把它们从流里读干净
+                    }
                     break;
                 }
                 // 单块上限：chunk 头里的 size 是客户端说了算的，
@@ -768,10 +816,10 @@ public final class Server {
                     Log.w("chunk 过大（" + size + " > " + MAX_BODY_BYTES + "），已拒绝");
                     throw new java.io.IOException("chunk too large: " + size);
                 }
-                // 累计上限：单块再小，无限发也能把 sb 撑爆；两边都要挡。
-                if (sb.length() + size > MAX_BODY_BYTES) {
-                    Log.w("chunked 请求体累计过大（已收 " + sb.length() + "），已拒绝");
-                    throw new java.io.IOException("chunked payload too large: " + sb.length());
+                // 累计上限：单块再小，无限发也能把内存撑爆；两边都要挡。
+                if (body.size() + size > MAX_BODY_BYTES) {
+                    Log.w("chunked 请求体累计过大（已收 " + body.size() + "），已拒绝");
+                    throw new java.io.IOException("chunked payload too large: " + body.size());
                 }
                 byte[] buf = new byte[size];
                 int read = 0;
@@ -780,10 +828,10 @@ public final class Server {
                     if (n < 0) break;
                     read += n;
                 }
-                sb.append(new String(buf, 0, read, StandardCharsets.UTF_8));
+                body.write(buf, 0, read);
                 readLine(in);
             }
-            r.body = sb.toString();
+            r.body = new String(body.toByteArray(), StandardCharsets.UTF_8);
         } else {
             int len = 0;
             try {
@@ -835,6 +883,9 @@ public final class Server {
         int perPeer = maxPerPeer();
         if (live > perPeer) {
             counter.decrementAndGet();
+            /* 这条连接没进下面的 try/finally，必须在这里把 Capacity 减回去；
+               否则每拒绝一条，inflight 就永久 +1，压力值和首请求时限都会被算歪。 */
+            Capacity.leave();
             Log.w("同一客户端连接过多（" + live + " > " + perPeer + "）：" + peer + "，拒绝一条");
             try {
                 s.getOutputStream().write(("HTTP/1.1 503 Service Unavailable\r\n"
@@ -890,7 +941,11 @@ public final class Server {
                        就没法知道该重试、该换号、还是该改代码。 */
                     errKind = ErrorKind.of(routeError);
                     Log.w("request failed (" + r.method + " " + r.path + "): " + routeError);
-                    failResponse(out, r.path, String.valueOf(routeError.getMessage()));
+                    /* InvalidRequest 自己带着 400 语义（客户端发错了），
+                       以前这里一律 500，客户端会把"请求不合规"当成网关故障去重试。 */
+                    int status = routeError instanceof InvalidRequest
+                            ? ((InvalidRequest) routeError).code : 500;
+                    failResponse(out, r.path, status, String.valueOf(routeError.getMessage()));
                     if (!conn.sse) conn.keepAlive = false;
                 }
                 long took = System.currentTimeMillis() - started;
@@ -1428,10 +1483,13 @@ public final class Server {
                 JSONObject sign = new JSONObject();
                 sign.put("contentMD5", md5);
                 sign.put("signature", sig);
-                sign.put("expectedContentMD5", "4y4r/XbitFP6g0g4B6NGRw==");
-                sign.put("expectedSignature", "M0/M5dmjBmxC1uJzKZ8nEd5TrAw=");
-                sign.put("pass", md5.equals("4y4r/XbitFP6g0g4B6NGRw==")
-                        && sig.equals("M0/M5dmjBmxC1uJzKZ8nEd5TrAw="));
+                /* 固定向量：原值对应的是早期的一版 body，后来 body 改过但期望值没跟着改，
+                   这个调试自检就一直是 pass=false，看起来像签名算法坏了。
+                   4.37.0 用当前 body 重新算过（HMAC-SHA1 结果与离线计算一致）。 */
+                sign.put("expectedContentMD5", "uCpafUH19O0kzitGHuTHSg==");
+                sign.put("expectedSignature", "EMv0UJy/fAYcWkVsDMugUj4t4a4=");
+                sign.put("pass", md5.equals("uCpafUH19O0kzitGHuTHSg==")
+                        && sig.equals("EMv0UJy/fAYcWkVsDMugUj4t4a4="));
                 out3.put("loomySigning", sign);
                 String machine = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
                 String device = "123456789012345";
@@ -2085,6 +2143,9 @@ public final class Server {
         if (c != null) {
             c.chunked = chunked;
             c.sse = true;
+            /* keep-alive 连接可能已经空闲很久；从这一刻重新计时，
+               否则新流刚开始就会被旧时间戳判成"上游静默 180 秒"。 */
+            c.lastUpstreamAt = System.currentTimeMillis();
             try {
                 synchronized (writer) {
                     writer.write(": ready\n\n");
@@ -2092,15 +2153,11 @@ public final class Server {
                 }
             } catch (Throwable ignored) {
             }
-            final CountingStream counter = c.counter;
             // 原来每条流 new 一个 Timer（1 线程/流），并发一高全是空转线程；
             // 现在走共享 2 线程调度器，心跳逻辑不变
             final java.util.concurrent.ScheduledFuture<?>[] self =
                     new java.util.concurrent.ScheduledFuture<?>[1];
             Runnable ping = new Runnable() {
-                private long lastSeen = counter == null ? -1 : counter.count;
-                private int stalls;
-
                 private void stop() {
                     java.util.concurrent.ScheduledFuture<?> f = self[0];
                     if (f != null) f.cancel(false);
@@ -2109,27 +2166,25 @@ public final class Server {
                 @Override
                 public void run() {
                     try {
-                        long now = counter == null ? -1 : counter.count;
-                        boolean idle = now == lastSeen;
-                        lastSeen = now;
+                        /* 判据只看"上游最后一次给内容"的时间，不看我们写了多少字节。
+                           旧实现用 client 方向的计数，ping 自己也会让它变化，
+                           结果 stalls 永远是 0：既不会发超时，也不会在真正静默时 ping。 */
+                        long silentMs = System.currentTimeMillis() - c.lastUpstreamAt;
                         synchronized (writer) {
-                            if (!idle) {
-                                stalls = 0;
-                                writer.write(": ping\n\n");
-                            } else {
-                                stalls++;
-                                if (stalls >= UPSTREAM_IDLE_PERIODS) {
-                                    Log.w("上游 " + (UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS / 1000)
-                                            + " 秒没有出字，已通知客户端（upstream_timeout）");
-                                    c.responseFailed = true;
-                                    writer.write("data: {\"error\":{\"message\":\"上游超过 180 秒没有返回内容，请重试\",\"type\":\"upstream_timeout\",\"code\":\"upstream_timeout\"}}\n\n");
-                                    writer.write("data: [DONE]\n\n");
-                                    writer.flush();
-                                    stop();
-                                    return;
-                                }
-                                writer.write(": ping\n\n");
+                            if (silentMs >= (long) UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS) {
+                                Log.w("上游 " + (UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS / 1000)
+                                        + " 秒没有出字，已通知客户端（upstream_timeout）");
+                                c.responseFailed = true;
+                                writer.write("data: {\"error\":{\"message\":\"上游超过 "
+                                        + (UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS / 1000)
+                                        + " 秒没有返回内容，请重试\",\"type\":\"upstream_timeout\",\"code\":\"upstream_timeout\"}}\n\n");
+                                writer.write("data: [DONE]\n\n");
+                                writer.flush();
+                                stop();
+                                return;
                             }
+                            // 心跳本身不是上游活动，只用来防止客户端/中间层空闲断开
+                            writer.write(": ping\n\n");
                             writer.flush();
                             // 真写出去了才记时间戳：写被阻塞时它不动，看门狗据此判定僵尸流
                             c.lastPing = System.currentTimeMillis();
@@ -2392,6 +2447,10 @@ public final class Server {
      * begun the error travels as an SSE event instead.
      */
     void failResponse(OutputStream out, String path, String message) {
+        failResponse(out, path, 500, message);
+    }
+
+    void failResponse(OutputStream out, String path, int status, String message) {
         String safe = message == null ? "unknown error"
                 : message.replace("\\", " ").replace("\"", "'").replace("\n", " ").replace("\r", " ");
         Conn c = connFor(out);
@@ -2424,7 +2483,7 @@ public final class Server {
             return;
         }
         try {
-            writeError(out, path, 500, safe);
+            writeError(out, path, status, safe);
         } catch (Throwable ignored) {
         }
     }
@@ -2532,7 +2591,10 @@ public final class Server {
         }
         if (matches.isEmpty()) {
             for (Config.Provider p : config.providers) {
-                if (p.enabled) {
+                /* 必须用 dispatchable()：catalogOnly 的语义是"只出现在目录里、
+                   不参与任何派发"，这里只查 enabled 会让 models=["*"] 的
+                   仅目录账号仍然被选中。 */
+                if (p.dispatchable()) {
                     for (String m : p.models) if ("*".equals(m)) matches.add(p);
                 }
             }
@@ -2607,7 +2669,10 @@ public final class Server {
         }
         if (matches.isEmpty()) {
             for (Config.Provider p : config.providers) {
-                if (p.enabled) {
+                /* 必须用 dispatchable()：catalogOnly 的语义是"只出现在目录里、
+                   不参与任何派发"，这里只查 enabled 会让 models=["*"] 的
+                   仅目录账号仍然被选中。 */
+                if (p.dispatchable()) {
                     for (String m : p.models) if ("*".equals(m)) matches.add(p);
                 }
             }
@@ -3120,7 +3185,9 @@ public final class Server {
             /* 4.35.0 留一份请求正文（判跑题用）；客户端重发次数也从这里取 */
             cur.toolNames = toolNameList(req);
             cur.askedHint = lastUserText(req);
-            cur.clientRetried = Repeats.seenCount(req) > 1;
+            /* 所有推理入口都在这里记一次（虚拟模型入口已提前记过，note() 会复用），
+               直连模型的质量标签才拿得到 retry。 */
+            cur.clientRetried = Repeats.note(req) > 1;
             /* 会话标识：同一段对话的多跳请求共用一个。
                用「首条用户消息 + 消息数」做指纹——同一轮工具循环里，
                消息数会递增，所以不能只用内容；直接用内容指纹会误把
@@ -3136,6 +3203,7 @@ public final class Server {
                 /* 数正文字符：上游普遍不返回 usage（中转站尤其），tokOut 长期是 0；
                    而 text(delta) 是逐字过来的，自己数不依赖上游。 */
                 if (delta != null && cur != null) {
+                    cur.lastUpstreamAt = System.currentTimeMillis();
                     cur.outChars += delta.length();
                     /* 留一份正文样本：用来判定"上游是不是把工具调用写进了正文"。
                        只留前 2000 字符，够识别标记，不会把内存吃满。 */
@@ -3149,12 +3217,16 @@ public final class Server {
 
             @Override
             public void thinking(String delta) {
+                if (cur != null) cur.lastUpstreamAt = System.currentTimeMillis();
                 inner.thinking(delta);
             }
 
             @Override
             public void toolCall(String id, String name, String argsJson) {
-                if (cur != null) cur.sawToolCall = true;
+                if (cur != null) {
+                    cur.lastUpstreamAt = System.currentTimeMillis();
+                    cur.sawToolCall = true;
+                }
                 inner.toolCall(id, name, argsJson);
             }
 
@@ -3165,6 +3237,7 @@ public final class Server {
                 // CURRENT.get() 恒为 null —— token 用量永远记 0。
                 Conn c = cur;
                 if (c != null) {
+                    c.lastUpstreamAt = System.currentTimeMillis();
                     /* 结束原因以前收到就丢：于是 length（被 max_tokens 截断）和 stop（正常结束）
                        在用量数据里完全一样，截断彻底不可见。现在记下来。 */
                     c.stopReason = stopReason == null ? "" : stopReason;
@@ -3393,12 +3466,21 @@ public final class Server {
     /** 一次竞速里几路一起跑。 */
     private static final int RACE_N = 3;
 
-    /** 全局闸门：同时最多几路竞速。不加这个，竞速会把普通请求挤死。 */
+    /**
+     * 全局闸门：同时最多几场竞速。
+     *
+     * 一场竞速占 RACE_N（3）条线程。以前闸门是 16 场、线程池只有 8 条：
+     * 第 3 场起 racer 就在无界队列里排队，早就不是"同时起跑"了；更糟的是
+     * 客户端 180 秒超时后仍在队列里的任务照常执行，白打一次上游。
+     * 现在闸门与线程池按 1:3 对齐，池里没有排队任务。
+     */
+    private static final int RACE_GATE_MAX = 4;
+
     private static final java.util.concurrent.Semaphore RACE_GATE =
-            new java.util.concurrent.Semaphore(16);
+            new java.util.concurrent.Semaphore(RACE_GATE_MAX);
 
     private static final java.util.concurrent.ExecutorService RACE_POOL =
-            java.util.concurrent.Executors.newFixedThreadPool(8, r -> {
+            java.util.concurrent.Executors.newFixedThreadPool(RACE_GATE_MAX * RACE_N, r -> {
                 Thread t = new Thread(r, "cpa-race");
                 t.setDaemon(true);
                 return t;
@@ -3439,7 +3521,7 @@ public final class Server {
      */
     private void serveRace(Req r, OutputStream out, Proto.Req req) throws Exception {
         if (!RACE_GATE.tryAcquire()) {
-            Log.w("竞速闸门已满（16 路在跑），这次退回普通选路");
+            Log.w("竞速闸门已满（" + RACE_GATE_MAX + " 场在跑），这次退回普通选路");
             serveVirtualOpenAi(r, out, req);
             return;
         }
@@ -3463,16 +3545,25 @@ public final class Server {
                 final Config.Provider prov = c.provider;
                 final String model = c.model;
                 RACE_POOL.execute(() -> {
+                    /* 已经决出胜负（或整场已收尾）时，排队晚到的 racer 直接退出：
+                       不要再打上游，也不要再建响应头。all 必须减，否则主线程会白等。 */
+                    if (race.closed || race.winnerId.get() != null) {
+                        all.countDown();
+                        return;
+                    }
                     RaceCancels.Handle handle = RaceCancels.bind(raceBucket, id);
                     DeferredWriter dw = new DeferredWriter(out);
                     dw.racerId = id;
                     dw.race = race;
                     BufferedWriter w = new BufferedWriter(dw, 8192);
                     Fronts.OpenAiFront.Streamer streamer = new Fronts.OpenAiFront.Streamer(w, req.model);
+                    /* 每路一份独立观测对象：三路共写一个 Conn 会丢更新/串数据。
+                       胜者确定后再由 copyObs() 合并回 raceConn。 */
+                    final Conn obs = new Conn(out, null);
                     try {
                         // 显式把 Conn 传进 serve：竞速线程的 ThreadLocal 是空的，
                         // 不传的话渠道名/模型名/token 全回填不进用量（整个竞速都记成失败）
-                        serve(req.model, prov, model, req, streamer, raceConn);
+                        serve(req.model, prov, model, req, streamer, obs);
                         try {
                             w.flush();
                         } catch (Exception ignored) {
@@ -3505,7 +3596,10 @@ public final class Server {
                     } finally {
                         RaceCancels.unbind(raceBucket, id);
                         all.countDown();
-                        if (id.equals(race.winnerId.get())) race.winnerDone.countDown();
+                        if (id.equals(race.winnerId.get())) {
+                            copyObs(obs, raceConn);
+                            race.winnerDone.countDown();
+                        }
                     }
                 });
             }
@@ -3784,7 +3878,6 @@ public final class Server {
         int tokens;
         try {
             Proto.Req req = Fronts.AnthropicFront.parse(body);
-        RequestCheck.check(req);
             RequestCheck.check(req);
             tokens = Classifier.estimateTokens(req);
         } catch (Throwable t) {
@@ -3815,6 +3908,10 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.AnthropicFront.parse(body);
+        /* 4.34.0 说"五处前端入口全接上"，实际这里漏了：Claude Code 走的正是
+           /v1/messages，缺 id 的工具调用会一路发到上游，再被记成渠道失败。
+           补在解析之后、选路之前：坏请求不占候选、不进熔断。 */
+        RequestCheck.check(req);
         if (Router.isVirtual(req.model)) {
             String real = resolveVirtual(req.model, req);
             if (real.isEmpty()) {

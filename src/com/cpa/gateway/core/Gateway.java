@@ -261,7 +261,14 @@ public final class Gateway {
             }
         }
         cur.port = fresh.port;
-        cur.apiKey = fresh.apiKey;
+        /* 磁盘上的 Key 解不开时，fresh 里是 Config.load 刚生成的新 Key，而运行中的
+           cur 可能还拿着可用的旧值。不要让一次 reload 把可用 Key 换成新的——
+           旧行为正是"解不开 → 空串 → 本机模式不再鉴权"。 */
+        if (!fresh.apiKeyUnreadable) {
+            cur.apiKey = fresh.apiKey;
+        } else {
+            Log.w("reload：磁盘上的 Key 解不开，保留运行中的客户端 Key");
+        }
         cur.lanAccess = fresh.lanAccess;
         cur.keepAlive = fresh.keepAlive;
         Log.i("reload：内存 " + before + " → " + cur.providers.size()
@@ -319,8 +326,20 @@ public final class Gateway {
             Log.w("导入前备份当前配置失败（继续导入）：" + t);
         }
 
-        /* 2) 校验能解析，避免把一份坏 JSON 写进去把用户锁在门外 */
-        Config parsed = Config.fromJson(Secret.open(new org.json.JSONObject(restored.toString())));
+        /* 2) 校验能解析，避免把一份坏 JSON 写进去把用户锁在门外。
+
+           4.37.0 起导出的是明文（外层由用户密码加密），但旧备份里可能是
+           本机 Keystore 密的字段。换机后那种密文解不开，旧代码会把它当空串
+           继续导入——账号列表看起来恢复了，实际全没有凭据。这里先拦下，
+           让用户回原机用 4.37.0+ 重新导出，而不是静默丢数据。 */
+        org.json.JSONObject payload = new org.json.JSONObject(restored.toString());
+        String unreadable = Secret.unreadableSealed(payload);
+        if (unreadable != null) {
+            throw new IllegalStateException("这份备份里的 " + unreadable
+                    + " 是用导出设备的本机密钥加密的，当前设备解不开。"
+                    + "请回到原设备用 4.37.0 或更新版本重新导出（新版本导出的是可跨设备恢复的格式）。");
+        }
+        Config parsed = Config.fromJson(Secret.open(payload));
         if (parsed == null) throw new IllegalStateException("备份内容无法解析为配置");
 
         /* 3) 停网关 → 落盘（走正常 save，让 Secret 重新用本机密钥加密）→ 重新加载 → 起网关 */

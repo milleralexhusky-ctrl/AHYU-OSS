@@ -878,20 +878,115 @@ public final class Upstreams {
      *   · 只接受 image/* 的 Content-Type：防止被当成任意内容的搬运通道。
      * 失败一律返回 null，由调用方决定怎么处理（目前是记日志 + 本次请求不带这张图）。
      */
+    /**
+     * 只允许指向公网地址的 http/https URL。
+     *
+     * 为什么必须查：图片 URL 来自客户端请求体。以前只判断了 "http://"，
+     * 于是任何能调本机网关的应用都能让网关去请求 127.0.0.1、局域网设备的
+     * 管理页或云元数据地址——盲探测，甚至把返回的 image/* 内联给上游。
+     *
+     * 这里解析域名并检查**每一个**解析结果；重定向由 openImageConnection()
+     * 逐跳再查一遍（HttpURLConnection 的自动跟随会让第一次检查形同虚设）。
+     * 残余风险：DNS rebinding 在"检查"和"连接"之间做手脚，本机场景下
+     * 这个窗口可接受；要彻底堵住得把连接固定到已校验的 IP。
+     */
+    static boolean isPublicHttpUrl(String raw) {
+        if (raw == null) return false;
+        try {
+            java.net.URI uri = new java.net.URI(raw.trim());
+            String scheme = uri.getScheme();
+            if (scheme == null) return false;
+            scheme = scheme.toLowerCase(java.util.Locale.US);
+            if (!"http".equals(scheme) && !"https".equals(scheme)) return false;
+            if (uri.getUserInfo() != null) return false;   // http://user@host 这种不该出现在图片 URL 里
+            String host = uri.getHost();
+            if (host == null || host.isEmpty()) return false;
+            java.net.InetAddress[] addrs = java.net.InetAddress.getAllByName(host);
+            if (addrs == null || addrs.length == 0) return false;
+            for (java.net.InetAddress a : addrs) {
+                if (a == null || isBlockedAddress(a)) return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean isBlockedAddress(java.net.InetAddress a) {
+        if (a.isAnyLocalAddress() || a.isLoopbackAddress() || a.isLinkLocalAddress()
+                || a.isSiteLocalAddress() || a.isMulticastAddress()) {
+            return true;
+        }
+        byte[] b = a.getAddress();
+        if (b.length == 4) {
+            int b0 = b[0] & 0xff;
+            int b1 = b[1] & 0xff;
+            if (b0 == 0) return true;                         // 0.0.0.0/8
+            if (b0 == 100 && b1 >= 64 && b1 <= 127) return true;  // 100.64/10 CGNAT
+            if ((b0 & 0xf0) == 0xf0) return true;             // 240/4 保留
+            return false;
+        }
+        if (b.length == 16) {
+            if ((b[0] & 0xfe) == 0xfc) return true;           // fc00::/7 唯一本地地址
+            boolean mapped = true;
+            for (int i = 0; i < 10; i++) if (b[i] != 0) { mapped = false; break; }
+            if (mapped && (b[10] & 0xff) == 0xff && (b[11] & 0xff) == 0xff) {
+                /* ::ffff:a.b.c.d：按 IPv4 再判一次，否则 isLoopback 之类对映射地址不生效 */
+                int b0 = b[12] & 0xff, b1 = b[13] & 0xff;
+                return b0 == 0 || b0 == 127 || b0 == 10
+                        || (b0 == 192 && b1 == 168) || (b0 == 172 && b1 >= 16 && b1 <= 31)
+                        || (b0 == 169 && b1 == 254)
+                        || (b0 == 100 && b1 >= 64 && b1 <= 127)
+                        || (b0 & 0xf0) == 0xf0;
+            }
+        }
+        return false;
+    }
+
+    /** 建立图片连接：不自动跟随重定向，每一跳都重新做公网校验，最多 3 跳。 */
+    private static java.net.HttpURLConnection openImageConnection(String url) {
+        String current = url;
+        for (int hop = 0; hop <= 3; hop++) {
+            if (!isPublicHttpUrl(current)) {
+                Log.w("图片重定向目标不是公网地址，已停止：" + Upstreams.shortenPublic(current));
+                return null;
+            }
+            try {
+                java.net.HttpURLConnection c =
+                        (java.net.HttpURLConnection) new java.net.URL(current).openConnection();
+                c.setConnectTimeout(IMAGE_FETCH_TIMEOUT_MS);
+                c.setReadTimeout(IMAGE_FETCH_TIMEOUT_MS);
+                c.setInstanceFollowRedirects(false);
+                c.setRequestProperty("Accept", "image/*");
+                int code = c.getResponseCode();
+                if (code >= 300 && code < 400) {
+                    String loc = c.getHeaderField("Location");
+                    c.disconnect();
+                    if (loc == null || loc.isEmpty()) return null;
+                    current = new java.net.URL(new java.net.URL(current), loc).toString();
+                    continue;
+                }
+                return c;
+            } catch (Throwable t) {
+                Log.w("图片下载连接失败：" + Upstreams.shortenPublic(current) + " · " + t);
+                return null;
+            }
+        }
+        Log.w("图片重定向超过 3 跳，已放弃：" + Upstreams.shortenPublic(url));
+        return null;
+    }
+
     static String[] fetchImageAsBase64(String url) {
         if (url == null) return null;
         String u = url.trim();
-        if (!u.startsWith("http://") && !u.startsWith("https://")) {
-            Log.w("图片 URL 协议不受支持，已跳过：" + Upstreams.shortenPublic(u));
+        if (!isPublicHttpUrl(u)) {
+            Log.w("图片 URL 不是公网 http/https，已跳过（防 SSRF）：" + Upstreams.shortenPublic(u));
             return null;
         }
         java.net.HttpURLConnection conn = null;
         try {
-            conn = (java.net.HttpURLConnection) new java.net.URL(u).openConnection();
-            conn.setConnectTimeout(IMAGE_FETCH_TIMEOUT_MS);
-            conn.setReadTimeout(IMAGE_FETCH_TIMEOUT_MS);
-            conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("Accept", "image/*");
+            conn = openImageConnection(u);
+            if (conn == null) return null;
             int code = conn.getResponseCode();
             if (code < 200 || code >= 300) {
                 Log.w("图片下载失败 HTTP " + code + "：" + Upstreams.shortenPublic(u));
@@ -1075,6 +1170,9 @@ public final class Upstreams {
         final Proto.Usage usage = new Proto.Usage();
         final String[] finish = {""};
         final Map<Integer, String[]> blockInfo = new LinkedHashMap<>();
+        /* 4.37.0：上游 response id。Anthropic 只在 message_start 里给一次
+           （message.id，形如 msg_...），后面没有重复，所以要在这里就报上去。 */
+        final boolean[] idReported = {false};
 
         postStream(endpoint, headers, body, line -> {
             JSONObject ev = sseData(line);
@@ -1082,7 +1180,16 @@ public final class Upstreams {
             String type = Proto.optString(ev, "type", "");
             if ("message_start".equals(type)) {
                 JSONObject msg = ev.optJSONObject("message");
-                if (msg != null) applyUsage(usage, msg.optJSONObject("usage"), "input_tokens", "output_tokens", "cache_read_input_tokens");
+                if (msg != null) {
+                    applyUsage(usage, msg.optJSONObject("usage"), "input_tokens", "output_tokens", "cache_read_input_tokens");
+                    if (!idReported[0]) {
+                        String rid = Proto.optString(msg, "id", "");
+                        if (!rid.isEmpty()) {
+                            idReported[0] = true;
+                            sink.responseId(rid);
+                        }
+                    }
+                }
             } else if ("content_block_start".equals(type)) {
                 int idx = Proto.optInt(ev, "index") == null ? 0 : Proto.optInt(ev, "index").intValue();
                 JSONObject cb = ev.optJSONObject("content_block");
@@ -1284,10 +1391,21 @@ public final class Upstreams {
             final Proto.Usage usage = new Proto.Usage();
             final String[] finish = {""};
             final List<String[]> calls = new ArrayList<>();
+            /* 4.37.0：Gemini 的 SSE 每个块可能带 responseId（新版 API 才有），
+               老版本没有这个字段就照旧留空，不算错误。 */
+            final boolean[] idReported = {false};
 
             postStream(endpoint, headers, body, line -> {
                 JSONObject ev = sseData(line);
                 if (ev == null) return;
+                if (!idReported[0]) {
+                    String rid = Proto.optString(ev, "responseId",
+                            Proto.optString(ev, "response_id", ""));
+                    if (!rid.isEmpty()) {
+                        idReported[0] = true;
+                        sink.responseId(rid);
+                    }
+                }
                 JSONObject um = ev.optJSONObject("usageMetadata");
                 if (um != null) {
                     applyUsage(usage, um, "promptTokenCount", "candidatesTokenCount", "cachedContentTokenCount");
