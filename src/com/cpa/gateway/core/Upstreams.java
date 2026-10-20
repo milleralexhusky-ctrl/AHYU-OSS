@@ -353,6 +353,11 @@ public final class Upstreams {
         if (req.maxTokens != null) body.put("max_tokens", req.maxTokens.intValue());
         if (req.temperature != null) body.put("temperature", req.temperature.doubleValue());
         if (req.topP != null) body.put("top_p", req.topP.doubleValue());
+        /* 只回给 OpenAI 入口的 top_k：OpenAI 官方接口不认这个字段，
+           跨协议硬塞会把本来正常的请求变成 400。 */
+        if (req.topK != null && "openai".equals(req.protocol)) {
+            body.put("top_k", req.topK.intValue());
+        }
         if (!req.stop.isEmpty()) body.put("stop", new JSONArray(req.stop));
         if (!req.tools.isEmpty()) {
             JSONArray tools = new JSONArray();
@@ -478,17 +483,29 @@ public final class Upstreams {
             /* 响应保真（4.50.0）：同样是 OpenAI 形状，客户端要 n>1 / logprobs / 音频时
                不再把响应拆成 canonical 的"一段正文"，而是原样回传。请求体还是同一份，
                选路、限额、换号、用量统计都在外层照常工作。 */
-            if (req.rawResponse && "openai".equals(req.protocol)) {
-                if (req.stream) {
-                    rawOpenAiStream(endpoint, headers, openAiBody(model, req, true), sink);
-                } else {
-                    rawOpenAiCall(endpoint, headers, openAiBody(model, req, false),
-                            req.model == null || req.model.isEmpty() ? model : req.model, sink);
-                }
-                return;
-            }
+            if (rawOpenAiIfWanted(req, endpoint, headers, model, sink)) return;
             openAiStream(endpoint, headers, openAiBody(model, req, true), sink);
         }
+    }
+
+    /**
+     * 已经是 OpenAI Chat 形状的渠道共用入口：需要保真就原样透传，返回 true。
+     *
+     * 4.50.0 只接了通用 OpenAI 兼容渠道；4.50.1 把同样用
+     * `openAiBody` + `openAiStream` 的 xAI / Kilo / OVH / Loomy 也接上。
+     * 它们的请求体本来就走同一套渲染，响应也是 OpenAI SSE，接进来没有额外假设。
+     */
+    static boolean rawOpenAiIfWanted(Proto.Req req, String endpoint,
+                                     Map<String, String> headers, String model,
+                                     Proto.Sink sink) throws Exception {
+        if (!req.rawResponse || !"openai".equals(req.protocol)) return false;
+        if (req.stream) {
+            rawOpenAiStream(endpoint, headers, openAiBody(model, req, true), sink);
+        } else {
+            rawOpenAiCall(endpoint, headers, openAiBody(model, req, false),
+                    req.model == null || req.model.isEmpty() ? model : req.model, sink);
+        }
+        return true;
     }
 
     /* ---------------------------------------------------- 响应保真（4.50.0） */
@@ -1245,6 +1262,9 @@ public final class Upstreams {
         if (!req.systemText().isEmpty()) body.put("system", req.systemText());
         if (req.temperature != null) body.put("temperature", req.temperature.doubleValue());
         if (req.topP != null) body.put("top_p", req.topP.doubleValue());
+        /* top_k 在 Anthropic 里是原生字段：OpenAI 入口的 top_k / Gemini 的 topK
+           都能等价翻译过来。 */
+        if (req.topK != null) body.put("top_k", req.topK.intValue());
         if (!req.stop.isEmpty()) body.put("stop_sequences", new JSONArray(req.stop));
         JSONArray msgs = new JSONArray();
         for (Proto.Msg m : req.messages) {
@@ -1448,6 +1468,7 @@ public final class Upstreams {
         if (req.maxTokens != null) gen.put("maxOutputTokens", req.maxTokens.intValue());
         if (req.temperature != null) gen.put("temperature", req.temperature.doubleValue());
         if (req.topP != null) gen.put("topP", req.topP.doubleValue());
+        if (req.topK != null) gen.put("topK", req.topK.intValue());
         if (!req.stop.isEmpty()) gen.put("stopSequences", new JSONArray(req.stop));
         Object tcfg = XParams.thinking(req.protocol, req.thinkingParams, "gemini");
         if (tcfg instanceof JSONObject) gen.put("thinkingConfig", tcfg);

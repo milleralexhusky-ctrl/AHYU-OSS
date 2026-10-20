@@ -164,6 +164,9 @@ public final class Fronts {
             req.maxTokens = mt;
             req.temperature = Proto.optDouble(body, "temperature");
             req.topP = Proto.optDouble(body, "top_p");
+            /* OpenAI 官方没有 top_k，但 OpenAI 兼容中转普遍支持；收进 canonical
+               后同协议照旧发出，Anthropic / Gemini 出口可以翻译。 */
+            req.topK = Proto.optInt(body, "top_k");
             /* 能力参数：原样留着，出口按目标协议翻译（见 XParams）。
                以前这几个字段连读都没读，是"同一账号走网关就变笨"的主因之一。 */
             Object tcRaw = body.opt("tool_choice");
@@ -246,7 +249,7 @@ public final class Fronts {
             }
             copyExtra(body, req.extraBody,
                     "model", "messages", "stream", "max_tokens", "max_completion_tokens",
-                    "max_output_tokens", "temperature", "top_p", "tool_choice",
+                    "max_output_tokens", "temperature", "top_p", "top_k", "tool_choice",
                     "response_format", "reasoning", "reasoning_effort",
                     "parallel_tool_calls", "presence_penalty", "frequency_penalty",
                     "seed", "stop", "tools", "stream_options");
@@ -884,6 +887,7 @@ public final class Fronts {
             req.maxTokens = Proto.optInt(body, "max_tokens");
             req.temperature = Proto.optDouble(body, "temperature");
             req.topP = Proto.optDouble(body, "top_p");
+            req.topK = Proto.optInt(body, "top_k");
             /* tool_choice 与 thinking：Anthropic 侧这两个直接决定"能不能用工具""要不要思考"。
                thinking 不传的后果最明显 —— 客户端明明开了 extended thinking，
                走网关却完全不思考，用户看到的就是"同一个模型变笨了"。 */
@@ -945,7 +949,7 @@ public final class Fronts {
             }
             copyExtra(body, req.extraBody,
                     "model", "messages", "stream", "max_tokens", "temperature", "top_p",
-                    "tool_choice", "thinking", "system", "stop_sequences", "tools");
+                    "top_k", "tool_choice", "thinking", "system", "stop_sequences", "tools");
             return req;
         }
 
@@ -1225,6 +1229,7 @@ public final class Fronts {
                 if (req.maxTokens == null) req.maxTokens = Proto.optInt(gen, "max_output_tokens");
                 req.temperature = Proto.optDouble(gen, "temperature");
                 req.topP = Proto.optDouble(gen, "topP");
+                req.topK = Proto.optInt(gen, "topK");
                 JSONArray stops = gen.optJSONArray("stopSequences");
                 if (stops != null) for (int i = 0; i < stops.length(); i++) req.stop.add(String.valueOf(stops.opt(i)));
                 /* 2.5 系列的思考预算与结构化输出都挂在这里，以前整段被忽略：
@@ -1266,7 +1271,7 @@ public final class Fronts {
                     "generationConfig", "generation_config", "tools", "toolConfig");
             if (gen != null) {
                 copyExtra(gen, req.extraGenerationConfig,
-                        "maxOutputTokens", "max_output_tokens", "temperature", "topP",
+                        "maxOutputTokens", "max_output_tokens", "temperature", "topP", "topK",
                         "stopSequences", "thinkingConfig", "responseMimeType",
                         "responseSchema");
             }

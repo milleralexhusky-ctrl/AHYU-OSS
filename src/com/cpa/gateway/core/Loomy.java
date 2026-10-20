@@ -221,8 +221,11 @@ public final class Loomy {
             Account acc = Account.fromJson(p.credentials);
             if (!acc.usable()) throw new IllegalStateException("Loomy 账号未登录，请先点「登录 Loomy」");
             String base = p.baseUrl == null || p.baseUrl.isEmpty() ? API_BASE : Upstreams.trimSlash(p.baseUrl);
+            String endpoint = base + "/api/v1/chat/completions";
+            /* 保真模式（4.50.1）：n>1 / logprobs 的响应原样回传。 */
+            if (Upstreams.rawOpenAiIfWanted(req, endpoint, apiHeaders(acc.session), model, sink)) return;
             JSONObject body = Upstreams.openAiBody(model, req, true);
-            Upstreams.openAiStream(base + "/api/v1/chat/completions", apiHeaders(acc.session), body, sink);
+            Upstreams.openAiStream(endpoint, apiHeaders(acc.session), body, sink);
         }
     }
 

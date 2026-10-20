@@ -79,6 +79,7 @@ public final class Selftest {
         add(out, "Ollama 请求翻译与响应形状", Selftest::checkOllamaProtocol);
         add(out, "同协议未知参数透传（top_k/service_tier/metadata）", Selftest::checkExtraBody);
         add(out, "响应保真透传（logprobs / 多 choice / 正文不被改写）", Selftest::checkRawFidelity);
+        add(out, "top_k 跨协议等价翻译（Anthropic ↔ Gemini）", Selftest::checkTopK);
         return out;
     }
 
@@ -1012,8 +1013,10 @@ public final class Selftest {
                     : body.optJSONObject("metadata").optString("k", ""))) {
                 return "OpenAI metadata 没透传";
             }
+            /* 4.50.1 起 top_k 是 canonical 字段：OpenAI 入口显式发 top_k 时，
+               Anthropic 出口会等价翻译（详见 checkTopK）。这里只确认它没有丢。 */
             JSONObject cross = Upstreams.anthropicBody("m", req);
-            if (cross.has("top_k")) return "跨协议不该把 OpenAI 的 top_k 塞给 Anthropic";
+            if (cross.optInt("top_k", 0) != 5) return "OpenAI 的 top_k 没翻译给 Anthropic";
 
             JSONObject a = new JSONObject();
             a.put("model", "m");
@@ -1109,6 +1112,74 @@ public final class Selftest {
             return "保真模式仍补写了 canonical 收尾分片";
         }
         return null;
+    }
+
+    /**
+     * top_k（4.50.1）：三套协议里名字不同、语义相同。
+     *
+     * 规则：
+     *  · OpenAI / Anthropic / Gemini 同协议都要保留；
+     *  · Anthropic ↔ Gemini 互译；
+     *  · 客户端显式发 top_k 时，可以翻译到 Anthropic / Gemini；
+     *  · 不往 OpenAI 上游跨协议硬塞——OpenAI 官方接口不认这个字段。
+     */
+    private static String checkTopK() {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("model", "m");
+            o.put("messages", new JSONArray().put(new JSONObject()
+                    .put("role", "user").put("content", "hi")));
+            o.put("top_k", 5);
+            Proto.Req or = Fronts.OpenAiFront.parse(o);
+            if (or.topK == null || or.topK.intValue() != 5) return "OpenAI 入口没解析 top_k";
+            if (Upstreams.openAiBody("m", or, true).optInt("top_k", 0) != 5) {
+                return "OpenAI→OpenAI 的 top_k 丢了";
+            }
+            if (Upstreams.anthropicBody("m", or).optInt("top_k", 0) != 5) {
+                return "OpenAI→Anthropic 的 top_k 没翻译";
+            }
+            if (Upstreams.geminiGenerationConfig(or).optInt("topK", 0) != 5) {
+                return "OpenAI→Gemini 的 top_k 没翻译";
+            }
+
+            JSONObject a = new JSONObject();
+            a.put("model", "m");
+            a.put("max_tokens", 16);
+            a.put("messages", new JSONArray().put(new JSONObject()
+                    .put("role", "user").put("content", "hi")));
+            a.put("top_k", 7);
+            Proto.Req ar = Fronts.AnthropicFront.parse(a);
+            if (ar.topK == null || ar.topK.intValue() != 7) return "Anthropic 入口没解析 top_k";
+            if (Upstreams.anthropicBody("m", ar).optInt("top_k", 0) != 7) {
+                return "Anthropic→Anthropic 的 top_k 丢了";
+            }
+            if (Upstreams.geminiGenerationConfig(ar).optInt("topK", 0) != 7) {
+                return "Anthropic→Gemini 的 top_k 没翻译";
+            }
+            if (Upstreams.openAiBody("m", ar, true).has("top_k")) {
+                return "Anthropic→OpenAI 不该硬塞 top_k（官方接口会 400）";
+            }
+
+            JSONObject gBody = new JSONObject();
+            gBody.put("contents", new JSONArray().put(new JSONObject()
+                    .put("role", "user").put("parts", new JSONArray().put(
+                            new JSONObject().put("text", "hi")))));
+            gBody.put("generationConfig", new JSONObject().put("topK", 9));
+            Proto.Req gr = Fronts.GeminiFront.parse("m", gBody);
+            if (gr.topK == null || gr.topK.intValue() != 9) return "Gemini 入口没解析 topK";
+            if (Upstreams.geminiGenerationConfig(gr).optInt("topK", 0) != 9) {
+                return "Gemini→Gemini 的 topK 丢了";
+            }
+            if (Upstreams.anthropicBody("m", gr).optInt("top_k", 0) != 9) {
+                return "Gemini→Anthropic 的 topK 没翻译";
+            }
+            if (Upstreams.openAiBody("m", gr, true).has("top_k")) {
+                return "Gemini→OpenAI 不该硬塞 top_k（官方接口会 400）";
+            }
+            return null;
+        } catch (Throwable t) {
+            return "top_k 翻译自检异常：" + t;
+        }
     }
 
     /** Ollama 是本地生态最常用的入口：翻译、工具配对、两种响应形状都要对。 */

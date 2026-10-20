@@ -149,6 +149,18 @@ public final class Proto {
         public Integer maxTokens;
         public Double temperature;
         public Double topP;
+        /**
+         * top-k 采样（4.50.1）。
+         *
+         * 三套协议里的名字不同：OpenAI 兼容端点的 `top_k`、Anthropic 的 `top_k`、
+         * Gemini 的 `generationConfig.topK`，语义是同一件事。以前只在同协议时
+         * 原样透传，跨协议直接丢；现在收进 canonical，Anthropic ↔ Gemini 以及
+         * 客户端显式发 `top_k` 的路径都能翻译过去。
+         *
+         * 不往 OpenAI 上游跨协议翻译：OpenAI 官方接口不认 `top_k`，
+         * 硬塞会让本来正常的请求 400。
+         */
+        public Integer topK;
         public final List<String> stop = new ArrayList<>();
         public final List<Tool> tools = new ArrayList<>();
         public boolean stream;

@@ -447,9 +447,11 @@ public final class Xai {
                 return;
             }
             Account acc = ensureFresh(p);
+            String endpoint = Upstreams.url(baseOf(p), "chat/completions");
+            /* 保真模式（4.50.1）：n>1 / logprobs 的响应原样回传。 */
+            if (Upstreams.rawOpenAiIfWanted(req, endpoint, headers(p, acc), model, sink)) return;
             JSONObject body = Upstreams.openAiBody(model, req, true);
-            Upstreams.openAiStream(Upstreams.url(baseOf(p), "chat/completions"),
-                    headers(p, acc), body, sink);
+            Upstreams.openAiStream(endpoint, headers(p, acc), body, sink);
         }
     }
 
