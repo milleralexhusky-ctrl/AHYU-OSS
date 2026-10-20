@@ -201,6 +201,10 @@ public class SettingsActivity extends Activity {
         dataCard.addView(Ui.label(this, "包含脱敏配置、日志、用量、自检结果；"
                 + "rawcap 尾部可能含回答内容，发送前请自行检查。"), Ui.lp(this, 6));
 
+        TextView updateBtn = Ui.outlineButton(this, "检查更新（GitHub Release）");
+        updateBtn.setOnClickListener(v -> checkUpdate());
+        dataCard.addView(updateBtn, Ui.lp(this, 10));
+
         TextView exportBtn = Ui.outlineButton(this, "导出加密备份");
         exportBtn.setOnClickListener(v -> startExport());
         dataCard.addView(exportBtn, Ui.lp(this, 10));
@@ -574,6 +578,82 @@ public class SettingsActivity extends Activity {
             });
         } else if (req == REQ_OPEN) {
             askImportPassword(uri);
+        }
+    }
+
+    /**
+     * 检查公库最新 Release。只提示并跳转，不做静默安装。
+     *
+     * 走 GitHub 公开 API，用户点一次才发一次请求；失败只 toast，不打扰。
+     */
+    private void checkUpdate() {
+        toast("正在检查最新版本…");
+        Threads.io(() -> {
+            try {
+                java.util.Map<String, String> headers = new java.util.HashMap<>();
+                headers.put("Accept", "application/vnd.github+json");
+                com.cpa.gateway.core.Http.Resp resp = com.cpa.gateway.core.Http.call(
+                        "GET",
+                        "https://api.github.com/repos/milleralexhusky-ctrl/AHYU-OSS/releases/latest",
+                        headers, null, null, 10000, 15000, false);
+                org.json.JSONObject o = new org.json.JSONObject(resp.body);
+                final String tag = o.optString("tag_name", "");
+                final String url = o.optString("html_url", "");
+                String notes = o.optString("body", "");
+                if (tag.isEmpty()) throw new IllegalStateException("GitHub 返回里没有版本号");
+                String cur = com.cpa.gateway.core.Backup.versionTag();
+                boolean newer = compareVersion(tag, cur) > 0;
+                String title = newer
+                        ? "发现新版本 " + tag + "（当前 " + cur + "）"
+                        : "已是最新版本（当前 " + cur + "）";
+                if (notes.length() > 4000) notes = notes.substring(0, 4000) + "…";
+                final String msg = notes.isEmpty() ? "这个 Release 没有写说明。" : notes;
+                runOnUiThread(() -> {
+                    android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+                            .setTitle(title)
+                            .setMessage(msg)
+                            .setNegativeButton("关闭", null);
+                    if (!url.isEmpty()) {
+                        b.setPositiveButton("打开发布页", (d, w) -> {
+                            try {
+                                startActivity(new Intent(Intent.ACTION_VIEW,
+                                        android.net.Uri.parse(url)));
+                            } catch (Throwable ignored) {
+                            }
+                        });
+                    }
+                    b.show();
+                });
+            } catch (Throwable t) {
+                runOnUiThread(() -> toast("检查更新失败：" + t.getMessage()));
+            }
+        });
+    }
+
+    private static int compareVersion(String a, String b) {
+        String[] x = versionParts(a);
+        String[] y = versionParts(b);
+        int n = Math.max(x.length, y.length);
+        for (int i = 0; i < n; i++) {
+            int vx = i < x.length ? parseIntOr0(x[i]) : 0;
+            int vy = i < y.length ? parseIntOr0(y[i]) : 0;
+            if (vx != vy) return vx < vy ? -1 : 1;
+        }
+        return 0;
+    }
+
+    private static String[] versionParts(String v) {
+        String s = v == null ? "" : v.trim();
+        while (s.startsWith("v") || s.startsWith("V")) s = s.substring(1);
+        if (s.isEmpty()) return new String[0];
+        return s.split("[^0-9]+");
+    }
+
+    private static int parseIntOr0(String s) {
+        try {
+            return Integer.parseInt(s);
+        } catch (Throwable t) {
+            return 0;
         }
     }
 

@@ -74,6 +74,7 @@ public final class Selftest {
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
         add(out, "流式解析回放（OpenAI/Anthropic/Gemini）", Selftest::checkStreamReplay);
+        add(out, "HTTP 请求回放（chunked 中文/多请求对齐）", Selftest::checkHttpRequestReplay);
         return out;
     }
 
@@ -868,6 +869,61 @@ public final class Selftest {
         m.parts.add(Proto.Part.text("同一条内容"));
         req.messages.add(m);
         return req;
+    }
+
+    /**
+     * HTTP 请求解析回放：chunked 正文里的中文不能被块边界切坏，trailer 要读干净，
+     * 同一连接上的下一个请求不能错位。
+     *
+     * 这三条都是 4.37.0 修过的真实缺陷；用固定字节回放，防止以后改解析时回归。
+     */
+    private static String checkHttpRequestReplay() {
+        try {
+            String body = "{\"q\":\"你好\"}";
+            byte[] bb = body.getBytes("UTF-8");
+            int cut = body.substring(0, body.indexOf('你')).getBytes("UTF-8").length + 1;
+            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream();
+            raw.write(("POST /v1/chat/completions HTTP/1.1\r\n"
+                    + "Host: selftest\r\n"
+                    + "Transfer-Encoding: chunked\r\n"
+                    + "Connection: keep-alive\r\n\r\n").getBytes("UTF-8"));
+            chunk(raw, bb, 0, cut);
+            chunk(raw, bb, cut, bb.length - cut);
+            raw.write(("0\r\nX-Trailer: 1\r\n\r\n").getBytes("UTF-8"));
+            raw.write(("GET /health HTTP/1.1\r\nHost: selftest\r\n\r\n").getBytes("UTF-8"));
+
+            /* 必须复用同一个 BufferedInputStream：真实 Server 也是这么做的。
+               如果这里传裸流，readRequest 会新包一层，第一次调用结束时把预读到的
+               第二个请求一起丢掉——那是测试写法的问题，不是解析器的问题。 */
+            java.io.BufferedInputStream in = new java.io.BufferedInputStream(
+                    new java.io.ByteArrayInputStream(raw.toByteArray()), 8192);
+            Server.Req first = Server.readRequest(in);
+            if (first == null) return "第一个请求没解析出来";
+            if (!body.equals(first.body)) return "chunked 中文被切坏：" + first.body;
+            if (!"/v1/chat/completions".equals(first.path)) return "第一个请求路径不对：" + first.path;
+            Server.Req second = Server.readRequest(in);
+            if (second == null) return "trailer 读完后第二个请求丢了（连接错位）";
+            if (!"/health".equals(second.path)) return "第二个请求路径错位：" + second.path;
+
+            String big = "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + "900000\r\n";
+            try {
+                Server.readRequest(new java.io.ByteArrayInputStream(big.getBytes("UTF-8")));
+                return "超大 chunk 没有被拒绝";
+            } catch (java.io.IOException expected) {
+                // 正确：MAX_BODY_BYTES 之外应当拒绝
+            }
+            return null;
+        } catch (Throwable t) {
+            return "HTTP 请求回放异常：" + t;
+        }
+    }
+
+    private static void chunk(java.io.ByteArrayOutputStream out, byte[] data, int off, int len)
+            throws Exception {
+        out.write((Integer.toHexString(len) + "\r\n").getBytes("UTF-8"));
+        out.write(data, off, len);
+        out.write("\r\n".getBytes("UTF-8"));
     }
 
     /* ------------------------------------------------------- 流式解析回放（4.39.0） */

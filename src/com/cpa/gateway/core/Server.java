@@ -725,7 +725,7 @@ public final class Server {
         return CURRENT.get();
     }
 
-    private static final class Req {
+    static final class Req {
         String method = "GET";
         String path = "/";
         String query = "";
@@ -751,7 +751,7 @@ public final class Server {
         return new String(bos.toByteArray(), StandardCharsets.UTF_8);
     }
 
-    private static Req readRequest(InputStream raw) throws Exception {
+    static Req readRequest(InputStream raw) throws Exception {
         // 不能每次请求都新包一层 BufferedInputStream：内层缓冲会预读超过本次请求
         // 的字节，而这层包装随着本次调用结束就被丢掉，预读到的那部分（下一条
         // 流水线请求、或者同一 TCP 段里跟过来的下一请求）就凭空消失了。

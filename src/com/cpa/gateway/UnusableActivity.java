@@ -1,6 +1,8 @@
 package com.cpa.gateway;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -16,6 +18,18 @@ import java.util.List;
 
 /** Home for the accounts that cannot serve right now, so the main list stays clean. */
 public class UnusableActivity extends Activity {
+
+    /** 从重新登录页回来后重建列表，避免还显示旧状态。 */
+    private boolean dirty;
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (dirty) {
+            dirty = false;
+            recreate();
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,10 +65,39 @@ public class UnusableActivity extends Activity {
             row.addView(avatar, alp);
             LinearLayout info = Ui.column(this);
             info.addView(Ui.oneLineName(this, p.name));
-            TextView why = Ui.label(this, MainActivity.unusableReason(p));
+            final String reason = MainActivity.unusableReason(p);
+            TextView why = Ui.label(this, reason);
             why.setSingleLine(false);
             info.addView(why, Ui.lp(this, 3));
             row.addView(info, Ui.weight(this, 1f, 0));
+
+            /* 直接给下一步动作：复制原因给支持 / 凭证类问题直接重新登录。
+               以前只能点进详情页再自己找，处理路径太长。 */
+            LinearLayout ops = Ui.column(this);
+            TextView copy = Ui.ghostButton(this, "复制");
+            copy.setOnClickListener(v -> copyToClipboard(p.name + "\n" + reason));
+            ops.addView(copy);
+            if (looksLikeLoginProblem(reason)) {
+                final Intent login = MainActivity.vendorLoginIntent(this,
+                        MainActivity.vendorOf(p),
+                        MainActivity.accountsOfVendor(MainActivity.vendorOf(p),
+                                Gateway.config().providers));
+                if (login != null) {
+                    TextView relogin = Ui.accentChipButton(this, "重登");
+                    relogin.setOnClickListener(v -> {
+                        dirty = true;
+                        try {
+                            startActivity(login);
+                        } catch (Throwable t) {
+                            android.widget.Toast.makeText(this, "打不开登录页：" + t.getMessage(),
+                                    android.widget.Toast.LENGTH_LONG).show();
+                        }
+                    });
+                    ops.addView(relogin, Ui.lp(this, 6));
+                }
+            }
+            row.addView(ops);
+
             LinearLayout.LayoutParams params = Ui.lp(this, 8);
             row.setClickable(true);
             Ui.pressable(row);
@@ -73,5 +116,23 @@ public class UnusableActivity extends Activity {
         root.addView(Ui.label(this, "这些账号被移到本页是因为：已停用、最近调用失败、或全部模型都调不通。在详情页里「启用」或重新登录即可回到首页。"), Ui.lp(this, 8));
         // 底层强度 0.65 —— 不可用模型：列表
         setContentView(Ui.glassScaffold(this, root, 0.65f));
+    }
+
+    private static boolean looksLikeLoginProblem(String reason) {
+        if (reason == null) return false;
+        return reason.contains("凭证") || reason.contains("登录") || reason.contains("过期")
+                || reason.contains("认证") || reason.contains("401");
+    }
+
+    private void copyToClipboard(String text) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm == null) return;
+            cm.setPrimaryClip(ClipData.newPlainText("AHYU", text));
+            android.widget.Toast.makeText(this, "已复制原因", android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            android.widget.Toast.makeText(this, "复制失败：" + t.getMessage(),
+                    android.widget.Toast.LENGTH_SHORT).show();
+        }
     }
 }

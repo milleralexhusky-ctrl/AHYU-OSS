@@ -82,6 +82,8 @@ public class MainActivity extends Activity {
 
     /** 上次应用的配色，用来发现"在设置页换了主题"。 */
     private String appliedTheme;
+    /** 本次界面是否显示了"第一次使用"引导卡；加完账号后要把它撤掉。 */
+    private boolean firstRunCard;
 
     @Override
     protected void onResume() {
@@ -99,6 +101,13 @@ public class MainActivity extends Activity {
             return;
         }
         syncFromDisk();
+        /* 第一次使用引导卡只在"一个账号都没有"时显示；从添加流程回来后重建一次，
+           让它自然消失（否则要等下次冷启动）。 */
+        if (firstRunCard && !Gateway.config().providers.isEmpty()) {
+            firstRunCard = false;
+            recreate();
+            return;
+        }
         refreshStatus();
         startStatusPolling();
     }
@@ -257,6 +266,25 @@ public class MainActivity extends Activity {
         quick.addView(check, Ui.weight(this, 1f, 0));
         statusInner.addView(quick, Ui.lp(this, 10));
         root.addView(Ui.card(this, statusInner), Ui.lp(this, 16));
+
+        /* 第一次使用：一个账号都没有时，把"要做的三件事"直接写在首页上。
+           老用户看不到这张卡；加完账号后 onResume 会重建界面把它撤掉。 */
+        if (Gateway.config().providers.isEmpty()) {
+            firstRunCard = true;
+            LinearLayout start = Ui.column(this);
+            start.addView(Ui.sectionTitle(this, "第一次使用"));
+            start.addView(Ui.label(this, "按顺序做三件事，客户端就能用："), Ui.lp(this, 6));
+            start.addView(Ui.text(this, "1. 添加一个账号（账号登录 / API Key / 中转站都可以）",
+                    13.5f, Ui.TEXT, false), Ui.lp(this, 5));
+            start.addView(Ui.text(this, "2. 点上面的「启动网关」",
+                    13.5f, Ui.TEXT, false), Ui.lp(this, 4));
+            start.addView(Ui.text(this, "3. 把下面卡片里的地址和 Key 填进客户端",
+                    13.5f, Ui.TEXT, false), Ui.lp(this, 4));
+            TextView firstAdd = Ui.accentChipButton(this, "＋ 添加第一个账号");
+            firstAdd.setOnClickListener(v -> addAccountDialog());
+            start.addView(firstAdd, Ui.lp(this, 12));
+            root.addView(Ui.card(this, start), Ui.lp(this, 12));
+        }
 
         LinearLayout conn = Ui.column(this);
         LinearLayout addrRow = Ui.row(this);
