@@ -75,6 +75,7 @@ public final class Selftest {
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
         add(out, "流式解析回放（OpenAI/Anthropic/Gemini）", Selftest::checkStreamReplay);
         add(out, "HTTP 请求回放（chunked 中文/多请求对齐）", Selftest::checkHttpRequestReplay);
+        add(out, "入口解析保留工具结果 id（OpenAI/Anthropic/Gemini）", Selftest::checkFrontToolResults);
         return out;
     }
 
@@ -924,6 +925,78 @@ public final class Selftest {
         out.write((Integer.toHexString(len) + "\r\n").getBytes("UTF-8"));
         out.write(data, off, len);
         out.write("\r\n".getBytes("UTF-8"));
+    }
+
+    /**
+     * 三个入口解析器都必须保留工具结果的 id（4.33.4 修过的真实问题）。
+     * 以前 OpenAI 的 tool 消息 content 非空时 id 会被丢掉，上游报
+     * "Unexpected tool_call_id: 空"；Gemini 的 functionResponse 更是固定写空。
+     */
+    private static String checkFrontToolResults() {
+        try {
+            JSONObject openAi = new JSONObject();
+            openAi.put("model", "m");
+            JSONArray msgs = new JSONArray();
+            JSONObject assistant = new JSONObject();
+            assistant.put("role", "assistant");
+            assistant.put("content", JSONObject.NULL);
+            assistant.put("tool_calls", new JSONArray().put(new JSONObject()
+                    .put("id", "call_1")
+                    .put("type", "function")
+                    .put("function", new JSONObject()
+                            .put("name", "bash")
+                            .put("arguments", "{}"))));
+            msgs.put(assistant);
+            msgs.put(new JSONObject()
+                    .put("role", "tool")
+                    .put("tool_call_id", "call_1")
+                    .put("content", "result text"));
+            openAi.put("messages", msgs);
+            Proto.Part tr = findPart(Fronts.OpenAiFront.parse(openAi), Proto.Part.TOOL_RESULT);
+            if (tr == null) return "OpenAI 工具结果没解析出来";
+            if (!"call_1".equals(tr.toolCallId)) return "OpenAI 工具结果丢了 tool_call_id";
+            if (!"result text".equals(tr.text)) return "OpenAI 工具结果正文丢了";
+
+            JSONObject anthropic = new JSONObject();
+            anthropic.put("model", "m");
+            anthropic.put("max_tokens", 16);
+            anthropic.put("messages", new JSONArray().put(new JSONObject()
+                    .put("role", "user")
+                    .put("content", new JSONArray().put(new JSONObject()
+                            .put("type", "tool_result")
+                            .put("tool_use_id", "toolu_1")
+                            .put("content", "结果")))));
+            Proto.Part atr = findPart(Fronts.AnthropicFront.parse(anthropic), Proto.Part.TOOL_RESULT);
+            if (atr == null) return "Anthropic 工具结果没解析出来";
+            if (!"toolu_1".equals(atr.toolCallId)) return "Anthropic 工具结果丢了 tool_use_id";
+
+            JSONObject gemini = new JSONObject();
+            gemini.put("contents", new JSONArray().put(new JSONObject()
+                    .put("role", "user")
+                    .put("parts", new JSONArray().put(new JSONObject()
+                            .put("functionResponse", new JSONObject()
+                                    .put("name", "bash")
+                                    .put("id", "fc_1")
+                                    .put("response", new JSONObject().put("result", "ok")))))));
+            Proto.Part gtr = findPart(Fronts.GeminiFront.parse("m", gemini), Proto.Part.TOOL_RESULT);
+            if (gtr == null) return "Gemini 工具结果没解析出来";
+            if (!"fc_1".equals(gtr.toolCallId)) return "Gemini 工具结果丢了 id";
+            if (!gtr.text.contains("ok")) return "Gemini 工具结果正文丢了";
+            return null;
+        } catch (Throwable t) {
+            return "入口解析回放异常：" + t;
+        }
+    }
+
+    private static Proto.Part findPart(Proto.Req req, String type) {
+        if (req == null) return null;
+        for (Proto.Msg m : req.messages) {
+            if (m == null || m.parts == null) continue;
+            for (Proto.Part p : m.parts) {
+                if (p != null && type.equals(p.type)) return p;
+            }
+        }
+        return null;
     }
 
     /* ------------------------------------------------------- 流式解析回放（4.39.0） */

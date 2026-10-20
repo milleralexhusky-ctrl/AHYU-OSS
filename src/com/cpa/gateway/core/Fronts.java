@@ -741,11 +741,19 @@ public final class Fronts {
                                         Proto.optString(inline, "data", "")));
                             } else if (fc != null) {
                                 JSONObject args = fc.optJSONObject("args");
-                                cm.add(Proto.Part.toolCall("call_" + i + "_" + k, Proto.optString(fc, "name", ""),
+                                /* 新版 Gemini 的 functionCall 可能带 id；带上它，下一轮
+                                   functionResponse 才能按 id 配对（没有就沿用本地生成的）。 */
+                                String fcId = Proto.optString(fc, "id", "call_" + i + "_" + k);
+                                cm.add(Proto.Part.toolCall(fcId, Proto.optString(fc, "name", ""),
                                         args == null ? "{}" : args.toString()));
                             } else if (fr != null) {
                                 Object resp = fr.opt("response");
-                                cm.add(Proto.Part.toolResult("", Proto.optString(fr, "name", ""), resp == null ? "" : String.valueOf(resp)));
+                                /* 以前这里固定写空 id，导致工具结果无法和调用配对；
+                                   有些客户端/上游会带 id，能读到就保留。 */
+                                String frId = Proto.optString(fr, "id",
+                                        Proto.optString(fr, "tool_call_id", ""));
+                                cm.add(Proto.Part.toolResult(frId, Proto.optString(fr, "name", ""),
+                                        resp == null ? "" : String.valueOf(resp)));
                             } else if (!t.isEmpty()) {
                                 cm.add(Proto.Part.text(t));
                             }

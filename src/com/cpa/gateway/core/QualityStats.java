@@ -37,6 +37,8 @@ public final class QualityStats {
         int nativeCall;     // 真吐了结构化调用
         int textCall;       // 把调用写在正文里（我们没接住）
         int hasHistory;     // 多轮工具历史
+        /** 每次请求的耗时（ms），用来算 p95；报告生成后随 Row 一起释放。 */
+        final List<Integer> latencies = new ArrayList<>();
 
         /** 可用率：ok / 有质量标记的总数。没有标记的旧行不算分母。 */
         double usableRate() {
@@ -48,6 +50,17 @@ public final class QualityStats {
         double toolFailRate() {
             if (withTools == 0) return -1;
             return (double) (withTools - nativeCall) / withTools;
+        }
+
+        /** 延迟 p95（ms）；没有样本返回 -1。只保留最近一段时间的样本，见 aggregate。 */
+        int p95() {
+            if (latencies.isEmpty()) return -1;
+            java.util.ArrayList<Integer> copy = new java.util.ArrayList<>(latencies);
+            java.util.Collections.sort(copy);
+            int idx = (int) Math.ceil(copy.size() * 0.95) - 1;
+            if (idx < 0) idx = 0;
+            if (idx >= copy.size()) idx = copy.size() - 1;
+            return copy.get(idx);
         }
     }
 
@@ -93,6 +106,8 @@ public final class QualityStats {
                         out.put(key, r);
                     }
                     r.total++;
+                    int latency = parseInt(c[4]);
+                    if (latency > 0) r.latencies.add(latency);
                     if ("ok".equals(quality)) r.ok++;
                     else if ("empty".equals(quality)) r.empty++;
                     else if ("cut".equals(quality)) r.cut++;
@@ -129,10 +144,11 @@ public final class QualityStats {
 
         StringBuilder sb = new StringBuilder();
         sb.append("按渠道（").append(days > 0 ? "最近 " + days + " 天" : "全部").append("）\n");
-        sb.append("渠道          样本  可用率  空回  截断  跑题  重发  工具失败\n");
+        sb.append("渠道          样本  p95    可用率  空回  截断  跑题  重发  工具失败\n");
         for (Row r : rows) {
             sb.append(pad(r.key, 14))
               .append(pad(String.valueOf(r.total), 6))
+              .append(pad(ms(r.p95()), 7))
               .append(pad(pct(r.usableRate()), 8))
               .append(pad(String.valueOf(r.empty), 6))
               .append(pad(String.valueOf(r.cut), 6))
@@ -151,13 +167,21 @@ public final class QualityStats {
                 Row r = mrows.get(i);
                 sb.append(pad(r.key, 26))
                   .append(pad(String.valueOf(r.total), 6))
+                  .append(pad(ms(r.p95()), 7))
                   .append(pad(pct(r.usableRate()), 8))
                   .append("工具失败 ").append(pct(r.toolFailRate()))
                   .append('\n');
             }
         }
-        sb.append("\n说明：可用率 = ok / 有质量标记的样本；工具失败 = 给了工具但没吐结构化调用。");
+        sb.append("\n说明：可用率 = ok / 有质量标记的样本；p95 = 该渠道/模型的 95 分位耗时；"
+                + "工具失败 = 给了工具但没吐结构化调用。");
         return sb.toString();
+    }
+
+    private static String ms(int v) {
+        if (v < 0) return "—";
+        if (v >= 1000) return String.format(java.util.Locale.US, "%.1fs", v / 1000.0);
+        return v + "ms";
     }
 
     /**
