@@ -10,6 +10,14 @@
 #                 x86_64 机器上如果 SDK 里没有再找 /usr/local/bin/aapt2）
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+# 私库里 .private/signing.env 保存签名口令与本机 SDK 路径；公库没有这个目录，
+# 所以这段在公库中什么都不做。私库 clone 下来直接 ./build.sh 就能用。
+if [ -z "${KS_STOREPASS:-}" ] && [ -f "$ROOT/.private/signing.env" ]; then
+    set -a
+    . "$ROOT/.private/signing.env"
+    set +a
+    echo "已加载私库签名配置：.private/signing.env"
+fi
 if [ -n "$ANDROID_SDK" ]; then
     SDK="$ANDROID_SDK"
 elif [ -d "$ROOT/android-sdk" ]; then
