@@ -1162,6 +1162,20 @@ public final class Server {
             writeJson(out, 200, cached);
             return;
         }
+        if (path.startsWith("/v1/models/") && "GET".equals(r.method)) {
+            String id = URLDecoder.decode(path.substring("/v1/models/".length()), "UTF-8");
+            if (!allModels().contains(id)) {
+                writeError(out, path, 404, "model not found: " + id);
+                return;
+            }
+            JSONObject m = new JSONObject();
+            m.put("id", id);
+            m.put("object", "model");
+            m.put("created", System.currentTimeMillis() / 1000);
+            m.put("owned_by", "ahyu");
+            writeJson(out, 200, m.toString());
+            return;
+        }
         if ("/panel".equals(path) || "/panel/".equals(path)) {
             writeRaw(out, 200, "text/html; charset=utf-8", panelHtml().getBytes(StandardCharsets.UTF_8), false);
             return;
@@ -1953,13 +1967,22 @@ public final class Server {
         }
         if (path.startsWith("/api/pull") || path.startsWith("/api/create")
                 || path.startsWith("/api/copy") || path.startsWith("/api/delete")
-                || path.startsWith("/api/blobs")) {
-            writeError(out, path, 501, "AHYU 只做推理转发，不支持管理远程模型库");
+                || path.startsWith("/api/blobs") || path.startsWith("/api/push")) {
+            handleOllamaManagement(r, out);
             return;
         }
         /* 非聊天 OpenAI 端点：原样转发给兼容上游，不做 canonical 转换。 */
         if ("/v1/embeddings".equals(path) && "POST".equals(r.method)) {
             proxyOpenAi(r, out, "embeddings", false);
+            return;
+        }
+        /* Cohere / Jina 形状的向量化与重排（很多中转同时提供 OpenAI 兼容入口） */
+        if ("/v1/embed".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "embed", false);
+            return;
+        }
+        if ("/v1/rerank".equals(path) && "POST".equals(r.method)) {
+            proxyOpenAi(r, out, "rerank", false);
             return;
         }
         if ("/v1/moderations".equals(path) && "POST".equals(r.method)) {
@@ -3824,6 +3847,49 @@ public final class Server {
             return;
         }
         writeError(out, r.path, 502, "上游没有可用响应");
+    }
+
+    /**
+     * Ollama 模型管理：只有配置了本机 Ollama 账号（baseUrl 含 :11434 或名称含 ollama）
+     * 才转发；否则明确 501，而不是假装管理了远程模型库。
+     */
+    private void handleOllamaManagement(Req r, OutputStream out) throws Exception {
+        Config.Provider target = null;
+        for (Config.Provider p : config.providers) {
+            if (!p.dispatchable()) continue;
+            String base = (p.baseUrl == null ? "" : p.baseUrl).toLowerCase(Locale.US);
+            String name = (p.name == null ? "" : p.name).toLowerCase(Locale.US);
+            if (base.contains(":11434") || name.contains("ollama")) {
+                target = p;
+                break;
+            }
+        }
+        if (target == null) {
+            writeError(out, r.path, 501,
+                    "没有配置本机 Ollama 账号；模型管理只代理到本机 Ollama（:11434）");
+            return;
+        }
+        try {
+            String base = Upstreams.trimSlash(target.baseUrl);
+            if (base.endsWith("/v1")) base = base.substring(0, base.length() - 3);
+            String url = base + r.path;
+            if (!r.query.isEmpty()) url = url + "?" + r.query;
+            Map<String, String> headers = new HashMap<>();
+            if (target.apiKey != null && !target.apiKey.isEmpty()) {
+                headers.put("Authorization", "Bearer " + target.apiKey);
+            }
+            String ct = r.header("content-type");
+            if (ct.isEmpty()) ct = "application/json";
+            byte[] payload = r.bodyBytes != null ? r.bodyBytes
+                    : r.body.getBytes(StandardCharsets.UTF_8);
+            Http.Resp resp = Http.call(r.method, url, headers, payload, ct, 15000, 300000, false);
+            String outType = r.path.startsWith("/api/pull") || r.path.startsWith("/api/push")
+                    ? "application/x-ndjson" : "application/json";
+            writeRaw(out, resp.code, outType,
+                    resp.body.getBytes(StandardCharsets.UTF_8), false);
+        } catch (Throwable t) {
+            writeError(out, r.path, 502, "Ollama 管理转发失败：" + t.getMessage());
+        }
     }
 
     /** Ollama `/api/embed` 与旧版 `/api/embeddings`。 */

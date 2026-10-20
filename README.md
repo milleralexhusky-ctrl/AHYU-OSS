@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.46.0**（versionCode 639，见 `version.properties`）
+- 当前版本：**4.47.0**（versionCode 640，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -21,12 +21,15 @@
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` / `:countTokens` | Gemini |
 | `POST /api/chat`、`/api/generate`、`/api/embed`、`GET /api/tags`、`/api/show` 等 | Ollama 原生协议（NDJSON） |
 | `POST /v1/embeddings`、`/v1/moderations`、`/v1/images/generations` | OpenAI 非聊天端点（原样转发） |
+| `POST /v1/rerank`、`/v1/embed` | Cohere / Jina 形状的重排与向量化 |
+| `GET /v1/models/{id}` | 单个模型查询 |
 | `POST /v1/audio/transcriptions`、`/v1/audio/speech` | 语音转写 / 合成（multipart / 二进制） |
 | `POST /v1beta/models/{model}:embedContent` / `:batchEmbedContents` | Gemini 向量化 |
 | `/v1/assistants`、`/v1/threads`、`.../messages`、`.../runs` | OpenAI Assistants / Threads（含 requires_action 工具闭环） |
 | `ws://127.0.0.1:8321/v1/realtime` | OpenAI Realtime（文本；音频未支持） |
 | `/openai/deployments/{deployment}/chat/completions` | Azure OpenAI 路径 |
 | `GET /v1/models`、`GET /health`、`GET /v1/capacity` | 模型目录、健康、容量 |
+| `POST /api/pull`、`/api/delete` 等 | 代理到本机 Ollama（:11434）的模型管理 |
 | `GET /panel` | 手机浏览器里的状态面板 |
 
 **账号与渠道**：WorkBuddy（CodeBuddy）、Trae、Loomy、Kimi、Antigravity、Claude、
