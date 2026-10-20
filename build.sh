@@ -67,7 +67,27 @@ mkdir -p $OUT/compiled $OUT/gen $OUT/classes $OUT/dex
 DEBUG_SRC=src/com/cpa/gateway/core/Debug.java
 cp $DEBUG_SRC $OUT/Debug.java.bak
 restore_debug() { cp $OUT/Debug.java.bak $DEBUG_SRC 2>/dev/null || true; }
-trap restore_debug EXIT INT TERM
+
+# 构建期私密常量：公库为空，私库从 .private/signing.env 注入。
+# 和 Debug.java 一样，构建结束必须还原，否则密钥会被写进源码、下次提交就漏进公库。
+SECRETS_SRC=src/com/cpa/gateway/core/BuildSecrets.java
+cp $SECRETS_SRC $OUT/BuildSecrets.java.bak
+restore_secrets() { cp $OUT/BuildSecrets.java.bak $SECRETS_SRC 2>/dev/null || true; }
+restore_all() { restore_debug; restore_secrets; }
+trap restore_all EXIT INT TERM
+
+if [ -n "${ANTIGRAVITY_CLIENT_SECRET:-}" ]; then
+  # 只允许安全字符，避免把 sed 分隔符/引号带进生成的 Java 字面量。
+  case "$ANTIGRAVITY_CLIENT_SECRET" in
+    *[!A-Za-z0-9._~-]*)
+      echo "[错误] ANTIGRAVITY_CLIENT_SECRET 含有不支持的字符"; exit 1 ;;
+  esac
+  sed -i "s|static final String ANTIGRAVITY_CLIENT_SECRET = .*|static final String ANTIGRAVITY_CLIENT_SECRET = \"$ANTIGRAVITY_CLIENT_SECRET\";|" \
+    $SECRETS_SRC
+  echo "已注入 Antigravity OAuth Client Secret（来自构建环境）"
+else
+  echo "未提供 ANTIGRAVITY_CLIENT_SECRET：本包无法完成 Antigravity 账号登录（公库默认行为）"
+fi
 
 echo "构建版本 $VERSION_NAME ($VERSION_CODE)"
 echo "[1/6] aapt2 compile"

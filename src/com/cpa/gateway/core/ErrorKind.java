@@ -26,6 +26,7 @@ final class ErrorKind {
     static final String AUTH = "auth";      // 凭证失效
     static final String CHANNEL = "channel";// 渠道校验（11128，改形状无效）
     static final String BADREQ = "badreq";  // 请求非法（我们自己的问题）
+    static final String MODEL = "model";    // 模型行为/接入问题（不是账号问题）
     static final String TIMEOUT = "timeout";
     static final String NET = "net";        // 连不上
     static final String EMPTY = "empty";    // 上游回了但没内容
@@ -37,6 +38,11 @@ final class ErrorKind {
     /** 从一个异常归类。没有异常但结果为空时传 EMPTY。 */
     static String of(Throwable t) {
         if (t == null) return NONE;
+
+        /* 模型行为/接入问题：既不是"号坏了"，也不是"请求非法"。
+           放在 InvalidRequest 之前：上游 400 里带 model not found 时要归到模型侧。 */
+        FailScope scope = FailScope.of(t);
+        if (scope == FailScope.MODEL_BAD || scope == FailScope.MODEL_ACCESS) return MODEL;
 
         /* InvalidRequest = 我们发错了，和渠道无关 */
         if (t instanceof InvalidRequest) return BADREQ;
@@ -75,6 +81,7 @@ final class ErrorKind {
             case AUTH: return "鉴权";
             case CHANNEL: return "渠道校验";
             case BADREQ: return "请求非法";
+            case MODEL: return "模型问题";
             case TIMEOUT: return "超时";
             case NET: return "连不上";
             case EMPTY: return "空响应";

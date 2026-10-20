@@ -80,6 +80,7 @@ public final class Selftest {
         add(out, "同协议未知参数透传（top_k/service_tier/metadata）", Selftest::checkExtraBody);
         add(out, "响应保真透传（logprobs / 多 choice / 正文不被改写）", Selftest::checkRawFidelity);
         add(out, "top_k 跨协议等价翻译（Anthropic ↔ Gemini）", Selftest::checkTopK);
+        add(out, "失败作用域（坏模型 / 坏号 / 坏请求）", Selftest::checkFailScope);
         return out;
     }
 
@@ -1179,6 +1180,45 @@ public final class Selftest {
             return null;
         } catch (Throwable t) {
             return "top_k 翻译自检异常：" + t;
+        }
+    }
+
+    /**
+     * 失败作用域（4.50.2）：坏模型、坏号、坏请求必须分开。
+     *
+     * 这条同时锁住三件事：
+     *  · 坏工具参数是模型行为问题 → 纯调用立刻停，轮换时跳过这个模型；
+     *  · 模型不存在/不支持 → 轮换时跳过该模型，但纯调用可以再换一个号确认；
+     *  · 请求本身不合法 → 换号换模型都没用，直接停。
+     */
+    private static String checkFailScope() {
+        try {
+            FailScope bad = FailScope.of(new ToolFix.BadToolCall("bash", "{oops"));
+            if (bad != FailScope.MODEL_BAD) return "坏工具参数没归到模型行为";
+            if (!bad.stopDirect()) return "坏工具参数在纯调用时还在换号";
+            if (!bad.skipModelInRotation()) return "坏工具参数在轮换时没跳过该模型";
+
+            FailScope access = FailScope.of(new InvalidRequest(400,
+                    "upstream HTTP 400 model gpt-x service info not found"));
+            if (access != FailScope.MODEL_ACCESS) return "model not found 没归到模型接入";
+            if (access.stopDirect()) return "model not found 不该在第一个账号就放弃（可能只是该号没有权限）";
+            if (!access.skipModelInRotation()) return "model not found 在轮换时没跳过该模型";
+
+            FailScope req = FailScope.of(new InvalidRequest(400,
+                    "请求不合规（我们自己这侧，不是渠道问题）：tool_call 缺少 id"));
+            if (req != FailScope.REQUEST) return "请求不合规没归到请求问题";
+            if (!req.stopDirect() || !req.stopRotation()) return "请求问题还在换号/换模型";
+
+            FailScope acct = FailScope.of(new Throttled(429, 1000L, "rate", "限流"));
+            if (acct != FailScope.ACCOUNT) return "限流没归到账号侧";
+            if (acct.stopDirect()) return "限流时纯调用不该立刻放弃（换号可以继续）";
+
+            FailScope tr = FailScope.of(new java.io.IOException("connection timed out"));
+            if (tr != FailScope.TRANSIENT) return "超时没归到暂时性失败";
+            if (tr.stopDirect()) return "超时不该停止换号";
+            return null;
+        } catch (Throwable t) {
+            return "失败作用域自检异常：" + t;
         }
     }
 

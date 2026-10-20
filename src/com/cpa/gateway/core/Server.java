@@ -2605,8 +2605,22 @@ public final class Server {
         } else {
             JSONObject e = new JSONObject();
             e.put("message", message);
-            e.put("type", status == 401 ? "authentication_error" : "api_error");
-            e.put("code", status == 401 ? "invalid_api_key" : "error");
+            /* 错误类别也反映到 type/code：客户端用 OpenAI SDK 时，
+               "模型坏了"和"账号坏了"至少能在结构上分开，不必去读中文文案。 */
+            String type = "api_error";
+            String code = "error";
+            if (status == 401) {
+                type = "authentication_error";
+                code = "invalid_api_key";
+            } else if ("model".equals(kind)) {
+                type = "model_error";
+                code = "model_error";
+            } else if ("badreq".equals(kind)) {
+                type = "invalid_request_error";
+                code = "invalid_request";
+            }
+            e.put("type", type);
+            e.put("code", code);
             if (kind != null && !kind.isEmpty()) e.put("kind", kind);
             o.put("error", e);
         }
@@ -3120,6 +3134,22 @@ public final class Server {
         } else if (!(err instanceof Throttled)) {
             Router.recordFail(key, String.valueOf(err.getMessage()));
         }
+    }
+
+    /**
+     * 非流式路径的最终失败：模型/请求问题用明确的 4xx/404 回给客户端，
+     * 不要走顶层 500，更不要伪装成"上游故障"。
+     *
+     * @return true 表示已经写出响应；false 表示调用方按原逻辑继续抛
+     */
+    private boolean writeScopedFailure(OutputStream out, Req r, Throwable last) throws Exception {
+        if (last == null) return false;
+        FailScope scope = FailScope.of(last);
+        if (!scope.modelScoped() && scope != FailScope.REQUEST) return false;
+        int code = scope == FailScope.MODEL_ACCESS ? 404 : 400;
+        if (last instanceof InvalidRequest) code = ((InvalidRequest) last).code;
+        writeError(out, r.path, code, String.valueOf(last.getMessage()), scope.kind());
+        return true;
     }
 
     private String upstreamModel(Config.Provider p, String model) {
@@ -3704,6 +3734,21 @@ public final class Server {
             throw t;
         } catch (Exception e) {
             String why = Upstreams.shortenPublic(String.valueOf(e.getMessage()));
+            /* 失败作用域（4.50.2）：坏模型 / 坏请求不能写成"这个账号坏了"。
+               以前这里对所有非暂时性异常都写 p.lastError，于是模型吐一次坏工具参数，
+               账号详情里就挂上"最近调用失败"，看起来像号挂了。 */
+            FailScope scope = FailScope.of(e);
+            if (scope == FailScope.MODEL_BAD && p != null && upstreamModel != null) {
+                /* 模型行为问题记进工具画像：以后带工具的请求会绕开它，
+                   而不是把同模型的其它账号逐个打一遍。 */
+                ToolAbility.note(p, upstreamModel, false);
+            }
+            if (scope == FailScope.MODEL_BAD || scope == FailScope.MODEL_ACCESS
+                    || scope == FailScope.REQUEST) {
+                Log.w("失败属于" + (scope == FailScope.REQUEST ? "请求" : "模型")
+                        + "问题，不标记账号不可用：" + (p == null ? "?" : p.name) + " · " + why);
+                throw e;
+            }
             // 暂时性失败（上游限流 / 超时 / 网络抖动）**不写 lastError**。
             //
             // 为什么：unusableReason() 会把"最近 30 分钟有过 lastError"的账号标成
@@ -3859,10 +3904,13 @@ public final class Server {
                 if (!(e instanceof Throttled)) {
                     Log.w("ollama 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                 }
+                if (FailScope.of(e).stopDirect()) break;
             }
         }
         markResponseFailed(out);
-        writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+        if (!writeScopedFailure(out, r, last)) {
+            writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+        }
     }
 
     private static boolean openAiCompatible(Config.Provider p) {
@@ -4217,10 +4265,13 @@ public final class Server {
                 if (!(e instanceof Throttled)) {
                     Log.w("completions 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                 }
+                if (FailScope.of(e).stopDirect()) break;
             }
         }
         markResponseFailed(out);
-        writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+        if (!writeScopedFailure(out, r, last)) {
+            writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+        }
     }
 
     private static JSONObject renderLegacyCompletion(String model, Fronts.Collector c) throws Exception {
@@ -4778,14 +4829,26 @@ public final class Server {
                         Log.w("流已开始输出，无法换号，直接报错");
                         break;
                     }
+                    /* 纯调用（这里就是点名模型）：模型行为坏了或请求不合法，
+                       换同模型的其它账号也不会好，别逐个把账号打成失败。 */
+                    if (FailScope.of(e).stopDirect()) {
+                        Log.w("纯调用失败属于模型/请求问题，停止换号重试：" + req.model);
+                        break;
+                    }
                     if (i + 1 < tries) Log.i("流尚未输出，换下一个候选重试：" + req.model);
                 }
             }
             if (last != null) {
                 markResponseFailed(out);
                 Log.w("upstream error（" + tries + " 个候选都失败）: " + last.getMessage());
+                FailScope sc = FailScope.of(last);
+                Conn cc = connFor(out);
+                if (cc != null) cc.errorKind = sc.kind();
                 JSONObject err = new JSONObject();
-                err.put("error", new JSONObject().put("message", String.valueOf(last.getMessage())).put("type", "upstream_error"));
+                err.put("error", new JSONObject()
+                        .put("message", String.valueOf(last.getMessage()))
+                        .put("type", sc.clientType())
+                        .put("code", sc.kind()));
                 try {
                     w.write("data: ");
                     w.write(err.toString());
@@ -4826,10 +4889,17 @@ public final class Server {
                     if (!(e instanceof Throttled)) {
                         Log.w("直连第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
+                    if (FailScope.of(e).stopDirect()) {
+                        Log.w("纯调用失败属于模型/请求问题，停止换号重试：" + req.model);
+                        break;
+                    }
                     if (i + 1 < tries) Log.i("非流式可换号，重试下一个候选：" + req.model);
                 }
             }
-            throw last == null ? new IllegalStateException("没有可用候选") : last;
+            if (!writeScopedFailure(out, r, last)) {
+                throw last == null ? new IllegalStateException("没有可用候选") : last;
+            }
+            return;
         }
     }
 
@@ -5065,8 +5135,14 @@ public final class Server {
 
         if (!req.stream) {
             Exception last = null;
-            for (int i = 0; i < tries; i++) {
+            /* 轮换模式：坏模型只跳过这个模型，别把同模型的其它账号逐个打一遍；
+               坏请求直接结束整轮（换模型也没用）。 */
+            java.util.Set<String> skipModels = new java.util.HashSet<>();
+            int attempts = 0;
+            for (int i = 0; i < cands.size() && attempts < tries; i++) {
                 Router.Pick c = cands.get(i);
+                if (skipModels.contains(c.model)) continue;
+                attempts++;
                 long t0 = System.currentTimeMillis();
                 try {
                     Fronts.Collector col = new Fronts.Collector();
@@ -5095,7 +5171,22 @@ public final class Server {
                     }
                     Log.w("虚拟模型 " + req.model + " 第 " + (i + 1) + " 个候选失败（"
                             + c.key() + "）：" + e.getMessage());
+                    FailScope sc = FailScope.of(e);
+                    if (sc.stopRotation()) {
+                        last = e;
+                        break;
+                    }
+                    if (sc.skipModelInRotation()) {
+                        skipModels.add(c.model);
+                        Log.w("模型问题，本轮跳过 " + c.model + "，换其它模型："
+                                + Upstreams.shortenPublic(String.valueOf(e.getMessage())));
+                    }
                 }
+            }
+            /* 请求本身不合法时不装成"兜底回答"：换个模型也过不了，直接告诉客户端。 */
+            if (last != null && FailScope.of(last) == FailScope.REQUEST) {
+                writeScopedFailure(out, r, last);
+                return;
             }
             writeFallback(out, r, req, "虚拟模型 " + req.model + " 所有候选都失败："
                     + (last == null ? "" : last.getMessage()));
@@ -5103,8 +5194,12 @@ public final class Server {
         }
 
         Exception last = null;
-        for (int i = 0; i < tries; i++) {
+        java.util.Set<String> skipModels = new java.util.HashSet<>();
+        int attempts = 0;
+        for (int i = 0; i < cands.size() && attempts < tries; i++) {
             Router.Pick c = cands.get(i);
+            if (skipModels.contains(c.model)) continue;
+            attempts++;
             DeferredWriter dw = new DeferredWriter(out);
             BufferedWriter w = new BufferedWriter(dw, 8192);
             Fronts.OpenAiFront.Streamer streamer = new Fronts.OpenAiFront.Streamer(w, req.model);
@@ -5151,9 +5246,23 @@ public final class Server {
                     }
                     return;
                 }
+                FailScope sc = FailScope.of(e);
+                if (sc.stopRotation()) {
+                    last = e;
+                    break;
+                }
+                if (sc.skipModelInRotation()) {
+                    skipModels.add(c.model);
+                    Log.w("模型问题，本轮跳过 " + c.model + "，换其它模型："
+                            + Upstreams.shortenPublic(String.valueOf(e.getMessage())));
+                }
                 Log.w("虚拟模型 " + req.model + " 第 " + (i + 1) + " 个候选失败（"
                         + c.key() + "），未提交，换下一个：" + e.getMessage());
             }
+        }
+        if (last != null && FailScope.of(last) == FailScope.REQUEST) {
+            writeScopedFailure(out, r, last);
+            return;
         }
         // 一个都没成，而且什么都还没写出去 → 正常回错误
         writeFallback(out, r, req, "虚拟模型 " + req.model + " 所有候选都失败："
@@ -5353,9 +5462,12 @@ public final class Server {
                     if (!(e instanceof Throttled)) {
                         Log.w("Anthropic 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
+                    if (FailScope.of(e).stopDirect()) break;
                 }
             }
-            throw last == null ? new IllegalStateException("没有可用候选") : last;
+            if (!writeScopedFailure(out, r, last)) {
+                throw last == null ? new IllegalStateException("没有可用候选") : last;
+            }
         }
     }
 
@@ -5440,9 +5552,12 @@ public final class Server {
                     if (!(e instanceof Throttled)) {
                         Log.w("Gemini 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
                     }
+                    if (FailScope.of(e).stopDirect()) break;
                 }
             }
-            throw last == null ? new IllegalStateException("没有可用候选") : last;
+            if (!writeScopedFailure(out, r, last)) {
+                throw last == null ? new IllegalStateException("没有可用候选") : last;
+            }
         }
     }
 
@@ -5909,9 +6024,13 @@ public final class Server {
                     if (!(e instanceof Throttled)) {
                         Log.w("Responses 第 " + (i + 1) + " 个候选失败（" + cp.name + "）：" + e.getMessage());
                     }
+                    if (FailScope.of(e).stopDirect()) break;
                 }
             }
-            if (last != null) throw last;
+            if (last != null) {
+                if (!writeScopedFailure(out, r, last)) throw last;
+                return;
+            }
             JSONObject out2 = new JSONObject();
             out2.put("id", respId);
             out2.put("object", "response");

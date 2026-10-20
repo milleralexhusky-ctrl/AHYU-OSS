@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.50.1**（versionCode 644，见 `version.properties`）
+- 当前版本：**4.50.2**（versionCode 645，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -40,6 +40,11 @@ OpenAI/Anthropic/Gemini 兼容中转。
 **选路与稳定性**：`auto` / `auto-code` / `auto-long` / `auto-race` 虚拟模型；
 按成功率、延迟、成本、额度、工具能力打分；首字节前自动换号；限流指数退避、
 熔断与半开试探、渠道校验单独回避、本地限额与并发槽。
+
+**两种模式要分清**：点名模型（含 `账号/模型` 前缀）是**纯调用**——只换同模型的账号，
+模型行为坏了或请求不合法就立刻返回明确的 4xx，不偷偷换模型；`auto*` 是**轮换**——
+可以换号也可以换模型。坏模型、坏号、坏请求由 `FailScope` 分开处理，模型问题不会写成
+账号不可用（见 `docs/changelog/AHYU-4.50.2-登录与失败作用域.md`）。
 
 **观测**：每次推理写一行 `usage.tsv`（22 列：来源、工具数、响应形态、解析结果、
 质量档、上游响应 ID、会话 ID、错误归类、工具名……）；日志落盘并滚动；
@@ -156,7 +161,8 @@ docs/research/             协议调查脚本
 
 - WorkBuddy 3 的 `11128 request illegal`（渠道校验）到 4.37.0 仍未证实根因；
   4.36.5–4.36.8 已按官方客户端补齐头与 body 派生字段，但缺少下一次真机回包证据。
-- `Antigravity.CLIENT_SECRET` 是占位串，使用该渠道前需要填入自己的 OAuth Client Secret。
+- Antigravity 的 OAuth Client Secret 由私库构建时注入（`.private/signing.env` 的
+  `ANTIGRAVITY_CLIENT_SECRET`）；用公库源码自行构建时该项为空，登录会停在 token 交换。
 - 多数渠道依赖网页/客户端私有协议，上游改版后可能失效；这类问题优先看
   `docs/changelog` 与 `rawcap.log`。
 - 仅供自有账号使用。请遵守各服务商的条款；本项目不分发任何账号或密钥。
