@@ -1,10 +1,10 @@
 # AHYU — Android AI 网关
 
 把多家 AI 服务商的能力聚合到一台 Android 手机上，让本机（或同一局域网）以
-**OpenAI / Anthropic / Gemini 兼容接口**访问这些账号。
+**OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.42.0**（versionCode 635，见 `version.properties`）
+- 当前版本：**4.43.0**（versionCode 636，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -15,17 +15,19 @@
 | 入口 | 说明 |
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI Chat Completions（含流式、工具调用） |
+| `POST /v1/completions` | OpenAI 旧版 Completions（含流式） |
 | `POST /v1/responses` | OpenAI Responses（含流式工具调用） |
 | `POST /v1/messages`、`/v1/messages/count_tokens` | Anthropic Messages |
-| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Gemini |
+| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` / `:countTokens` | Gemini |
+| `POST /api/chat`、`/api/generate`、`GET /api/tags`、`/api/show` 等 | Ollama 原生协议（NDJSON） |
+| `/openai/deployments/{deployment}/chat/completions` | Azure OpenAI 路径 |
 | `GET /v1/models`、`GET /health`、`GET /v1/capacity` | 模型目录、健康、容量 |
 | `GET /panel` | 手机浏览器里的状态面板 |
 
 **账号与渠道**：WorkBuddy（CodeBuddy）、Trae、Loomy、Kimi、Antigravity、Claude、
 ChatGPT/Codex、DeepSeek、豆包、Cline、xAI、Kilo、OVH，以及自定义
-OpenAI/Anthropic/Gemini 兼容中转，以及本机 llama.cpp / Ollama（回环、无认证）。
-登录方式按渠道支持 OAuth、设备码、WebView、API Key 等；每个账号可单独选择
-认证头风格（Bearer / x-api-key / 两者 / 不认证）。
+OpenAI/Anthropic/Gemini 兼容中转。
+登录方式按渠道支持 OAuth、设备码、WebView、API Key 等。
 
 **选路与稳定性**：`auto` / `auto-code` / `auto-long` / `auto-race` 虚拟模型；
 按成功率、延迟、成本、额度、工具能力打分；首字节前自动换号；限流指数退避、

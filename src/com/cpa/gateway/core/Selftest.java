@@ -76,7 +76,7 @@ public final class Selftest {
         add(out, "流式解析回放（OpenAI/Anthropic/Gemini）", Selftest::checkStreamReplay);
         add(out, "HTTP 请求回放（chunked 中文/多请求对齐）", Selftest::checkHttpRequestReplay);
         add(out, "入口解析保留工具结果 id（OpenAI/Anthropic/Gemini）", Selftest::checkFrontToolResults);
-        add(out, "上游认证头按账号选择（Bearer/x-api-key/none）", Selftest::checkAuthStyles);
+        add(out, "Ollama 请求翻译与响应形状", Selftest::checkOllamaProtocol);
         return out;
     }
 
@@ -989,45 +989,58 @@ public final class Selftest {
         }
     }
 
-    /** 认证头风格：第三方中转只认一种时，不能把另一种硬塞过去。 */
-    private static String checkAuthStyles() {
-        Config.Provider p = new Config.Provider();
-        p.apiKey = "k";
+    /** Ollama 是本地生态最常用的入口：翻译、工具配对、两种响应形状都要对。 */
+    private static String checkOllamaProtocol() {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("model", "m");
+            JSONArray msgs = new JSONArray();
+            msgs.put(new JSONObject().put("role", "system").put("content", "sys"));
+            msgs.put(new JSONObject().put("role", "user").put("content", "hi")
+                    .put("images", new JSONArray().put("aGVsbG8=")));
+            msgs.put(new JSONObject().put("role", "assistant").put("content", "")
+                    .put("tool_calls", new JSONArray().put(new JSONObject()
+                            .put("function", new JSONObject()
+                                    .put("name", "bash")
+                                    .put("arguments", new JSONObject().put("cmd", "ls"))))));
+            msgs.put(new JSONObject().put("role", "tool").put("tool_name", "bash")
+                    .put("content", "ok"));
+            body.put("messages", msgs);
+            Proto.Req req = Fronts.OllamaFront.parse(body);
+            if (!"sys".equals(req.system)) return "Ollama system 没进 req.system";
+            if (findPart(req, Proto.Part.IMAGE) == null) return "Ollama images 没翻译成图片块";
+            Proto.Part call = findPart(req, Proto.Part.TOOL_CALL);
+            Proto.Part result = findPart(req, Proto.Part.TOOL_RESULT);
+            if (call == null || result == null) return "Ollama 工具调用/结果没解析出来";
+            if (call.toolCallId == null || call.toolCallId.isEmpty()) return "Ollama 工具调用 id 为空";
+            if (!call.toolCallId.equals(result.toolCallId)) {
+                return "Ollama 工具结果 id 没和调用配对：" + call.toolCallId + " vs " + result.toolCallId;
+            }
 
-        p.authStyle = Config.AUTH_BEARER;
-        java.util.Map<String, String> h = new java.util.HashMap<>();
-        Upstreams.applyAuth(h, p);
-        if (!"Bearer k".equals(h.get("Authorization"))) return "Bearer 没写对：" + h;
-        if (h.containsKey("x-api-key")) return "Bearer 模式不该带 x-api-key";
+            Fronts.Collector c = new Fronts.Collector();
+            c.text("he");
+            c.text("llo");
+            c.stop = "stop";
+            c.usage.input = 3;
+            c.usage.output = 2;
+            JSONObject chat = Fronts.OllamaFront.render("m", c);
+            if (!"hello".equals(chat.optJSONObject("message").optString("content"))) {
+                return "Ollama chat 渲染正文不对";
+            }
+            if (!chat.optBoolean("done")) return "Ollama chat 没标 done";
+            JSONObject gen = Fronts.OllamaFront.renderGenerate("m", c);
+            if (!"hello".equals(gen.optString("response"))) return "Ollama generate 渲染正文不对";
 
-        p.authStyle = Config.AUTH_X_API_KEY;
-        h.clear();
-        Upstreams.applyAuth(h, p);
-        if (!"k".equals(h.get("x-api-key"))) return "x-api-key 没写对：" + h;
-        if (h.containsKey("Authorization")) return "x-api-key 模式不该带 Authorization";
-
-        p.authStyle = Config.AUTH_BOTH;
-        h.clear();
-        Upstreams.applyAuth(h, p);
-        if (!"k".equals(h.get("x-api-key")) || !"Bearer k".equals(h.get("Authorization"))) {
-            return "both 模式缺头：" + h;
+            /* 工具调用的响应必须带 function.name/arguments 对象。 */
+            Fronts.Collector tc = new Fronts.Collector();
+            tc.toolCalls.add(Proto.Part.toolCall("call_1", "bash", "{\"cmd\":\"ls\"}"));
+            JSONObject withTool = Fronts.OllamaFront.render("m", tc);
+            JSONArray arr = withTool.optJSONObject("message").optJSONArray("tool_calls");
+            if (arr == null || arr.length() != 1) return "Ollama 工具调用响应没渲染出来";
+            return null;
+        } catch (Throwable t) {
+            return "Ollama 协议自检异常：" + t;
         }
-
-        p.authStyle = Config.AUTH_NONE;
-        h.clear();
-        Upstreams.applyAuth(h, p);
-        if (!h.isEmpty()) return "none 模式不该写认证头：" + h;
-
-        /* 老配置没有 authStyle：Anthropic 仍按 both，其它按 Bearer。 */
-        Config.Provider old = new Config.Provider();
-        old.apiKey = "k";
-        old.type = Config.TYPE_ANTHROPIC;
-        h.clear();
-        Upstreams.applyAuth(h, old);
-        if (!h.containsKey("x-api-key") || !h.containsKey("Authorization")) {
-            return "老 Anthropic 配置没有沿用 both：" + h;
-        }
-        return null;
     }
 
     private static Proto.Part findPart(Proto.Req req, String type) {

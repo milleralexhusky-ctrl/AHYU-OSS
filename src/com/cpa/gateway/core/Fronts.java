@@ -435,6 +435,304 @@ public final class Fronts {
         }
     }
 
+    /* ----------------------------------------------------- Ollama front-end */
+
+    /**
+     * Ollama 原生协议（4.43.0）。
+     *
+     * 为什么需要：本地模型生态里大量客户端（Open WebUI、Ollama SDK、各种桌面壳）
+     * 只会说 `/api/chat` + NDJSON。它们不是不接受 OpenAI，而是**默认**按 Ollama
+     * 的协议连接；不给这个入口，用户就得改客户端或加一层转换。
+     *
+     * 做法：把 Ollama 请求翻译成 OpenAI body，复用已经稳定的
+     * {@link OpenAiFront#parse}。工具调用 id 在 Ollama 历史里可能缺失，
+     * 这里按顺序补齐，保证 RequestCheck 的配对校验能过。
+     */
+    public static final class OllamaFront {
+
+        private OllamaFront() {
+        }
+
+        public static Proto.Req parse(JSONObject body) throws Exception {
+            return OpenAiFront.parse(toOpenAiBody(body));
+        }
+
+        public static JSONObject toOpenAiBody(JSONObject body) throws Exception {
+            JSONObject out = new JSONObject();
+            out.put("model", Proto.optString(body, "model", ""));
+            /* Ollama 的 stream 默认是 true（不是 OpenAI 的 false）。 */
+            out.put("stream", body.optBoolean("stream", true));
+
+            JSONObject opts = body.optJSONObject("options");
+            if (opts != null) {
+                if (opts.has("temperature")) out.put("temperature", opts.opt("temperature"));
+                if (opts.has("top_p")) out.put("top_p", opts.opt("top_p"));
+                if (opts.has("num_predict")) out.put("max_tokens", opts.opt("num_predict"));
+                Object stop = opts.opt("stop");
+                if (stop != null) out.put("stop", stop);
+            }
+
+            JSONArray msgs = body.optJSONArray("messages");
+            JSONArray outMsgs = new JSONArray();
+            java.util.Map<String, java.util.ArrayDeque<String>> pendingIds =
+                    new java.util.HashMap<>();
+            int seq = 0;
+            if (msgs != null) {
+                for (int i = 0; i < msgs.length(); i++) {
+                    JSONObject m = msgs.optJSONObject(i);
+                    if (m == null) continue;
+                    String role = Proto.optString(m, "role", "user");
+                    JSONObject om = new JSONObject().put("role", role);
+
+                    Object content = m.opt("content");
+                    String text = content instanceof String ? (String) content : "";
+                    JSONArray images = m.optJSONArray("images");
+                    if (images != null && images.length() > 0) {
+                        JSONArray parts = new JSONArray();
+                        if (!text.isEmpty()) {
+                            parts.put(new JSONObject().put("type", "text").put("text", text));
+                        }
+                        for (int k = 0; k < images.length(); k++) {
+                            String b64 = images.optString(k, "");
+                            if (b64.isEmpty()) continue;
+                            String mime = b64.startsWith("/9j/") ? "image/jpeg" : "image/png";
+                            parts.put(new JSONObject()
+                                    .put("type", "image_url")
+                                    .put("image_url", new JSONObject()
+                                            .put("url", "data:" + mime + ";base64," + b64)));
+                        }
+                        om.put("content", parts);
+                    } else if (content != null) {
+                        om.put("content", content);
+                    }
+
+                    JSONArray tcs = m.optJSONArray("tool_calls");
+                    if (tcs != null && tcs.length() > 0) {
+                        JSONArray otcs = new JSONArray();
+                        for (int k = 0; k < tcs.length(); k++) {
+                            JSONObject tc = tcs.optJSONObject(k);
+                            if (tc == null) continue;
+                            JSONObject fn = tc.optJSONObject("function");
+                            String name = fn == null ? "" : Proto.optString(fn, "name", "");
+                            Object args = fn == null ? null : fn.opt("arguments");
+                            String argsStr = args instanceof String ? (String) args
+                                    : (args == null ? "{}" : args.toString());
+                            String id = Proto.optString(tc, "id", "");
+                            if (id.isEmpty()) id = "call_" + (seq++);
+                            java.util.ArrayDeque<String> q = pendingIds.get(name);
+                            if (q == null) {
+                                q = new java.util.ArrayDeque<>();
+                                pendingIds.put(name, q);
+                            }
+                            q.addLast(id);
+                            otcs.put(new JSONObject()
+                                    .put("id", id)
+                                    .put("type", "function")
+                                    .put("function", new JSONObject()
+                                            .put("name", name)
+                                            .put("arguments", argsStr)));
+                        }
+                        om.put("tool_calls", otcs);
+                        if (!om.has("content")) om.put("content", JSONObject.NULL);
+                    }
+
+                    if ("tool".equals(role)) {
+                        String id = Proto.optString(m, "tool_call_id", "");
+                        String name = Proto.optString(m, "tool_name",
+                                Proto.optString(m, "name", ""));
+                        if (id.isEmpty()) {
+                            java.util.ArrayDeque<String> q = pendingIds.get(name);
+                            if (q != null) id = q.pollFirst();
+                            if (id == null) id = "";
+                        }
+                        om.put("tool_call_id", id);
+                        if (!name.isEmpty()) om.put("name", name);
+                    }
+                    outMsgs.put(om);
+                }
+            }
+            out.put("messages", outMsgs);
+            JSONArray tools = body.optJSONArray("tools");
+            if (tools != null) out.put("tools", tools);
+            return out;
+        }
+
+        /** 非流式响应：把 Collector 渲染成 Ollama 的 /api/chat 形状。 */
+        public static JSONObject render(String model, Collector c) throws Exception {
+            JSONObject out = new JSONObject();
+            out.put("model", model);
+            out.put("created_at", java.time.Instant.now().toString());
+            JSONObject msg = new JSONObject();
+            msg.put("role", "assistant");
+            msg.put("content", c.text == null ? "" : c.text.toString());
+            if (c.thinking != null && c.thinking.length() > 0) {
+                msg.put("thinking", c.thinking.toString());
+            }
+            JSONArray calls = toolCallsJson(c.toolCalls);
+            if (calls.length() > 0) msg.put("tool_calls", calls);
+            out.put("message", msg);
+            out.put("done", true);
+            out.put("done_reason", doneReason(c.stop));
+            out.put("prompt_eval_count", c.usage.input);
+            out.put("eval_count", c.usage.output);
+            return out;
+        }
+
+        /** 非流式 /api/generate 响应形状。 */
+        public static JSONObject renderGenerate(String model, Collector c) throws Exception {
+            JSONObject out = new JSONObject();
+            out.put("model", model);
+            out.put("created_at", java.time.Instant.now().toString());
+            out.put("response", c.text == null ? "" : c.text.toString());
+            out.put("done", true);
+            out.put("done_reason", doneReason(c.stop));
+            out.put("prompt_eval_count", c.usage.input);
+            out.put("eval_count", c.usage.output);
+            return out;
+        }
+
+        static JSONArray toolCallsJson(List<Proto.Part> calls) throws Exception {
+            JSONArray arr = new JSONArray();
+            if (calls == null) return arr;
+            for (Proto.Part p : calls) {
+                if (p == null) continue;
+                JSONObject fn = new JSONObject();
+                fn.put("name", p.toolName == null ? "" : p.toolName);
+                try {
+                    fn.put("arguments", new JSONObject(p.argsJson == null ? "{}" : p.argsJson));
+                } catch (Exception badArgs) {
+                    fn.put("arguments", new JSONObject());
+                }
+                arr.put(new JSONObject().put("function", fn));
+            }
+            return arr;
+        }
+
+        static String doneReason(String canonical) {
+            return "length".equals(canonical) ? "length" : "stop";
+        }
+    }
+
+    /** 流式：每个 delta 写一行 NDJSON，最后一行 done=true。 */
+    public static final class OllamaStreamer implements Proto.Sink {
+        private final BufferedWriter w;
+        private final String model;
+        private final boolean generate;
+        private final String createdAt = java.time.Instant.now().toString();
+        private final List<Proto.Part> calls = new ArrayList<>();
+        private Proto.Usage usage = new Proto.Usage();
+        private boolean done;
+
+        public OllamaStreamer(BufferedWriter w, String model) {
+            this(w, model, false);
+        }
+
+        public OllamaStreamer(BufferedWriter w, String model, boolean generate) {
+            this.w = w;
+            this.model = model;
+            this.generate = generate;
+        }
+
+        @Override
+        public void text(String delta) {
+            if (delta == null || delta.isEmpty()) return;
+            if (generate) {
+                writeGenerate(delta, false, null);
+                return;
+            }
+            try {
+                writeMessage(new JSONObject().put("role", "assistant").put("content", delta), false, null);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @Override
+        public void thinking(String delta) {
+            if (delta == null || delta.isEmpty() || generate) return;
+            try {
+                writeMessage(new JSONObject().put("role", "assistant").put("thinking", delta), false, null);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @Override
+        public void toolCall(String id, String name, String argsJson) {
+            calls.add(Proto.Part.toolCall(id, name, argsJson));
+        }
+
+        @Override
+        public void finish(String stopReason, Proto.Usage u) {
+            if (u != null) usage = u;
+            if (done) return;
+            done = true;
+            try {
+                if (generate) {
+                    writeGenerate("", true, stopReason);
+                    return;
+                }
+                JSONObject msg = new JSONObject();
+                msg.put("role", "assistant");
+                msg.put("content", "");
+                JSONArray arr = OllamaFront.toolCallsJson(calls);
+                if (arr.length() > 0) msg.put("tool_calls", arr);
+                writeMessage(msg, true, stopReason);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        /** 流内错误：Ollama 客户端认 {"error":"..."} 这一行。 */
+        public void error(String message) {
+            if (done) return;
+            done = true;
+            try {
+                JSONObject o = new JSONObject();
+                o.put("error", message == null ? "upstream error" : message);
+                w.write(o.toString());
+                w.write("\n");
+                w.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private void writeMessage(JSONObject message, boolean doneFlag, String stopReason) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("model", model);
+                o.put("created_at", createdAt);
+                o.put("message", message);
+                o.put("done", doneFlag);
+                if (doneFlag) {
+                    o.put("done_reason", OllamaFront.doneReason(Proto.canonicalStop(stopReason, !calls.isEmpty())));
+                    o.put("prompt_eval_count", usage.input);
+                    o.put("eval_count", usage.output);
+                }
+                w.write(o.toString());
+                w.write("\n");
+                w.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private void writeGenerate(String response, boolean doneFlag, String stopReason) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("model", model);
+                o.put("created_at", createdAt);
+                o.put("response", response == null ? "" : response);
+                o.put("done", doneFlag);
+                if (doneFlag) {
+                    o.put("done_reason", OllamaFront.doneReason(Proto.canonicalStop(stopReason, false)));
+                    o.put("prompt_eval_count", usage.input);
+                    o.put("eval_count", usage.output);
+                }
+                w.write(o.toString());
+                w.write("\n");
+                w.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     /* --------------------------------------------------- Anthropic front-end */
 
     public static final class AnthropicFront {

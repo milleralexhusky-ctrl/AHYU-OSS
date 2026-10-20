@@ -1792,8 +1792,92 @@ public final class Server {
             writeJson(out, 200, modelsGemini().toString());
             return;
         }
+        /* Azure OpenAI 客户端：路径是 /openai/deployments/<deployment>/chat/completions，
+           鉴权头通常是 api-key。这里改写成标准路径并补 model。 */
+        if (path.startsWith("/openai/deployments/") && "POST".equals(r.method)) {
+            String rest = path.substring("/openai/deployments/".length());
+            /* deployment 可能带斜杠（我们的模型名是 WB/xxx），所以从**末尾**匹配
+               /chat/completions 或 /completions，而不是按第一个斜杠切。 */
+            String tail = null;
+            int cut = -1;
+            if (rest.endsWith("/chat/completions")) {
+                cut = rest.length() - "/chat/completions".length();
+                tail = "chat/completions";
+            } else if (rest.endsWith("/completions")) {
+                cut = rest.length() - "/completions".length();
+                tail = "completions";
+            }
+            if (cut > 0) {
+                String deployment = URLDecoder.decode(rest.substring(0, cut), "UTF-8");
+                JSONObject body;
+                try {
+                    body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                } catch (Exception e) {
+                    writeError(out, path, 400, "invalid JSON body");
+                    return;
+                }
+                if (!body.has("model") && !deployment.isEmpty()) body.put("model", deployment);
+                r.body = body.toString();
+                if ("chat/completions".equals(tail)) {
+                    r.path = "/v1/chat/completions";
+                    handleOpenAiChat(r, out);
+                    return;
+                }
+                if ("completions".equals(tail)) {
+                    r.path = "/v1/completions";
+                    handleLegacyCompletions(r, out);
+                    return;
+                }
+            }
+        }
         if ("/v1/chat/completions".equals(path) && "POST".equals(r.method)) {
             handleOpenAiChat(r, out);
+            return;
+        }
+        /* OpenAI 旧版 Completions：很多老客户端/插件还在用，不能只支持 chat。 */
+        if ("/v1/completions".equals(path) && "POST".equals(r.method)) {
+            handleLegacyCompletions(r, out);
+            return;
+        }
+        /* Ollama 原生协议：本地生态的默认入口。 */
+        if ("/api/tags".equals(path) && "GET".equals(r.method)) {
+            writeJson(out, 200, ollamaTags().toString());
+            return;
+        }
+        if ("/api/version".equals(path) && "GET".equals(r.method)) {
+            JSONObject v = new JSONObject();
+            v.put("version", "0.6.0");
+            writeJson(out, 200, v.toString());
+            return;
+        }
+        if ("/api/ps".equals(path) && "GET".equals(r.method)) {
+            JSONObject v = new JSONObject();
+            v.put("models", new JSONArray());
+            writeJson(out, 200, v.toString());
+            return;
+        }
+        if ("/api/show".equals(path) && "POST".equals(r.method)) {
+            JSONObject v = new JSONObject();
+            JSONObject details = new JSONObject();
+            details.put("format", "ahyu");
+            details.put("family", "ahyu");
+            details.put("families", new JSONArray().put("ahyu"));
+            details.put("parameter_size", "");
+            details.put("quantization_level", "");
+            v.put("details", details);
+            v.put("model_info", new JSONObject());
+            v.put("modelfile", "");
+            v.put("parameters", "");
+            v.put("template", "");
+            writeJson(out, 200, v.toString());
+            return;
+        }
+        if ("/api/chat".equals(path) && "POST".equals(r.method)) {
+            handleOllama(r, out, false);
+            return;
+        }
+        if ("/api/generate".equals(path) && "POST".equals(r.method)) {
+            handleOllama(r, out, true);
             return;
         }
         if ("/v1/messages".equals(path) && "POST".equals(r.method)) {
@@ -1815,6 +1899,19 @@ public final class Server {
             int colon = rest.indexOf(':');
             String model = colon > 0 ? rest.substring(0, colon) : rest;
             String verb = colon > 0 ? rest.substring(colon + 1) : "generateContent";
+            if ("countTokens".equals(verb)) {
+                /* Gemini 客户端会先数 token 再决定怎么切上下文；404 会让它直接截断。 */
+                try {
+                    JSONObject body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+                    Proto.Req req = Fronts.GeminiFront.parse(model, body);
+                    JSONObject o = new JSONObject();
+                    o.put("totalTokens", Classifier.estimateTokens(req));
+                    writeJson(out, 200, o.toString());
+                } catch (Throwable t) {
+                    writeError(out, path, 400, "invalid countTokens body: " + t.getMessage());
+                }
+                return;
+            }
             boolean stream = verb.startsWith("streamGenerateContent");
             handleGemini(r, out, model, stream);
             return;
@@ -1957,6 +2054,8 @@ public final class Server {
         if (auth.toLowerCase(Locale.US).startsWith("bearer ")) token = auth.substring(7).trim();
         if (token.isEmpty()) token = r.header("x-api-key").trim();
         if (token.isEmpty()) token = r.header("x-goog-api-key").trim();
+        /* Azure OpenAI 客户端用 api-key 头。 */
+        if (token.isEmpty()) token = r.header("api-key").trim();
         if (token.isEmpty() && !r.query.isEmpty()) {
             /*
              * ?key= 形式：Gemini 官方就这么传，本机回环下保留（删掉会破坏兼容）。
@@ -2132,6 +2231,28 @@ public final class Server {
         return sseOpened.writer;
     }
 
+    /** Ollama 的 NDJSON 流：没有 SSE 的 `data:` 前缀，也不需要心跳注释。 */
+    private static BufferedWriter startNdjson(OutputStream out) throws Exception {
+        String head = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: application/x-ndjson; charset=utf-8\r\n"
+                + "Cache-Control: no-cache\r\n"
+                + "Access-Control-Allow-Origin: *\r\n"
+                + "Transfer-Encoding: chunked\r\n"
+                + "Connection: keep-alive\r\n\r\n";
+        out.write(head.getBytes(StandardCharsets.UTF_8));
+        out.flush();
+        Conn c = connFor(out);
+        ChunkedStream chunked = new ChunkedStream(out);
+        BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(chunked, StandardCharsets.UTF_8), 8192);
+        if (c != null) {
+            c.chunked = chunked;
+            c.chunkedEncoding = true;
+            c.sse = false;
+        }
+        return writer;
+    }
+
     private static SseOut openSse(OutputStream out) throws Exception {
         StringBuilder h = new StringBuilder();
         h.append("HTTP/1.1 200 OK\r\n");
@@ -2277,7 +2398,10 @@ public final class Server {
             }
         }
         JSONObject o = new JSONObject();
-        if (path.startsWith("/v1/messages")) {
+        if (path.startsWith("/api/")) {
+            /* Ollama 的错误体是 {"error":"..."}，不是 OpenAI 的嵌套结构。 */
+            o.put("error", message);
+        } else if (path.startsWith("/v1/messages")) {
             JSONObject e = new JSONObject();
             e.put("type", "api_error");
             e.put("message", message);
@@ -3352,6 +3476,346 @@ public final class Server {
     }
 
     /* ----------------------------------------------------------------- handlers */
+
+    /** Ollama `/api/tags`：把对外模型清单按它的形状列出来。 */
+    private JSONObject ollamaTags() {
+        JSONObject out = new JSONObject();
+        JSONArray arr = new JSONArray();
+        String now = java.time.Instant.now().toString();
+        try {
+            for (String m : allModels()) {
+                JSONObject x = new JSONObject();
+                x.put("name", m);
+                x.put("model", m);
+                x.put("modified_at", now);
+                x.put("size", 0);
+                x.put("digest", "");
+                JSONObject d = new JSONObject();
+                d.put("format", "ahyu");
+                d.put("family", "ahyu");
+                d.put("families", new JSONArray().put("ahyu"));
+                d.put("parameter_size", "");
+                d.put("quantization_level", "");
+                x.put("details", d);
+                arr.put(x);
+            }
+            out.put("models", arr);
+        } catch (Throwable t) {
+            try {
+                out.put("error", String.valueOf(t.getMessage()));
+            } catch (Exception ignored) {
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Ollama `/api/chat` 与 `/api/generate`。
+     *
+     * 客户端只会说 NDJSON；这里用 {@link Fronts.OllamaFront} 翻译成 canonical 请求，
+     * 选路/换号/限额沿用同一套，输出再翻译回 Ollama 形状。
+     */
+    private void handleOllama(Req r, OutputStream out, boolean generate) throws Exception {
+        JSONObject body;
+        try {
+            body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+        } catch (Exception e) {
+            writeError(out, r.path, 400, "invalid JSON body");
+            return;
+        }
+        JSONObject chatBody = body;
+        if (generate) {
+            chatBody = new JSONObject();
+            chatBody.put("model", Proto.optString(body, "model", ""));
+            chatBody.put("stream", body.optBoolean("stream", true));
+            JSONArray msgs = new JSONArray();
+            String sys = Proto.optString(body, "system", "");
+            if (!sys.isEmpty()) {
+                msgs.put(new JSONObject().put("role", "system").put("content", sys));
+            }
+            JSONObject um = new JSONObject();
+            um.put("role", "user");
+            um.put("content", Proto.optString(body, "prompt", ""));
+            JSONArray images = body.optJSONArray("images");
+            if (images != null) um.put("images", images);
+            msgs.put(um);
+            chatBody.put("messages", msgs);
+            if (body.has("options")) chatBody.put("options", body.opt("options"));
+        }
+        Proto.Req req = Fronts.OllamaFront.parse(chatBody);
+        RequestCheck.check(req);
+        if (Router.isVirtual(req.model)) {
+            String real = resolveVirtual(req.model, req);
+            if (real.isEmpty()) {
+                writeError(out, r.path, 503, "虚拟模型 " + req.model + " 暂时没有可用候选");
+                return;
+            }
+            req.model = real;
+        }
+        List<Config.Provider> cands = pickAll(req.model);
+        if (cands.isEmpty()) {
+            writeError(out, r.path, 404, unknownModelMessage(req.model));
+            return;
+        }
+        int tries = Router.budget(cands, req.model);
+        ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
+        if (block.until > 0L) {
+            writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
+            return;
+        }
+
+        if (req.stream) {
+            Config.Provider p = cands.get(0);
+            String um = upstreamModel(p, req.model);
+            BufferedWriter w = startNdjson(out);
+            Fronts.OllamaStreamer streamer = new Fronts.OllamaStreamer(w, req.model, generate);
+            long t0 = System.currentTimeMillis();
+            try {
+                serve(req.model, p, um, req, streamer);
+                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+            } catch (Exception e) {
+                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                markResponseFailed(out);
+                Log.w("ollama 上游错误（" + p.name + "）：" + e.getMessage());
+                streamer.error(String.valueOf(e.getMessage()));
+            }
+            try {
+                w.flush();
+            } catch (Exception ignored) {
+            }
+            Conn c = connFor(out);
+            if (c != null) c.endStream();
+            return;
+        }
+
+        Exception last = null;
+        for (int i = 0; i < tries; i++) {
+            Config.Provider p = cands.get(i);
+            String um = upstreamModel(p, req.model);
+            Fronts.Collector c = new Fronts.Collector();
+            long t0 = System.currentTimeMillis();
+            try {
+                serve(req.model, p, um, req, c);
+                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                writeJson(out, 200, generate
+                        ? Fronts.OllamaFront.renderGenerate(req.model, c).toString()
+                        : Fronts.OllamaFront.render(req.model, c).toString());
+                return;
+            } catch (Exception e) {
+                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                last = e;
+                if (!(e instanceof Throttled)) {
+                    Log.w("ollama 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
+                }
+            }
+        }
+        markResponseFailed(out);
+        writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+    }
+
+    /**
+     * OpenAI 旧版 `/v1/completions`。
+     *
+     * 很多老插件/CLI 还在用它；只支持 chat 会让它们直接不可用。
+     * 把 prompt 当成一条 user 消息走同一条 canonical 选路，输出再转回 text_completion。
+     */
+    private void handleLegacyCompletions(Req r, OutputStream out) throws Exception {
+        JSONObject body;
+        try {
+            body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
+        } catch (Exception e) {
+            writeError(out, r.path, 400, "invalid JSON body");
+            return;
+        }
+        Proto.Req req = new Proto.Req();
+        req.model = Proto.optString(body, "model", "");
+        req.stream = body.optBoolean("stream", false);
+        req.protocol = "openai";
+        req.maxTokens = Proto.optInt(body, "max_tokens");
+        req.temperature = Proto.optDouble(body, "temperature");
+        req.topP = Proto.optDouble(body, "top_p");
+        Object stop = body.opt("stop");
+        if (stop instanceof String) req.stop.add((String) stop);
+        else if (stop instanceof JSONArray) {
+            JSONArray a = (JSONArray) stop;
+            for (int i = 0; i < a.length(); i++) req.stop.add(String.valueOf(a.opt(i)));
+        }
+        Object prompt = body.opt("prompt");
+        StringBuilder sb = new StringBuilder();
+        if (prompt instanceof String) sb.append((String) prompt);
+        else if (prompt instanceof JSONArray) {
+            JSONArray a = (JSONArray) prompt;
+            for (int i = 0; i < a.length(); i++) {
+                if (i > 0) sb.append('\n');
+                sb.append(a.optString(i, ""));
+            }
+        }
+        Proto.Msg m = new Proto.Msg("user");
+        m.add(Proto.Part.text(sb.toString()));
+        req.messages.add(m);
+        RequestCheck.check(req);
+
+        if (Router.isVirtual(req.model)) {
+            String real = resolveVirtual(req.model, req);
+            if (real.isEmpty()) {
+                writeError(out, r.path, 503, "虚拟模型 " + req.model + " 暂时没有可用候选");
+                return;
+            }
+            req.model = real;
+        }
+        List<Config.Provider> cands = pickAll(req.model);
+        if (cands.isEmpty()) {
+            writeError(out, r.path, 404, unknownModelMessage(req.model));
+            return;
+        }
+        int tries = Router.budget(cands, req.model);
+        ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
+        if (block.until > 0L) {
+            writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
+            return;
+        }
+
+        if (req.stream) {
+            Config.Provider p = cands.get(0);
+            String um = upstreamModel(p, req.model);
+            BufferedWriter w = startSse(out);
+            LegacyStreamer streamer = new LegacyStreamer(w, req.model);
+            long t0 = System.currentTimeMillis();
+            try {
+                serve(req.model, p, um, req, streamer);
+                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+            } catch (Exception e) {
+                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                markResponseFailed(out);
+                Log.w("legacy completions 上游错误（" + p.name + "）：" + e.getMessage());
+                streamer.error(String.valueOf(e.getMessage()));
+            }
+            try {
+                w.flush();
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+
+        Exception last = null;
+        for (int i = 0; i < tries; i++) {
+            Config.Provider p = cands.get(i);
+            String um = upstreamModel(p, req.model);
+            Fronts.Collector c = new Fronts.Collector();
+            long t0 = System.currentTimeMillis();
+            try {
+                serve(req.model, p, um, req, c);
+                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                writeJson(out, 200, renderLegacyCompletion(req.model, c).toString());
+                return;
+            } catch (Exception e) {
+                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                last = e;
+                if (!(e instanceof Throttled)) {
+                    Log.w("completions 第 " + (i + 1) + " 个候选失败（" + p.name + "）：" + e.getMessage());
+                }
+            }
+        }
+        markResponseFailed(out);
+        writeError(out, r.path, 502, last == null ? "没有可用候选" : String.valueOf(last.getMessage()));
+    }
+
+    private static JSONObject renderLegacyCompletion(String model, Fronts.Collector c) throws Exception {
+        JSONObject out = new JSONObject();
+        out.put("id", "cmpl-" + java.util.UUID.randomUUID().toString().replace("-", ""));
+        out.put("object", "text_completion");
+        out.put("created", System.currentTimeMillis() / 1000);
+        out.put("model", model);
+        JSONArray choices = new JSONArray();
+        JSONObject ch = new JSONObject();
+        ch.put("text", c.text == null ? "" : c.text.toString());
+        ch.put("index", 0);
+        ch.put("logprobs", JSONObject.NULL);
+        ch.put("finish_reason", "length".equals(c.stop) ? "length" : "stop");
+        choices.put(ch);
+        out.put("choices", choices);
+        JSONObject usage = new JSONObject();
+        usage.put("prompt_tokens", c.usage.input);
+        usage.put("completion_tokens", c.usage.output);
+        usage.put("total_tokens", c.usage.input + c.usage.output);
+        out.put("usage", usage);
+        return out;
+    }
+
+    /** OpenAI legacy 流式：`data: {...}\n\n` + `[DONE]`。 */
+    private static final class LegacyStreamer implements Proto.Sink {
+        private final BufferedWriter w;
+        private final String model;
+        private final String id = "cmpl-" + java.util.UUID.randomUUID().toString().replace("-", "");
+        private final long created = System.currentTimeMillis() / 1000;
+        private boolean done;
+
+        LegacyStreamer(BufferedWriter w, String model) {
+            this.w = w;
+            this.model = model;
+        }
+
+        @Override
+        public void text(String delta) {
+            if (delta == null || delta.isEmpty()) return;
+            chunk(delta, null);
+        }
+
+        @Override
+        public void thinking(String delta) {
+        }
+
+        @Override
+        public void toolCall(String id, String name, String argsJson) {
+        }
+
+        @Override
+        public void finish(String stopReason, Proto.Usage usage) {
+            if (done) return;
+            done = true;
+            chunk("", "length".equals(stopReason) ? "length" : "stop");
+            try {
+                w.write("data: [DONE]\n\n");
+                w.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        void error(String message) {
+            if (done) return;
+            done = true;
+            try {
+                JSONObject e = new JSONObject();
+                e.put("error", new JSONObject().put("message", message).put("type", "upstream_error"));
+                w.write("data: ");
+                w.write(e.toString());
+                w.write("\n\ndata: [DONE]\n\n");
+                w.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private void chunk(String text, String finishReason) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("id", id);
+                o.put("object", "text_completion");
+                o.put("created", created);
+                o.put("model", model);
+                JSONObject ch = new JSONObject();
+                ch.put("text", text);
+                ch.put("index", 0);
+                ch.put("logprobs", JSONObject.NULL);
+                ch.put("finish_reason", finishReason == null ? JSONObject.NULL : finishReason);
+                o.put("choices", new JSONArray().put(ch));
+                w.write("data: ");
+                w.write(o.toString());
+                w.write("\n\n");
+                w.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 
     private void handleOpenAiChat(Req r, OutputStream out) throws Exception {
         JSONObject body;

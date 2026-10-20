@@ -117,32 +117,6 @@ final class ProviderEditor {
         box.addView(Ui.label(a, "密钥（控制台里的 API Key）"), Ui.lp(a, 12));
         box.addView(apiKey);
 
-        /* 认证头风格：第三方中转不统一，必须能按账号选。 */
-        final String[] AUTH_ORDER = {
-                Config.AUTH_BEARER, Config.AUTH_X_API_KEY,
-                Config.AUTH_BOTH, Config.AUTH_NONE
-        };
-        final String[] AUTH_LABELS = {
-                "Authorization: Bearer（多数第三方）",
-                "x-api-key（Anthropic 风格）",
-                "两者都带（兼容）",
-                "不认证（本机 / 局域网）"
-        };
-        final Spinner auth = new Spinner(a);
-        ArrayAdapter<String> authAdapter = new ArrayAdapter<>(a,
-                android.R.layout.simple_spinner_dropdown_item, AUTH_LABELS);
-        auth.setAdapter(authAdapter);
-        int authInitial = 0;
-        for (int i = 0; i < AUTH_ORDER.length; i++) {
-            if (AUTH_ORDER[i].equals(p.effectiveAuthStyle())) {
-                authInitial = i;
-                break;
-            }
-        }
-        auth.setSelection(authInitial);
-        box.addView(Ui.label(a, "认证方式（默认按类型；只认一种的中转在这里改）"), Ui.lp(a, 12));
-        box.addView(auth);
-
         final EditText creds = Ui.field(a, "账号凭据 JSON（登录后自动写入，一般不用手填）", p.credentials, true);
         box.addView(Ui.label(a, "账号凭据"), Ui.lp(a, 12));
         box.addView(creds);
@@ -189,9 +163,6 @@ final class ProviderEditor {
                     tmp.type = t;
                     tmp.baseUrl = b;
                     tmp.apiKey = k;
-                    int ai = auth.getSelectedItemPosition();
-                    tmp.authStyle = ai >= 0 && ai < AUTH_ORDER.length
-                            ? AUTH_ORDER[ai] : Config.defaultAuthStyle(t);
                     tmp.credentials = c;
                     got = join(Upstreams.fetchModels(tmp));
                 } catch (Exception e) {
@@ -314,8 +285,6 @@ final class ProviderEditor {
                         + "保存后请求会被拒绝。请改用 https://");
             }
             p.apiKey = apiKey.getText().toString().trim();
-            int ai = auth.getSelectedItemPosition();
-            if (ai >= 0 && ai < AUTH_ORDER.length) p.authStyle = AUTH_ORDER[ai];
             p.credentials = creds.getText().toString().trim();
             p.enabled = enabled.isChecked();
             p.rpm = intOf(rpm);
@@ -351,7 +320,6 @@ final class ProviderEditor {
                     dup.name = p.name;
                     dup.baseUrl = p.baseUrl;
                     dup.apiKey = p.apiKey;
-                    dup.authStyle = p.authStyle;
                     dup.enabled = p.enabled;
                     dup.credentials = p.credentials;
                     dup.rpm = p.rpm;
