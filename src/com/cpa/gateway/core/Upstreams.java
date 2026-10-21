@@ -42,6 +42,24 @@ public final class Upstreams {
         void line(String s) throws Exception;
     }
 
+    /**
+     * 本次上游调用的首 token 预算覆盖（毫秒）；0/未设置 = 用默认值。
+     *
+     * 由 Server 在"还有别的候选"时设成 10 秒：一条卡住的上游不该把交互请求
+     * 拖到 90 秒。ThreadLocal 是因为调用链里拿不到请求对象，而每个请求固定在
+     * 一条连接线程上执行；用完必须 clear，否则 keep-alive 的下一条请求会继承。
+     */
+    private static final ThreadLocal<Long> FIRST_TOKEN_OVERRIDE = new ThreadLocal<>();
+
+    static void firstTokenOverride(long ms) {
+        if (ms > 0) FIRST_TOKEN_OVERRIDE.set(ms);
+        else FIRST_TOKEN_OVERRIDE.remove();
+    }
+
+    static void clearFirstTokenOverride() {
+        FIRST_TOKEN_OVERRIDE.remove();
+    }
+
     /** Raw-line capture used when bringing up a new vendor (see /v1/debug/raw-stream). */
     static final java.util.List<String> RAW = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
     private static volatile int rawLimit = 0;
@@ -125,7 +143,12 @@ public final class Upstreams {
         // 不如直接判负）；普通请求 90 秒——推理模型思考久，45 秒会误杀正常流，
         // 90 秒比原来的 300 秒还是快 3 倍。
         RaceCancels.Handle cancel = RaceCancels.current();
-        long firstTokenMs = cancel != null ? 30000L : 90000L;
+        /* 交互请求的首 token 预算：轮换模式下"还有下一个候选"时只等 10 秒，
+           等不到就换模型，别让一条卡住的上游把整轮拖到 90 秒。
+           最后一个候选仍给 45 秒（推理模型可能思考久）；竞速保持 30 秒。 */
+        Long override = FIRST_TOKEN_OVERRIDE.get();
+        long firstTokenMs = cancel != null ? 30000L
+                : (override != null && override.longValue() > 0 ? override.longValue() : 90000L);
         byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
         Http.stream(url, headers, payload, 10000, 300000, firstTokenMs, line -> {
             if (rawLimit > 0 && RAW.size() < rawLimit) RAW.add(shorten(line));

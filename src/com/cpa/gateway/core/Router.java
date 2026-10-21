@@ -310,6 +310,12 @@ public final class Router {
             ms = Math.max(ms, 20_000L);
             Log.w("上游请求级风控（11128，可原样重发）：暂避 "
                     + (ms / 1000) + " 秒 → " + key);
+        } else if ("empty".equals(kind)) {
+            /* 上游 200 但没内容：不拉黑账号，只让这个"账号/模型"短暂避开，
+               下一条请求先去试别的候选，避免每次都先在它身上等几秒。 */
+            ms = Math.max(ms, 45_000L);
+            Log.w("上游回空（200 但无正文/思考/工具调用）：暂避 "
+                    + (ms / 1000) + " 秒 → " + key);
         } else if ("quota".equals(kind)) {
             ms = Math.max(ms, 30 * 60_000L);
             Log.w("上游额度耗尽：暂避 " + (ms / 60000) + " 分钟 → " + key);

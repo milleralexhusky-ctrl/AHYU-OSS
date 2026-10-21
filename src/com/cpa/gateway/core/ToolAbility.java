@@ -105,10 +105,24 @@ final class ToolAbility {
     private static final java.util.Set<String> PROBING =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /**
+     * 每个账号最近一次工具探活的时间。
+     *
+     * 没有这个节流时，一轮轮换会对同一个账号的多个候选各起一次探活；
+     * 上游看到的是"同一个号在几秒内发来一串 get_weather 请求"，
+     * 既浪费额度，也容易被风控当成异常活动。30 秒内只探一次足够。
+     */
+    private static final java.util.Map<String, Long> LAST_PROBE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     /** 还没记录过就后台探一次；不阻塞当前请求。 */
     static void probeAsync(final Config.Provider p, final String model) {
         if (state(p, model) != UNKNOWN) return;
+        long now = System.currentTimeMillis();
+        Long last = LAST_PROBE.get(p.name);
+        if (last != null && now - last < 30_000L) return;
         if (!PROBING.add(p.name + "/" + model)) return;
+        LAST_PROBE.put(p.name, now);
         Threads.io(() -> {
             try {
                 Config cfg = Gateway.config();

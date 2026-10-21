@@ -2548,6 +2548,8 @@ public final class Server {
         private final StringBuilder buf = new StringBuilder();
         private BufferedWriter real;
         private boolean committed;
+        /** 响应头/`: ready` 是否已经写出（内容仍在缓冲，仍可换候选）。 */
+        private boolean opened;
 
         // 竞速用：这一路的身份，以及共享的胜负状态
         String racerId;
@@ -2562,20 +2564,50 @@ public final class Server {
             return committed;
         }
 
-        /** 上游开始出内容了：写响应头 + 吐缓冲，之后直写。 */
+        boolean opened() {
+            return opened || committed;
+        }
+
+        /** 换候选前丢掉上一个候选压进缓冲的内容（响应头已经发出去时也能清）。 */
+        void reset() {
+            if (!committed) buf.setLength(0);
+        }
+
+        /**
+         * 先把响应头与 `: ready` 发出去，内容继续缓冲。
+         *
+         * 目的：客户端连上来后立刻能看到首字节，不会因为网关卡在"换候选/等首 token"
+         * 而自己判定超时重连；内容没提交，仍然可以换候选。
+         */
+        void open() throws Exception {
+            if (committed || opened) return;
+            if (race != null && race.closed) return;
+            SseOut sse = openSse(out);
+            real = sse.writer;
+            this.chunked = sse.chunked;
+            Conn cc = connFor(out);
+            if (cc != null) cc.chunkedEncoding = sse.chunked != null;
+            if (race != null && racerId != null && racerId.equals(race.winnerId.get())) {
+                race.winnerChunked = sse.chunked;   // 收尾交给竞速协调者
+            }
+            opened = true;
+        }
+
+        /** 已经开了头但最终没内容时，直接写一段错误事件。 */
+        void raw(String s) throws Exception {
+            if (!opened || committed) return;
+            real.write(s);
+            real.flush();
+        }
+
+        /** 上游开始出内容了：必要时写响应头 + 吐缓冲，之后直写。 */
         void commit() throws Exception {
             if (committed) return;
             // 竞速已收尾（赢家跑完 / 超时）：迟到的这路不能再写响应头，
             // 否则同一个 socket 上会出现第二个 HTTP 响应，客户端解析直接崩。
             if (race != null && race.closed) return;
-            SseOut opened = openSse(out);
-            real = opened.writer;
-            this.chunked = opened.chunked;
-            Conn cc = connFor(out);
-            if (cc != null) cc.chunkedEncoding = opened.chunked != null;
-            if (race != null && racerId != null && racerId.equals(race.winnerId.get())) {
-                race.winnerChunked = opened.chunked;   // 收尾交给竞速协调者
-            }
+            open();
+            if (!opened || real == null) return;
             real.write(buf.toString());
             real.flush();
             buf.setLength(0);
@@ -3364,6 +3396,10 @@ public final class Server {
             if (scope.modelScoped() || scope == FailScope.REQUEST
                     || err instanceof ClientGone || err instanceof RaceLost) {
                 Router.abortProbe(key);
+            } else if (err instanceof EmptyUpstream) {
+                /* 回空不是账号坏了，但这个模型在短期内的"可用"证据就是假的：
+                   45 秒内别再把下一个请求交给它，否则用户每次都先等它几秒再换。 */
+                Router.recordThrottled(key, 45_000L, "empty", false, 0L);
             } else if (!(err instanceof Throttled)) {
                 Router.recordFail(key, String.valueOf(err.getMessage()));
             }
@@ -3741,6 +3777,24 @@ public final class Server {
      */
     private void serve(String requested, Config.Provider p, String upstreamModel, Proto.Req req, Proto.Sink sink) throws Exception {
         serve(requested, p, upstreamModel, req, sink, CURRENT.get());
+    }
+
+    /**
+     * serve + 首 token 预算。轮换时还有下一个候选 → 只等 10 秒；
+     * 最后一个候选 → 45 秒；点名模型（direct）→ 45 秒。
+     *
+     * 不带这层时默认 90 秒：一条连上了但吐不出字的上游会把交互请求拖到一分半，
+     * 客户端早就重连了。首 token 到了看门狗就撤销，不影响后续长输出。
+     */
+    private void serveWithBudget(String requested, Config.Provider p, String upstreamModel,
+                                 Proto.Req req, Proto.Sink sink, int i, int tries) throws Exception {
+        long ft = (i + 1 < tries) ? 10_000L : 45_000L;
+        Upstreams.firstTokenOverride(ft);
+        try {
+            serve(requested, p, upstreamModel, req, sink);
+        } finally {
+            Upstreams.clearFirstTokenOverride();
+        }
     }
 
     /**
@@ -5084,7 +5138,7 @@ public final class Server {
                 String um = upstreamModel(p, req.model);
                 long t0 = System.currentTimeMillis();
                 try {
-                    serve(req.model, p, um, req, streamer);
+                    serveWithBudget(req.model, p, um, req, streamer, i, tries);
                     /* 一个内容分片都没有：Streamer 现在不会写收尾，客户端还没收到东西，
                        直接换下一个候选。 */
                     if (!streamer.committed() && !streamer.rawSeen()) {
@@ -5155,7 +5209,7 @@ public final class Server {
                 Fronts.Collector c = new Fronts.Collector();
                 long t0 = System.currentTimeMillis();
                 try {
-                    serve(req.model, p, um, req, c);
+                    serveWithBudget(req.model, p, um, req, c, i, tries);
                     /* 200 但一个正文/思考/工具调用都没有：不是成功，换下一个候选。 */
                     if (!c.substantive()) {
                         throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
@@ -5417,6 +5471,9 @@ public final class Server {
         }
         /* 虚拟模型同样按累积失败概率决定试几个（见 Router.budget） */
         int tries = Router.budget(cands);
+        /* 交互场景别试太多：3 个候选已经能覆盖绝大部分；再多只是把失败时间拉长。
+           回空/连不上的候选会进 45 秒短回避，下一条请求自动跳过。 */
+        tries = Math.min(tries, 3);
         StringBuilder picked = new StringBuilder();
         for (int i = 0; i < tries; i++) {
             picked.append(i > 0 ? " → " : "").append(cands.get(i).key())
@@ -5438,7 +5495,7 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     Fronts.Collector col = new Fronts.Collector();
-                    serve(req.model, c.provider, c.model, req, col);
+                    serveWithBudget(req.model, c.provider, c.model, req, col, attempts - 1, tries);
                     if (!col.substantive()) {
                         throw new EmptyUpstream("上游没有返回任何内容（" + c.key() + "）");
                     }
@@ -5499,6 +5556,8 @@ public final class Server {
         }
 
         Exception last = null;
+        /* 一条请求只写一次响应头：所有候选共用同一个 DeferredWriter。 */
+        DeferredWriter dw = new DeferredWriter(out);
         java.util.Set<String> skipModels = new java.util.HashSet<>();
         int attempts = 0;
         int softExtra = 0;
@@ -5506,12 +5565,14 @@ public final class Server {
             Router.Pick c = cands.get(i);
             if (skipModels.contains(c.model)) continue;
             attempts++;
-            DeferredWriter dw = new DeferredWriter(out);
+            dw.reset();
             BufferedWriter w = new BufferedWriter(dw, 8192);
             Fronts.OpenAiFront.Streamer streamer = new Fronts.OpenAiFront.Streamer(w, req.model);
             long t0 = System.currentTimeMillis();
             try {
-                serve(req.model, c.provider, c.model, req, streamer);
+                /* 先发响应头与 `: ready`，客户端立刻看到首字节；内容仍可换候选。 */
+                dw.open();
+                serveWithBudget(req.model, c.provider, c.model, req, streamer, attempts - 1, tries);
                 /* 上游"成功"但一个分片内容都没有：不能提交空流，换下一个候选。 */
                 if (!streamer.committed() && !streamer.rawSeen()) {
                     throw new EmptyUpstream("上游没有返回任何内容（" + c.key() + "）");
@@ -5579,6 +5640,20 @@ public final class Server {
         }
         if (last != null && FailScope.of(last) == FailScope.REQUEST) {
             writeScopedFailure(out, r, last);
+            return;
+        }
+        /* 已经发过响应头/`: ready`：不能再写 HTTP 错误，只能按 SSE 发错误事件并收尾。 */
+        if (dw.opened() && !dw.committed()) {
+            try {
+                JSONObject err = new JSONObject();
+                err.put("error", new JSONObject()
+                        .put("message", last instanceof EmptyUpstream
+                                ? "上游没有返回任何内容，请重试"
+                                : String.valueOf(last == null ? "没有可用候选" : last.getMessage()))
+                        .put("type", "api_error"));
+                dw.raw("data: " + err + "\n\ndata: [DONE]\n\n");
+            } catch (Exception ignored) {
+            }
             return;
         }
         // 一个都没成，而且什么都还没写出去 → 正常回错误
@@ -5740,6 +5815,7 @@ public final class Server {
         /* 试几个候选由累积失败概率决定，不再固定 3 次（见 Router.budget） */
         int tries = virtual ? Router.budget(picks) : Router.budget(cands, req.model);
         tries = Math.min(tries, picks.size());
+        tries = Math.min(tries, 3);
 
         /* 全部候选都被上游**明确告知**要等到某个时刻时，别去撞墙了。
            虚拟模型的候选来自 Router.candidates()，已经过滤过冷却；这里只对
@@ -5757,17 +5833,23 @@ public final class Server {
                空流不会提交，于是可以像 OpenAI 那样换候选；只有已经出过内容才不能换。
                这也顺手修掉了"上游回空 → 客户端显示空回答/重连失败"。 */
             Exception last = null;
+            /* 一条请求只允许写一次响应头：所有候选共用同一个 DeferredWriter，
+               换候选时只清缓冲，不重新 openSse。 */
+            DeferredWriter dw = new DeferredWriter(out);
             for (int i = 0; i < tries; i++) {
                 Router.Pick c = picks.get(i);
                 Config.Provider p = c.provider;
                 String um = c.model;
-                DeferredWriter dw = new DeferredWriter(out);
+                dw.reset();
                 BufferedWriter w = new BufferedWriter(dw, 8192);
                 Fronts.AnthropicFront.Streamer streamer =
                         new Fronts.AnthropicFront.Streamer(w, req.model);
                 long t0 = System.currentTimeMillis();
                 try {
-                    serve(req.model, p, um, req, streamer);
+                    /* 先把响应头与 `: ready` 发出去：客户端立刻看到首字节，
+                       不会因为网关在换候选/等首 token 而自己超时重连。 */
+                    dw.open();
+                    serveWithBudget(req.model, p, um, req, streamer, i, tries);
                     if (!streamer.substantive()) {
                         throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
                     }
@@ -5807,6 +5889,21 @@ public final class Server {
                     if (FailScope.of(e).stopDirect()) break;
                 }
             }
+            /* 响应头已经发出去（`: ready`）但一个候选都没成功：不能在同一个
+               socket 上再写一个 HTTP 响应，只能按 SSE 发错误事件。 */
+            if (dw.opened() && !dw.committed()) {
+                try {
+                    JSONObject ev = new JSONObject();
+                    ev.put("type", "error");
+                    ev.put("error", new JSONObject().put("type", "api_error")
+                            .put("message", last instanceof EmptyUpstream
+                                    ? "上游没有返回任何内容，请重试"
+                                    : String.valueOf(last == null ? "没有可用候选" : last.getMessage())));
+                    dw.raw("event: error\ndata: " + ev + "\n\n");
+                } catch (Exception ignored) {
+                }
+                return;
+            }
             if (!writeScopedFailure(out, r, last)) {
                 if (last instanceof EmptyUpstream) {
                     writeError(out, r.path, 502, "上游没有返回任何内容，请重试");
@@ -5824,7 +5921,7 @@ public final class Server {
                 Fronts.Collector c = new Fronts.Collector();
                 long t0 = System.currentTimeMillis();
                 try {
-                    serve(req.model, p, um, req, c);
+                    serveWithBudget(req.model, p, um, req, c, i, tries);
                     if (!c.substantive()) {
                         throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
                     }
