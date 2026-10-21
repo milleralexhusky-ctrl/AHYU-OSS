@@ -29,6 +29,40 @@ public class LogActivity extends Activity {
     /** 自己的日志监听，销毁时只注销自己这一份。 */
     private Log.Listener logListener;
 
+    /* --------------------------------------------------------- 跟随状态（4.51.6） */
+
+    /**
+     * 是否"跟随最新"：只有跟随中才在刷新后自动滚到底。
+     *
+     * <p>为什么必须有这个开关：原来 {@code render()} 结尾是无条件
+     * {@code fullScroll(FOCUS_DOWN)}。日志每来一行就 render 一次，于是用户
+     * **往上翻看历史时会被不断拽回底部** —— 想看清一行报错，手指刚滚上去就被
+     * 弹下来，等于日志页在网关忙的时候没法读。
+     *
+     * <p>判据用"当前滚动位置离底部有多远"，不用"用户是否上滑过"：
+     * 后者在"内容变长了"时也会误判（内容长了但用户没动，其实还在底部）。
+     */
+    private boolean follow = true;
+
+    /** 判定"算在底部"的容差（px）。留一点余量：惯性滑动常常差几像素到不了底。 */
+    private static final int FOLLOW_SLACK_PX = 48;
+
+    /**
+     * 这次滚动是不是用户自己划的。
+     *
+     * <p>必须区分：render() 每次 setText 都会让内容变高，随之而来的滚动回调
+     * 并不是用户在滚动。不加这个判据的话，每来一行日志都会把用户"上翻"的状态
+     * 重新算一遍，而算的时候内容刚变长、位置还没跟上，于是被误判成
+     * "用户不在底部"，跟随状态就开始乱跳、按钮跟着闪。
+     *
+     * <p>松手后再留 600ms 才清掉：惯性滑动（fling）在 ACTION_UP 之后还会继续
+     * 滚一段，那段时间的滚动同样是用户意图，不能忽略。
+     */
+    private boolean userScroll;
+
+    /** 浮动在右下角的"回到最新"按钮，只在非跟随时出现。 */
+    private TextView jumpBtn;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -93,6 +127,9 @@ public class LogActivity extends Activity {
 
             @Override
             public void onTextChanged(CharSequence s, int a, int b, int c) {
+                /* 换过滤词等于换了整套内容，没有"上翻的历史"可言 —— 恢复跟随，
+                   否则新筛出来的结果会停在上面，用户以为"没匹配到"。 */
+                follow = true;
                 render();
             }
 
@@ -129,9 +166,37 @@ public class LogActivity extends Activity {
         view.setTextSize(11.5f);
         view.setTypeface(Typeface.MONOSPACE);
         scroll.addView(view);
+        // 上翻即暂停跟随；滚回底部自动恢复。见 follow 字段的说明。
+        scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> updateFollow());
+        /* 触摸期间标成"用户在滚"；松手后 600ms 内也算（惯性还在跑）。 */
+        scroll.setOnTouchListener((v, ev) -> {
+            if (ev.getActionMasked() == android.view.MotionEvent.ACTION_DOWN
+                    || ev.getActionMasked() == android.view.MotionEvent.ACTION_MOVE) {
+                userScroll = true;
+            } else if (ev.getActionMasked() == android.view.MotionEvent.ACTION_UP
+                    || ev.getActionMasked() == android.view.MotionEvent.ACTION_CANCEL) {
+                handler.postDelayed(() -> userScroll = false, 600L);
+            }
+            return false;      // 不拦截，滚动照常
+        });
         panel.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        root.addView(panel, Ui.fill(this, 12));
+
+        /* 面板 + 右下角浮动的"回到最新"。用 FrameLayout 叠一层：
+           LinearLayout 加进去会占位，把日志面板挤扁，而这是个覆盖式控件。 */
+        android.widget.FrameLayout stage = new android.widget.FrameLayout(this);
+        stage.addView(panel, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        jumpBtn = Ui.accentChipButton(this, "↓ 回到最新");
+        Ui.a11y(jumpBtn, "回到最新日志，恢复自动跟随");
+        jumpBtn.setVisibility(android.view.View.GONE);
+        jumpBtn.setOnClickListener(v -> jumpToLatest());
+        android.widget.FrameLayout.LayoutParams jlp = new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        jlp.gravity = android.view.Gravity.BOTTOM | android.view.Gravity.END;
+        jlp.setMargins(0, 0, Ui.dp(this, 14), Ui.dp(this, 34));
+        stage.addView(jumpBtn, jlp);
+        root.addView(stage, Ui.fill(this, 12));
 
         logListener = line -> handler.post(this::render);
         Log.addListener(logListener);
@@ -206,7 +271,58 @@ public class LogActivity extends Activity {
         }
         if (shown == 0) sb.append(q.isEmpty() ? "（还没有日志）" : "没有匹配「" + q + "」的日志");
         view.setText(sb);
-        scroll.post(() -> scroll.fullScroll(ScrollView.FOCUS_DOWN));
+        /* 只有跟随中才自动滚到底 —— 用户上翻看历史时不能在下面把他拽回去。
+           注意这里要标记"这次滚动不是用户划的"，见 userScroll 的说明。 */
+        if (follow) {
+            userScroll = false;
+            scroll.post(() -> {
+                scroll.fullScroll(ScrollView.FOCUS_DOWN);
+                updateFollow();
+            });
+        }
+        updateJumpButton();
+    }
+
+    /**
+     * 根据当前滚动位置判定是否还跟随最新。
+     *
+     * <p>只认**用户自己划出来**的位置变化（见 {@link #userScroll}）：
+     * 内容变长导致的滚动、以及我们自己 fullScroll 到底，都不该改变跟随状态。
+     */
+    private void updateFollow() {
+        if (!userScroll) return;
+        boolean was = follow;
+        follow = atBottom();
+        if (was != follow) {
+            if (!follow) Log.i("日志已暂停跟随（上翻查看历史），点右下角可回到最新");
+            updateJumpButton();
+        }
+    }
+
+    /** 滚动位置是否已经到底（留 FOLLOW_SLACK_PX 容差）。 */
+    private boolean atBottom() {
+        if (scroll == null || view == null) return true;
+        int max = view.getHeight() - scroll.getHeight() + scroll.getPaddingTop()
+                + scroll.getPaddingBottom();
+        if (max <= 0) return true;                    // 内容还不满一屏，永远是"到底"
+        return scroll.getScrollY() >= max - FOLLOW_SLACK_PX;
+    }
+
+    /** 右下角浮动按钮：只在暂停跟随时出现。 */
+    private void updateJumpButton() {
+        if (jumpBtn == null) return;
+        jumpBtn.setVisibility(follow ? android.view.View.GONE : android.view.View.VISIBLE);
+    }
+
+    /** 点"回到最新"：恢复跟随并滚到底。 */
+    private void jumpToLatest() {
+        follow = true;
+        userScroll = false;
+        updateJumpButton();
+        scroll.post(() -> {
+            scroll.fullScroll(ScrollView.FOCUS_DOWN);
+            // fullScroll 本身也会触发滚动回调，但 userScroll 刚被清掉，不会被误判
+        });
     }
 
     /** 用量明细：近 7 天，按接口 / 渠道 / 模型 / 天各列前几名。 */

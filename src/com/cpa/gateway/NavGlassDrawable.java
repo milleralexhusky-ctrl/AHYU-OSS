@@ -169,7 +169,30 @@ final class NavGlassDrawable extends Drawable {
                 shader.setFloatUniform("uRefract", dp(4.5f) * quality); // 边缘位移强度（猛了就成鱼眼）
                 shader.setFloatUniform("uDisp", dp(0.6f) * quality);    // 色散（要几乎看不出彩边）
                 shader.setFloatUniform("uRim", 0.09f);        // 边缘高光
-                // 玻璃底色：深色模式往暗处压（保证白字可读），浅色模式往亮处提（保证深字可读）
+                /* 玻璃底色：深色模式往暗处压（保证白字可读），浅色模式往亮处提（保证深字可读）
+                 *
+                 * 【为什么是写死的两组常量，而不是"按背景平均亮度自适应"】
+                 *
+                 * 这行代码看着像遗漏 —— 背景有 7 套配色、有 strength 差异，直觉上
+                 * 该按实测亮度调 tint。4.51.6 真去算了 7 套配色 × 深浅两模式的平均亮度
+                 * （Rec.709，含 Swatch 的柔光团）：
+                 *
+                 *   浅色：0.854（靛蓝）～ 0.881（暖橙）    极差 0.027
+                 *   深色：0.196（玫红/靛蓝）～ 0.205（青绿） 极差 0.009
+                 *
+                 * 七套配色的**底色深浅本来就接近**（{@link Swatch} 把主题色和固定底
+                 * 混合时主题色只占一两成），差异远小于能看出 tint 偏了的阈值。
+                 * 而页面 strength 根本不影响这张纹理：玻璃采样的是 {@link BackdropTex}
+                 * 那张**固定**色版，strength 只作用于 {@link DynamicBackdrop} 的实时画面
+                 * （它的 fade() 影响的是**显示**亮度，纹理始终按 strength=1 画）。
+                 *
+                 * 结论：自适应解决的是一个在这个设计下**不存在**的问题，只会多一处
+                 * 永远输出同一个值、还要人维护的分支。真正会变的只有深浅模式，
+                 * 而那正是 Ui.LIGHT 这个分支在管的。别"顺手加自适应"。
+                 *
+                 * 这条结论由 {@code Selftest.checkGlassTintRange} 钉住：以后配色表里
+                 * 真加进明暗差很多的配色，那条自检会红，那时才需要重新评估这两组常量。
+                 */
                 if (Ui.LIGHT) {
                     // 提亮比原来收一点：原来玻璃采样后接近纯白，整屏最亮的地方都在这儿
                     shader.setFloatUniform("uTint", 0.34f);

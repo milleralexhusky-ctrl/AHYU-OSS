@@ -1285,4 +1285,57 @@ final class Ui {
                 (int) (Color.green(a) * (1 - ratio) + Color.green(b) * ratio),
                 (int) (Color.blue(a) * (1 - ratio) + Color.blue(b) * ratio));
     }
+
+    /* --------------------------------------------------- 选中聚焦（4.51.6） */
+
+    /**
+     * 一排同类选项里的"聚焦"语义：选中的放大提亮，同层没选中的降饱和、缩小、变暗。
+     *
+     * <p>为什么值得单独抽出来：这排东西（主题色圆点、分段选择器）原来只用
+     * "描边 / 实心底"区分选中，在**七个小圆点**这种场景下几乎看不出来 ——
+     * 眼睛得逐个比对谁的描边粗一点。聚焦语义是"一眼就知道现在选的是哪个"。
+     *
+     * <p>三条刻意的取舍：
+     *
+     * <ul>
+     *   <li><b>不做模糊。</b>未选中项"轻微模糊"在原理上要 {@code RenderEffect}
+     *       或整层离屏重绘。这排圆点直径只有 34dp、内容就是一块纯色，
+     *       模糊既看不出（没有细节可糊），又会把 {@code Perf} 的帧预算吃掉。
+     *       降饱和 + 缩小已经足够拉开层次。</li>
+     *   <li><b>用 {@link #mute} 降饱和，不用降 alpha。</b>降 alpha 会让圆点透出
+     *       背后的玻璃，颜色变得不确定 —— 而这里恰恰是**让用户比较颜色**的地方，
+     *       透出来的底色会干扰判断。{@code mute} 保留色相、只压饱和度与明度。</li>
+     *   <li><b>动画走 {@link Jelly} 那套弹簧，不用固定时长补间。</b>
+     *       弹簧可打断、可逆：用户连点几个圆点时，前一次过渡不会卡住后一次。</li>
+     * </ul>
+     *
+     * @param dot     目标控件
+     * @param on      true = 选中（放大提亮），false = 同层未选中
+     * @param animate true = 用弹簧过渡；首帧绑定（列表初次构建）应传 false，
+     *                否则刚进页面就会看到一排控件从默认状态弹到目标状态
+     */
+    static void focus(android.view.View dot, final boolean on, boolean animate) {
+        if (dot == null) return;
+        final float target = on ? 1f : 0.80f;
+        final float alpha = on ? 1f : 0.62f;
+        if (!animate) {
+            dot.setScaleX(target);
+            dot.setScaleY(target);
+            dot.setAlpha(alpha);
+            return;
+        }
+        /* 目标值写在 tag 上：同一个控件被连续切换时，后一次要能读到前一次的目标，
+           才能从"当前实际值"接着弹，而不是从初始值重来。 */
+        dot.animate().cancel();
+        dot.animate()
+                .scaleX(target).scaleY(target).alpha(alpha)
+                .setDuration(240L)
+                .setInterpolator(new android.view.animation.OvershootInterpolator(1.6f))
+                .start();
+    }
+
+    /** 选中项的描边色：选中时用正文色（对比强），未选中时用主题色淡描边（保持可辨）。 */
+    static int focusStroke(boolean on) {
+        return on ? TEXT : mix(ACCENT, TEXT, 0.55f);
+    }
 }

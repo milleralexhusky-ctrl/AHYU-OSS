@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.text.InputType;
+import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -218,18 +219,27 @@ public class SettingsActivity extends Activity {
         themeCard.addView(Ui.sectionTitle(this, "外观"));
         themeCard.addView(Ui.label(this, "主题色：切完立即生效，其它页面下次进入时同步"), Ui.lp(this, 10));
         LinearLayout dots = Ui.row(this);
+        dots.setGravity(Gravity.CENTER_VERTICAL);
         final String current = Gateway.config().accentTheme == null ? "spring" : Gateway.config().accentTheme;
         for (final String[] t : Ui.THEMES) {
+            final boolean on = t[0].equals(current);
             TextView dot = new TextView(this);
             android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
             g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
-            g.setColor(Color.parseColor(t[2]));
-            if (t[0].equals(current)) g.setStroke(Ui.dp(this, 2), Ui.TEXT);
+            /* 聚焦语义（4.51.6）：选中项用**本色**、未选中项降饱和。
+               原来七个圆点只有选中那个多一圈 2dp 描边，其余一模一样 ——
+               一排小圆点里"哪个是当前"要靠逐个比对描边粗细才看得出来。 */
+            int face = Color.parseColor(t[2]);
+            g.setColor(on ? face : Ui.mute(face));
+            g.setStroke(Ui.dp(this, on ? 2 : 1), Ui.focusStroke(on));
             dot.setBackground(g);
             dot.setClickable(true);
-            Ui.a11y(dot, "主题 " + t[1]);
+            // 选中态由 Ui.focus 负责放大提亮；读屏也要能听出来，不能只靠视觉
+            Ui.a11y(dot, "主题 " + t[1] + (on ? "，已选中" : ""));
             LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(Ui.dp(this, 34), Ui.dp(this, 34));
             dlp.rightMargin = Ui.dp(this, 12);
+            // 首次绑定不做动画：刚进设置页就看着一排圆点弹一下是不必要的动静
+            Ui.focus(dot, on, false);
             dot.setOnClickListener(v -> {
                 Gateway.config().accentTheme = t[0];
                 Gateway.save(this);

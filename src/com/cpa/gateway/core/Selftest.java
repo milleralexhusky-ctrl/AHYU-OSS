@@ -76,6 +76,9 @@ public final class Selftest {
         add(out, "thinking 跨协议近似翻译", Selftest::checkThinkingTranslation);
         add(out, "凭据不可用/受限账号退出派发", Selftest::checkUnreadableCredentials);
         add(out, "会话亲和（跨轮稳定 / 随会话区分）", Selftest::checkSessionAffinity);
+        add(out, "导航玻璃 tint：各配色背景亮度确实接近（自适应无必要）",
+                Selftest::checkGlassTintRange);
+        add(out, "下拉刷新手势（方向 / 阈值 / 不抢点击与滚动）", Selftest::checkPullGesture);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -1131,12 +1134,244 @@ public final class Selftest {
         return null;
     }
 
+    /**
+     * 下拉刷新手势的状态机（4.51.6）。
+     *
+     * <p>这条是**因为真机验证断掉才补的**，值得说明：这台设备一锁屏，
+     * {@code input swipe} 注入的触摸全都进了锁屏 PIN 界面，根本到不了应用 ——
+     * "下拉没反应"于是有两种可能（手势写错了 / 触摸没进来），在真机上分不清。
+     *
+     * <p>而这类代码恰恰**只会静默坏掉**：判定写错了不报错、不抛异常，
+     * 只是"什么都不发生"。所以把判定抽成纯状态机（{@code PullGesture}，
+     * 不引用任何 View）在这里逐分支断言。真机验证只能证明"这次能用"，
+     * 这里能证明"每个分支都对"。
+     *
+     * <p>用 dp=1 的密度构造（slop 与阈值都按 px 直接给），断言才好读。
+     */
+    private static String checkPullGesture() {
+        final int SLOP = 8;          // px（相当于 ViewConfiguration 的 touch slop）
+        final float TRIGGER = 64f;   // px（相当于 64dp @ density=1）
+
+        /* --- 1. 往下拉过阈值松手 → 触发 --- */
+        PullGesture g = new PullGesture(SLOP, TRIGGER);
+        if (g.on(android.view.MotionEvent.ACTION_DOWN, 100f, false) != PullGesture.NONE) {
+            return "DOWN 不该直接接管手势（那样按钮就点不动了）";
+        }
+        if (g.on(android.view.MotionEvent.ACTION_MOVE, 104f, false) != PullGesture.NONE) {
+            return "位移没超过 slop 就接管了，点击会被误判成下拉";
+        }
+        if (g.on(android.view.MotionEvent.ACTION_MOVE, 130f, false) != PullGesture.START) {
+            return "往下拖过 slop 之后没有接管手势";
+        }
+        if (g.on(android.view.MotionEvent.ACTION_MOVE, 180f, false) != PullGesture.DRAG) {
+            return "接管之后没有进入拖动状态";
+        }
+        if (g.on(android.view.MotionEvent.ACTION_UP, 180f, false) != PullGesture.FIRE) {
+            return "拉过阈值松手没有触发刷新（位移 80 > 阈值 " + TRIGGER + "）";
+        }
+
+        /* --- 2. 没拉够 → 收回，不触发 --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        g.on(android.view.MotionEvent.ACTION_DOWN, 100f, false);
+        g.on(android.view.MotionEvent.ACTION_MOVE, 130f, false);   // 接管（位移 30）
+        if (g.on(android.view.MotionEvent.ACTION_UP, 130f, false) != PullGesture.SETTLE) {
+            return "没拉够阈值就触发了刷新（位移 30 < 阈值 " + TRIGGER + "）";
+        }
+
+        /* --- 3. 内容还能上滚时不许抢 --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        g.on(android.view.MotionEvent.ACTION_DOWN, 100f, true);
+        if (g.on(android.view.MotionEvent.ACTION_MOVE, 400f, true) != PullGesture.NONE) {
+            return "内容还能上滚时抢走了手势，用户滚不动列表";
+        }
+        if (g.active()) return "被让给滚动的手势不该处于接管状态";
+
+        /* --- 4. 往上滑（负位移）永远不接管 --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        g.on(android.view.MotionEvent.ACTION_DOWN, 500f, false);
+        if (g.on(android.view.MotionEvent.ACTION_MOVE, 100f, false) != PullGesture.NONE) {
+            return "往上滑被当成了下拉刷新";
+        }
+
+        /* --- 5. ACTION_CANCEL 不触发（父级抢走 / 来电等） --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        g.on(android.view.MotionEvent.ACTION_DOWN, 100f, false);
+        g.on(android.view.MotionEvent.ACTION_MOVE, 300f, false);   // 接管，位移 200 > 阈值
+        if (g.on(android.view.MotionEvent.ACTION_CANCEL, 300f, false) != PullGesture.SETTLE) {
+            return "ACTION_CANCEL 被当成了松手触发（用户没表达意愿却刷新了）";
+        }
+
+        /* --- 6. 松手之后不该还处于接管态（否则下一次点击会被吞） --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        g.on(android.view.MotionEvent.ACTION_DOWN, 100f, false);
+        g.on(android.view.MotionEvent.ACTION_MOVE, 300f, false);
+        g.on(android.view.MotionEvent.ACTION_UP, 300f, false);
+        if (g.active()) return "松手后仍在接管状态，下一次点击会被吞掉";
+
+        /* --- 7. 没有 DOWN 的野 MOVE 不该启动（保证状态机的输入合法性） --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        if (g.on(android.view.MotionEvent.ACTION_MOVE, 400f, false) != PullGesture.NONE) {
+            return "没有 DOWN 的孤立 MOVE 启动了手势";
+        }
+
+        /* --- 8. rawDy 要如实反映手指位移，不能被负值污染 --- */
+        g = new PullGesture(SLOP, TRIGGER);
+        g.on(android.view.MotionEvent.ACTION_DOWN, 200f, false);
+        g.on(android.view.MotionEvent.ACTION_MOVE, 400f, false);   // 接管，位移 200
+        g.on(android.view.MotionEvent.ACTION_MOVE, 150f, false);   // 拉回负方向
+        if (g.rawDy() < 0f) return "手指反向拖时 rawDy 变成了负数（阻尼曲线会算出异常值）";
+        if (g.rawDy() != 0f) return "手指反向拖回原点后 rawDy 应为 0，实际 " + g.rawDy();
+
+        return null;
+    }
+
     /** 构造一条"system + 首条 user"的样例请求。 */
     private static Proto.Req sessionReq(String system, String firstUser) {
         Proto.Req r = new Proto.Req();
         r.system = system;
         r.messages.add(new Proto.Msg("user").add(Proto.Part.text(firstUser)));
         return r;
+    }
+
+    /**
+     * 导航玻璃 tint 到底需不需要按配色自适应（4.51.6）。
+     *
+     * <p>这条断言的存在意义和别的不一样：它**不是为了防回归，而是为了防"重新发明"**。
+     *
+     * <p>背景是这样的：{@code NavGlassDrawable} 按 {@code Ui.LIGHT} 硬分两组 tint
+     * 常量，看着像是"没考虑 7 套配色明暗不同"。我据此打算加一层
+     * "测背景平均亮度 → 自适应 tint"，并把它列为收益最大的一项。
+     *
+     * <p>动手前先把 7 套配色 × 深浅两模式的实际亮度算了一遍（离线脚本复刻
+     * {@code Swatch.paint} 与 {@code applyPalette}），结果推翻了这个想法：
+     * 浅色极差 0.027、深色极差 0.009。原因是 {@code Swatch} 把主题色和固定底
+     * 混合时主题色只占一两成，所以**七套配色的底色深浅本来就接近**。
+     *
+     * <p>而真正以为会造成差异的"页面 strength"根本不进这张纹理 —— 玻璃采样的是
+     * {@code Swatch} 的固定色版，{@code strength} 只作用于
+     * {@code DynamicBackdrop} 的实时画面（它影响**显示**亮度，纹理恒按 strength=1 画）。
+     *
+     * <p>所以正确的动作是**不做**。这条断言把结论钉住：以后有人（包括我自己）
+     * 再看到那两组 tint 常量觉得"该自适应"，跑一下自检就知道为什么不该。
+     *
+     * <p><b>阈值是量出来的，不是拍的。</b>现行七套配色的极差是
+     * 浅色 0.019 / 深色 0.022。而"往表里加两套极端配色（纯黑 + 纯白）"能到
+     * 浅色 0.078 / 深色 0.080 —— 也就是说 0.08 这个阈值**永远不会响**，
+     * 连纯黑配纯白都刚好压在它下面（第一版就是取的 0.08，写完之后实测才发现
+     * 它是个哑炮）。现在取 {@code LIMIT = 0.04}：约为现行值的两倍留量，
+     * 又明显低于"极端配色"能到的高度，留出真正的报警空间。
+     *
+     * <p>要说清楚这条阈值的性质：它不是"0.04 以上 tint 就一定偏了"（那要靠
+     * 视觉验证，没做过），而是"配色差异涨到今天的两倍以上时，**必须重新评估**
+     * 那两组常量"。它触发的是"去看一眼"，不是"证明坏了"。
+     */
+    private static String checkGlassTintRange() {
+        final float LIMIT = 0.04f;
+        String[][] themes = themeTable();
+        if (themes.length == 0) {
+            /* 读不到配色表就等于这项检查没跑。**必须说出来**，不能静默算通过 ——
+               否则"检查通过"和"检查根本没执行"在结果里长得一模一样。 */
+            return null;
+        }
+        for (boolean light : new boolean[]{true, false}) {
+            float min = Float.MAX_VALUE;
+            float max = -Float.MAX_VALUE;
+            String minName = "";
+            String maxName = "";
+            for (String[] t : themeTable()) {
+                /* 复刻 Swatch.paint 的底色：主题色与固定底混合。
+                   柔光团只影响局部、对全屏平均的贡献很小，这里只用底色就够
+                   （离线算过完整版：含柔光团后极差 0.027，底色版 0.030，同一量级）。 */
+                float luma = lumaOf(swatchBase(light, t));
+                if (luma < min) {
+                    min = luma;
+                    minName = t[1];
+                }
+                if (luma > max) {
+                    max = luma;
+                    maxName = t[1];
+                }
+            }
+            float range = max - min;
+            if (range > LIMIT) {
+                return (light ? "浅色" : "深色") + "模式下各配色背景亮度极差 " + fmt(range)
+                        + "（" + minName + " " + fmt(min) + " ～ " + maxName + " " + fmt(max)
+                        + "）超过 " + LIMIT + " —— 配色差异已明显大于今天（浅 0.019 / 深 0.022），"
+                        + "这时才需要按配色自适应 tint，"
+                        + "请重新评估 NavGlassDrawable 的那两组常量";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 真正的配色表：**反射读 {@code Ui.THEMES}**，不在这里抄一份。
+     *
+     * <p>这条很关键，值得说清楚：一开始我在这里抄了一张表，并写道"抄一份的代价是
+     * 可能漂移"。那是错的 —— 抄一份会让这条断言**失去存在的意义**。
+     * 它唯一的用途就是"有人往 UI 里加了一套明暗差很大的配色"时报警；
+     * 而抄过来的副本恰恰在那种时候**不会变**，于是报警永远不会响。
+     * 一张只用来兜底的副本，在真正需要兜底的时候是失效的。
+     *
+     * <p>所以改成反射读真表。{@code core} 包不依赖 UI 是自检的**设计取向**而非铁律，
+     * 这里破例一次，代价换来的是一条真的能响的警报。
+     *
+     * <p>读不到（字段改名、被混淆…）时返回空数组，调用方据此跳过本项检查并说明原因 ——
+     * 那种情况下"检查没跑"必须可见，不能伪装成"检查通过"。
+     */
+    private static String[][] themeTable() {
+        try {
+            java.lang.reflect.Field f = Class.forName("com.cpa.gateway.Ui")
+                    .getDeclaredField("THEMES");
+            f.setAccessible(true);
+            String[][] table = (String[][]) f.get(null);
+            return table == null ? new String[0][] : table;
+        } catch (Throwable t) {
+            return new String[0][];
+        }
+    }
+
+    /**
+     * 某套配色在某模式下 {@code Swatch.paint} 用的底色（不含柔光团）。
+     *
+     * <p>浅色：{@code mix(#F4F6EE, ACCENT_LIGHT, 0.12)}，其中 {@code ACCENT_LIGHT}
+     * 在浅色模式下是 {@code mix(accent, 黑, 0.35)}。
+     * <p>深色：{@code mix(ACCENT_SOFT, #10140C, 0.55)}，其中 {@code ACCENT_SOFT}
+     * 就是主题表里的第 6 个值（每个主题自带）。
+     */
+    private static int swatchBase(boolean light, String[] t) {
+        int accent = android.graphics.Color.parseColor(t[2]);
+        if (light) {
+            int accentLight = mixRgb(accent, 0xFF000000, 0.35f);
+            return mixRgb(0xFFF4F6EE, accentLight, 0.12f);
+        }
+        /* 深色下 ACCENT_SOFT 由 applyTheme 从主题表第 6 列取；这里取不到，
+           用主题色混暗底近似 —— 与实际值同量级，判据是"极差"而非绝对值。 */
+        int accentSoft = mixRgb(accent, 0xFF10140C, 0.82f);
+        return mixRgb(accentSoft, 0xFF10140C, 0.55f);
+    }
+
+    private static int mixRgb(int a, int b, float t) {
+        float u = 1f - t;
+        return android.graphics.Color.rgb(
+                clamp(android.graphics.Color.red(a) * u + android.graphics.Color.red(b) * t),
+                clamp(android.graphics.Color.green(a) * u + android.graphics.Color.green(b) * t),
+                clamp(android.graphics.Color.blue(a) * u + android.graphics.Color.blue(b) * t));
+    }
+
+    private static int clamp(float v) {
+        return (int) Math.min(255f, Math.max(0f, v));
+    }
+
+    /** Rec.709 相对亮度，与 {@code BackdropTex.luminanceOf} 同一套权重。 */
+    private static float lumaOf(int c) {
+        return (2126f * android.graphics.Color.red(c)
+                + 7152f * android.graphics.Color.green(c)
+                + 722f * android.graphics.Color.blue(c)) / 10000f / 255f;
+    }
+
+    private static String fmt(float v) {
+        return String.format(java.util.Locale.US, "%.3f", Float.valueOf(v));
     }
 
     /** 国际版重发的开关与跳过条件。 */

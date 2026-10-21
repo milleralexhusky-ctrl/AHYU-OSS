@@ -53,6 +53,8 @@ public class MainActivity extends Activity {
     private TextView addressText;
     private TextView keyText;
     private android.app.Dialog currentDialog;
+    /** 下拉刷新的浮动指示器（见 PullRefresh）。 */
+    private TextView pullIndicator;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -363,8 +365,57 @@ public class MainActivity extends Activity {
         bottom.addView(settings, Ui.weight(this, 1f, 0));
         root.addView(bottom, Ui.lp(this, 12));
 
+        /* 下拉刷新（4.51.6）：包一层 PullRefresh 容器。
+           必须用 onInterceptTouchEvent 那套 —— 挂在根布局的 OnTouchListener 收不到
+           落在卡片上的 DOWN，真机实测完全不生效（见 PullRefresh 的类注释）。 */
+        pullIndicator = Ui.pill(this, "↓ 下拉刷新", Ui.ACCENT_LIGHT, Ui.CARD);
+        pullIndicator.setVisibility(View.GONE);
+        pullIndicator.setAlpha(0f);
+        PullRefresh pull = new PullRefresh(this, pullIndicator);
+        pull.addView(root, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        pull.setOnRefresh(this::runPullRefresh);
+
         // 底层强度 1.00 —— 主界面：空间多、文字少，底层是主角
-        setContentView(Ui.glassScaffold(this, root, 1.00f));
+        setContentView(Ui.glassScaffold(this, pull, 1.00f));
+        frameOverlay(pullIndicator);
+    }
+
+    /** 下拉触发时真正做的事：刷积分（绕过节流）+ 刷状态。 */
+    private void runPullRefresh(final Runnable done) {
+        Log.i("下拉刷新：重新拉取状态与各账号积分");
+        /* 积分刷新有 5 分钟节流，下拉是**用户的明确意图**，必须绕过它 ——
+           否则用户拉一下什么都没发生，会以为下拉坏了。 */
+        lastCreditsAt = 0L;
+        refreshCreditsAsync(this, () -> {
+            refreshStatus();
+            done.run();
+            android.widget.Toast.makeText(this, "已刷新",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    /** 当前窗口的根 FrameLayout（glassScaffold 建的），用来叠加浮动控件。 */
+    private android.widget.FrameLayout rootFrame() {
+        View v = findViewById(android.R.id.content);
+        if (v instanceof android.widget.FrameLayout) {
+            View child = ((android.widget.FrameLayout) v).getChildAt(0);
+            if (child instanceof android.widget.FrameLayout) {
+                return (android.widget.FrameLayout) child;
+            }
+        }
+        return null;
+    }
+
+    /** 把一个浮动控件叠到根 FrameLayout 顶部居中。 */
+    private void frameOverlay(View v) {
+        android.widget.FrameLayout frame = rootFrame();
+        if (frame == null) return;
+        android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        lp.topMargin = Ui.dp(this, 8);
+        frame.addView(v, lp);
     }
 
     /* ------------------------------------------------------------------ state */
