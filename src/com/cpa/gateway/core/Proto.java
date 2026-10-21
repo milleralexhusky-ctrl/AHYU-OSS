@@ -146,6 +146,15 @@ public final class Proto {
         public String model;
         public final List<Msg> messages = new ArrayList<>();
         public String system;
+        /**
+         * 入口是 Anthropic 时保留的**原始 system**（字符串或块数组）。
+         *
+         * Claude Code 会把 system 拆成多个块并挂 `cache_control`；canonical 里
+         * 只剩拼平的文本，cache_control 一丢，上游就不能复用这段前缀缓存 ——
+         * 每一轮都为十几 KB 的 system 重新计费、重新计算，延迟和成本都上去了。
+         * 同协议转发（Anthropic 入口 → Anthropic 上游）时优先用原始形状。
+         */
+        public Object systemRaw;
         public Integer maxTokens;
         public Double temperature;
         public Double topP;
@@ -214,6 +223,15 @@ public final class Proto {
         public Integer seed;
         /** 请求来自哪套协议（openai / anthropic / gemini），出口翻译时要用。 */
         public String protocol = "";
+        /**
+         * 客户端带进来的 `anthropic-beta`（Claude Code 会带一长串）。
+         *
+         * Anthropic Messages 上游的很多能力（1M 上下文、细粒度工具流、interleaved
+         * thinking）都挂在这个头里；网关以前把它丢了，客户端明明开了 beta，
+         * 走网关却按默认能力走，表现就是"同一地址、同一个 Key，网关不如直连"。
+         * 只在出站也是 Anthropic 时原样转发，跨协议不要带。
+         */
+        public String beta = "";
         /**
          * 入口协议里**没有单独建模**的顶层字段（top_k / logprobs / service_tier /
          * metadata / safetySettings …）。

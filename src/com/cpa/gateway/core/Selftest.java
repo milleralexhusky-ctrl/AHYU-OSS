@@ -71,6 +71,8 @@ public final class Selftest {
         add(out, "检测采样跳过非聊天模型", Selftest::checkDetectSampling);
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
         add(out, "WorkBuddy 会话头与新版风控归类", Selftest::checkWorkBuddyChannel);
+        add(out, "Anthropic Messages 上游（Claude Code 接入地址）", Selftest::checkAnthropicUpstream);
+        add(out, "本机多端并发不共用单客户端配额", Selftest::checkLoopbackPeers);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -870,6 +872,81 @@ public final class Selftest {
         if (!h4.get("X-Conversation-ID").equals(h3.get("X-Conversation-ID"))) {
             return "同一会话跨轮次换了 X-Conversation-ID";
         }
+        return null;
+    }
+
+    /**
+     * "Claude Code 接入"文档里的地址有根地址、/v1、完整 /v1/messages 几种写法，
+     * 出站必须都能拼成同一个端点，且带上 Claude Code 认得的那组头。
+     */
+    private static String checkAnthropicUpstream() {
+        String[][] cases = {
+                {"https://api.anthropic.com", "https://api.anthropic.com/v1/messages"},
+                {"https://api.anthropic.com/", "https://api.anthropic.com/v1/messages"},
+                {"https://api.anthropic.com/v1", "https://api.anthropic.com/v1/messages"},
+                {"https://relay.example.com/api/anthropic",
+                        "https://relay.example.com/api/anthropic/v1/messages"},
+                {"https://relay.example.com/api/anthropic/v1/messages",
+                        "https://relay.example.com/api/anthropic/v1/messages"},
+                {"https://relay.example.com/api/anthropic/v1/messages/",
+                        "https://relay.example.com/api/anthropic/v1/messages"},
+        };
+        for (String[] c : cases) {
+            String got = Upstreams.anthropicMessagesUrl(c[0]);
+            if (!c[1].equals(got)) return "地址拼接错误：" + c[0] + " → " + got + "（期望 " + c[1] + "）";
+        }
+        Config.Provider p = new Config.Provider();
+        p.apiKey = "sk-selftest";
+        java.util.Map<String, String> h = Upstreams.anthropicHeaders(p, "context-1m-2025-08-07");
+        if (!"sk-selftest".equals(h.get("x-api-key"))) return "缺少 x-api-key";
+        if (!"Bearer sk-selftest".equals(h.get("Authorization"))) return "缺少 Bearer 兼容头";
+        if (!"2023-06-01".equals(h.get("anthropic-version"))) return "anthropic-version 不对";
+        if (!"cli".equals(h.get("x-app"))) return "缺少 Claude Code 的 x-app: cli";
+        String ua = h.get("user-agent");
+        if (ua == null || !ua.startsWith("claude-cli/")) return "User-Agent 不是 Claude Code 形状：" + ua;
+        if (!"context-1m-2025-08-07".equals(h.get("anthropic-beta"))) return "客户端 beta 没转发";
+        java.util.Map<String, String> h2 = Upstreams.anthropicHeaders(p, "");
+        if (h2.containsKey("anthropic-beta")) return "没有 beta 时不该凭空发明 anthropic-beta";
+
+        /* Anthropic → Anthropic：system 的 cache_control 必须保留，否则
+           Claude Code 每轮都要为整段 system 重新计费/计算。 */
+        try {
+            JSONObject in = new JSONObject();
+            in.put("model", "claude-sonnet-4-5");
+            in.put("max_tokens", 16);
+            JSONArray sys = new JSONArray();
+            sys.put(new JSONObject().put("type", "text").put("text", "很长的 system")
+                    .put("cache_control", new JSONObject().put("type", "ephemeral")));
+            in.put("system", sys);
+            JSONArray msgs = new JSONArray();
+            msgs.put(new JSONObject().put("role", "user").put("content", "hi"));
+            in.put("messages", msgs);
+            Proto.Req r = Fronts.AnthropicFront.parse(in);
+            JSONObject out = Upstreams.anthropicBody("claude-sonnet-4-5", r);
+            JSONArray outSys = out.optJSONArray("system");
+            if (outSys == null) return "同协议转发把 system 块数组拍平了（cache_control 丢失）";
+            JSONObject b0 = outSys.optJSONObject(0);
+            if (b0 == null || b0.optJSONObject("cache_control") == null) {
+                return "system 块的 cache_control 没保留";
+            }
+            /* 跨协议仍应是文本，不要把 Anthropic 的块塞给别的上游。 */
+            r.protocol = "openai";
+            JSONObject out2 = Upstreams.anthropicBody("claude-sonnet-4-5", r);
+            if (!(out2.opt("system") instanceof String)) {
+                return "跨协议入口仍带着 Anthropic 块形状";
+            }
+        } catch (Exception e) {
+            return "cache_control 样例失败：" + e;
+        }
+        return null;
+    }
+
+    /** 本机所有应用都从 127.0.0.1/::1 进来，必须都能拿到独立配额。 */
+    private static String checkLoopbackPeers() {
+        if (!Server.isLoopbackPeer("127.0.0.1")) return "127.0.0.1 没被认成回环";
+        if (!Server.isLoopbackPeer("0:0:0:0:0:0:0:1")) return "IPv6 回环没被认出来";
+        if (!Server.isLoopbackPeer("::ffff:127.0.0.1")) return "IPv4-mapped 回环没被认出来";
+        if (Server.isLoopbackPeer("192.168.1.5")) return "局域网地址被误认成回环";
         return null;
     }
 

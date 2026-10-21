@@ -1258,14 +1258,51 @@ public final class Upstreams {
         @Override
         public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
             JSONObject body = anthropicBody(model, req);
-            Map<String, String> headers = new HashMap<>();
-            if (!p.apiKey.isEmpty()) {
-                headers.put("x-api-key", p.apiKey);
-                headers.put("Authorization", "Bearer " + p.apiKey);
-            }
-            headers.put("anthropic-version", "2023-06-01");
-            anthropicStream(url(p.baseUrl, "v1/messages"), headers, body, sink);
+            anthropicStream(anthropicMessagesUrl(p.baseUrl),
+                    anthropicHeaders(p, req == null ? "" : req.beta), body, sink);
         }
+    }
+
+    /**
+     * 出站 Anthropic Messages 地址。
+     *
+     * "Claude Code 接入"文档给的地址有好几种写法，直接拼 `v1/messages` 会踩坑：
+     *   https://api.example.com                    → …/v1/messages
+     *   https://api.example.com/v1                 → …/v1/messages（不再叠一层 v1）
+     *   https://api.example.com/api/anthropic      → …/api/anthropic/v1/messages
+     *   https://api.example.com/v1/messages        → 原样（文档直接给完整端点）
+     *   https://api.example.com/api/anthropic/v1/messages → 原样
+     */
+    static String anthropicMessagesUrl(String base) {
+        String b = trimSlash(base);
+        if (b.isEmpty()) b = "https://api.anthropic.com";
+        String low = b.toLowerCase(java.util.Locale.US);
+        if (low.endsWith("/v1/messages") || low.endsWith("/messages")) return b;
+        return url(b, "v1/messages");
+    }
+
+    /**
+     * Anthropic Messages 出站头。
+     *
+     * 同时带 `x-api-key` 与 `Authorization: Bearer`：官方 API / 大多数中转任选其一即可，
+     * 两个都带是为了兼容"只认 Bearer"的 Claude Code 中转（它们把 Key 叫 AUTH_TOKEN）。
+     * UA / x-app 按 Claude Code 客户端写：部分中转会检查这两个头才放行。
+     * anthropic-beta 只转发客户端自己带来的，不凭空发明 —— 官网上没开通的 beta
+     * 硬塞过去会直接 400。
+     */
+    static Map<String, String> anthropicHeaders(Config.Provider p, String beta) {
+        Map<String, String> h = new HashMap<>();
+        if (p != null && p.apiKey != null && !p.apiKey.isEmpty()) {
+            h.put("x-api-key", p.apiKey);
+            h.put("Authorization", "Bearer " + p.apiKey);
+        }
+        h.put("anthropic-version", "2023-06-01");
+        h.put("content-type", "application/json");
+        h.put("accept", "text/event-stream");
+        h.put("user-agent", "claude-cli/2.1.280 (external, cli)");
+        h.put("x-app", "cli");
+        if (beta != null && !beta.trim().isEmpty()) h.put("anthropic-beta", beta.trim());
+        return h;
     }
 
     /** Shared Anthropic-shaped body builder (API key and OAuth channels both use it). */
@@ -1274,7 +1311,14 @@ public final class Upstreams {
         body.put("model", model);
         body.put("max_tokens", req.maxTokens == null ? 8192 : req.maxTokens.intValue());
         body.put("stream", true);
-        if (!req.systemText().isEmpty()) body.put("system", req.systemText());
+        /* Anthropic 入口 → Anthropic 上游：原样带回 system 块（含 cache_control）。
+           其它入口/出口用拼平的文本，避免把别的协议的形状硬塞过去。 */
+        Object rawSystem = req.systemRaw;
+        boolean keepRaw = "anthropic".equals(req.protocol) && rawSystem != null
+                && rawSystem != JSONObject.NULL
+                && !(rawSystem instanceof String && ((String) rawSystem).trim().isEmpty());
+        if (keepRaw) body.put("system", rawSystem);
+        else if (!req.systemText().isEmpty()) body.put("system", req.systemText());
         if (req.temperature != null) body.put("temperature", req.temperature.doubleValue());
         if (req.topP != null) body.put("top_p", req.topP.doubleValue());
         /* top_k 在 Anthropic 里是原生字段：OpenAI 入口的 top_k / Gemini 的 topK

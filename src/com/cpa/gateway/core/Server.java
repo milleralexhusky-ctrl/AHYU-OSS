@@ -755,10 +755,24 @@ public final class Server {
     private static final double PEER_SHARE = 0.375;   /* 24/64，保持原来的份额 */
     private static final int PEER_FLOOR = 8;
 
-    private static int maxPerPeer() {
+    private static int maxPerPeer(String peerKey) {
+        /* 回环地址不算"一个客户端"：本机上所有应用（编辑器、浏览器、桌面壳、
+           自动化脚本）都从 127.0.0.1 / ::1 进来，共用一个 peer key。
+           按普通客户端配额只给 8 条，两个应用各开几条 keep-alive 就互相挤掉了。
+           本机流量是用户自己的，给到总容量减去给局域网预留的那一份（56/64），
+           仍然保留上限，防止某个泄漏连接的本地应用把整池吃光。 */
+        if (isLoopbackPeer(peerKey)) return Math.max(PEER_FLOOR, MAX_CONN - PEER_FLOOR);
         int cap = Capacity.suggest();
         int v = (int) Math.ceil(cap * PEER_SHARE);
         return Math.max(PEER_FLOOR, Math.min(v, Math.max(PEER_FLOOR, cap)));
+    }
+
+    /** 这个 peer key 是不是本机回环（IPv4 / IPv6 / IPv4-mapped）。 */
+    static boolean isLoopbackPeer(String peerKey) {
+        if (peerKey == null) return false;
+        String s = peerKey.startsWith("/") ? peerKey.substring(1) : peerKey;
+        return s.startsWith("127.") || "::1".equals(s) || "0:0:0:0:0:0:0:1".equals(s)
+                || s.startsWith("::ffff:127.") || "localhost".equalsIgnoreCase(s);
     }
 
     /**
@@ -1007,27 +1021,21 @@ public final class Server {
     }
 
     private void handle(Socket s) {
-        /*
-         * 进出各记一次，用来量**真实瞬时并发** —— Capacity 用它算排队论里的
-         * 负载强度 a = λ·W。放在最前面/最后面，保证异常退出也能减回去。
-         */
-        Capacity.enter();
-        long enterAt = System.currentTimeMillis();
+        /* Capacity 按**请求**记账（不是按连接）：keep-alive 空闲连接不占服务台，
+           否则一条空闲 60 秒的连接会被当成"一个跑了 60 秒的请求"，
+           把排队论算出来的容量和压力值全部带偏。 */
         Conn conn = null;
         String peer = String.valueOf(s.getInetAddress());
         final String peerKey = peerKeyOf(peer);
         java.util.concurrent.atomic.AtomicInteger counter =
                 PER_PEER.computeIfAbsent(peerKey, k -> new java.util.concurrent.atomic.AtomicInteger());
         int live = counter.incrementAndGet();
-        int perPeer = maxPerPeer();
+        int perPeer = maxPerPeer(peerKey);
         if (live > perPeer) {
             counter.decrementAndGet();
             /* 计数归零就把表项删掉：LAN 模式下每个来源 IP 留一条，
                IPv6 客户端可以换地址，长期下来这张表会无限增长。 */
             PER_PEER.computeIfPresent(peerKey, (k, v) -> v.get() <= 0 ? null : v);
-            /* 这条连接没进下面的 try/finally，必须在这里把 Capacity 减回去；
-               否则每拒绝一条，inflight 就永久 +1，压力值和首请求时限都会被算歪。 */
-            Capacity.leave();
             Log.w("同一客户端连接过多（" + live + " > " + perPeer + "）：" + peer + "，拒绝一条");
             try {
                 s.getOutputStream().write(("HTTP/1.1 503 Service Unavailable\r\n"
@@ -1107,6 +1115,9 @@ public final class Server {
                 }
                 boolean reqOk = true;
                 String errKind = ErrorKind.NONE;
+                /* 请求级进出账：inflight 是"正在处理的请求数"，
+                   生命周期 = 这一次 route 的耗时（流式请求算到最后一个字节）。 */
+                Capacity.enter();
                 try {
                     route(r, out, s);
                 } catch (Throwable routeError) {
@@ -1122,8 +1133,15 @@ public final class Server {
                             ? ((InvalidRequest) routeError).code : 500;
                     failResponse(out, r.path, status, String.valueOf(routeError.getMessage()));
                     if (!conn.sse) conn.keepAlive = false;
+                } finally {
+                    Capacity.leave();
                 }
                 long took = System.currentTimeMillis() - started;
+                /* 容量模型只吃真实流量：后台探活（x-cpa-ephemeral）会带 90 秒超时，
+                   把它算进去会让"请求很慢"的结论失真，进而把建议容量带偏。 */
+                if (r.header("x-cpa-ephemeral").isEmpty() && !r.path.startsWith("/v1/debug")) {
+                    Capacity.record(started, took);
+                }
                 if (Debug.ON) {
                     long netT2 = android.os.SystemClock.uptimeMillis();
                     Log.i("请求分解：" + r.method + " " + r.path
@@ -1242,8 +1260,6 @@ public final class Server {
                    并发新连接可能刚把计数加回 1，这时不能把表项删掉。 */
                 PER_PEER.computeIfPresent(peerKey, (k, v) -> v.get() <= 0 ? null : v);
             }
-            Capacity.leave();
-            Capacity.record(enterAt, System.currentTimeMillis() - enterAt);
         }
     }
 
@@ -5648,6 +5664,10 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.AnthropicFront.parse(body);
+        /* Claude Code 把 1M 上下文、细粒度工具流、interleaved thinking 这些能力
+           都写在 anthropic-beta 里。网关出站也是 Anthropic 时原样带上，
+           否则同一个地址、同一个 Key，走网关会比直连少能力。 */
+        req.beta = r.header("anthropic-beta");
         /* 4.34.0 说"五处前端入口全接上"，实际这里漏了：Claude Code 走的正是
            /v1/messages，缺 id 的工具调用会一路发到上游，再被记成渠道失败。
            补在解析之后、选路之前：坏请求不占候选、不进熔断。 */

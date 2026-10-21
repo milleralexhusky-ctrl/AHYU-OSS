@@ -936,6 +936,9 @@ public final class Fronts {
             if (ath instanceof JSONObject) req.thinkingParams = ath;
             Object sys = body.opt("system");
             req.system = OpenAiFront.contentToText(sys);
+            /* 同协议（Anthropic → Anthropic）转发时保留块结构与 cache_control；
+               跨协议仍用拼平的 req.system。 */
+            req.systemRaw = sys;
             JSONArray stops = body.optJSONArray("stop_sequences");
             if (stops != null) for (int i = 0; i < stops.length(); i++) req.stop.add(String.valueOf(stops.opt(i)));
             JSONArray msgs = body.optJSONArray("messages");

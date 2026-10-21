@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.50.4**（versionCode 647，见 `version.properties`）
+- 当前版本：**4.51.0**（versionCode 648，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -36,6 +36,11 @@
 ChatGPT/Codex、DeepSeek、豆包、Cline、xAI、Kilo、OVH，以及自定义
 OpenAI/Anthropic/Gemini 兼容中转。
 登录方式按渠道支持 OAuth、设备码、WebView、API Key 等。
+
+**自定义上游协议**：OpenAI 兼容、Anthropic Messages（文档里“Claude Code 接入”的
+根地址、`/v1` 或完整 `/v1/messages` 都可直接粘贴）、Gemini。Anthropic 上游会
+带上 Claude Code 形状的 UA / `x-app` / `anthropic-beta`，并保留 `system` 块的
+`cache_control` 前缀缓存。
 
 **选路与稳定性**：`auto` / `auto-code` / `auto-long` / `auto-race` 虚拟模型；
 按成功率、延迟、成本、额度、工具能力打分；首字节前自动换号；限流指数退避、
@@ -131,6 +136,8 @@ docs/research/             协议调查脚本
 ## 性能与保真
 
 - 150 次 keep-alive 真机压测：`/v1/models` p50 0.77ms、`/health` 0.99ms、`/v1/capacity` 1.18ms。
+- 本机多应用并发：回环地址不再共用单客户端连接配额（56/64），
+  20 个并发连接实测 20/20 成功；容量模型只统计真实请求，空闲 keep-alive 不计入。
 - 同协议转发时保留未建模字段（`top_k` / `service_tier` / `metadata` / `safetySettings` 等），
   不因网关不认识而丢掉；跨协议不硬塞。
 - 客户端要 `n>1`、`logprobs` / `top_logprobs` 或音频输出时，OpenAI 兼容渠道走

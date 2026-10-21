@@ -110,7 +110,8 @@ final class ProviderEditor {
         box.addView(type);
 
         final EditText baseUrl = Ui.field(a, "https://api.example.com/v1", p.baseUrl, false);
-        box.addView(Ui.label(a, "服务地址（根地址或 /v1 都行；WorkBuddy / ChatGPT 账号可留空）"), Ui.lp(a, 12));
+        box.addView(Ui.label(a, "服务地址（根地址、/v1、/v1/messages 都行；"
+                + "Claude Code 文档给的那个地址可直接粘贴；WorkBuddy / ChatGPT 账号可留空）"), Ui.lp(a, 12));
         box.addView(baseUrl);
 
         final EditText apiKey = Ui.field(a, "服务商给的 Key（填过的也当 User-Agent 用）", p.apiKey, false);

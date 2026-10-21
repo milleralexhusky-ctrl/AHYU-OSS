@@ -204,7 +204,7 @@ public final class Claude {
         public void chat(String model, Proto.Req req, Proto.Sink sink) throws Exception {
             Account acc = ensureFresh(p);
             JSONObject body = Upstreams.anthropicBody(model, req);
-            Upstreams.anthropicStream(Upstreams.url(baseOf(p), "v1/messages"), headers(acc), body, sink);
+            Upstreams.anthropicStream(Upstreams.anthropicMessagesUrl(baseOf(p)), headers(acc), body, sink);
         }
     }
 
