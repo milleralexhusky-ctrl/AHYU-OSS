@@ -66,10 +66,25 @@ public final class Fronts {
          */
         public JSONObject rawBody;
 
-        /** 这次响应里到底有没有"东西"：正文 / 思考 / 工具调用 / 原样透传的完整响应。 */
+        /**
+         * 这次响应里到底有没有**交付给客户端的东西**：正文 / 工具调用 / 原样透传的响应体。
+         *
+         * 为什么**不算 thinking**：思考过程不是回答。实测（Loomy 走 OpenAI 协议转
+         * Anthropic 出口）会出现"只有 thinking、stop_reason=end_turn、没有正文也没有
+         * 工具调用"的响应 —— 客户端拿到的是一个空回答。对 agent 类客户端更糟：
+         * 既没有文字也没有工具调用，它只能重试，表现就是"回空 / 一直重连"。
+         * 这种响应当成空，让上层换候选。
+         */
         public boolean substantive() {
-            return rawBody != null || text.length() > 0 || thinking.length() > 0
-                    || !toolCalls.isEmpty();
+            return rawBody != null || delivered(text) || !toolCalls.isEmpty();
+        }
+
+        /** 正文里除了空白还有没有东西（模型偶尔只发几个空格，那也不算交付）。 */
+        private static boolean delivered(StringBuilder sb) {
+            for (int i = 0; i < sb.length(); i++) {
+                if (!Character.isWhitespace(sb.charAt(i))) return true;
+            }
+            return false;
         }
 
         @Override
@@ -338,6 +353,8 @@ public final class Fronts {
             private Proto.Usage usage = new Proto.Usage();
             private String stop = "stop";
             private final boolean[] toolStarted = {false};
+            /** 有没有交付正文或工具调用。**不算 thinking**（思考过程不是回答）。 */
+            private boolean deliveredText;
 
             /* ---- 响应保真（4.50.0） ---- */
             /** 这条流有没有真的透传过上游分片；有则 finish() 不再补 canonical 收尾。 */
@@ -352,6 +369,8 @@ public final class Fronts {
                     new java.util.HashMap<>();
             /** 还没确认有正文的 role-only 分片：先压着，失败换号时客户端什么都没看到。 */
             private final List<JSONObject> rawPending = new ArrayList<>();
+            /** 透传里出现过"正文 / 工具调用"。**思考不算**（见 delivered()）。 */
+            private boolean rawDelivered;
 
             public Streamer(BufferedWriter w, String model) {
                 this(w, model, true);
@@ -376,6 +395,17 @@ public final class Fronts {
                 return roleSent || rawWrote || rawEnded;
             }
 
+            /**
+             * 这次尝试有没有交付内容（正文或工具调用）。
+             *
+             * 与 committed() 的区别：committed 说的是"客户端可能已经看到东西了"，
+             * 这个说的是"确实给了回答"。只有思考没有正文的尝试会 committed()==true
+             * 但这里 false —— 它是空回答，调用方据此换候选。
+             */
+            public boolean delivered() {
+                return deliveredText || toolStarted[0] || rawDelivered;
+            }
+
             /** 这次请求有没有真的走成 raw（用于回退 canonical 时留一条可观测日志）。 */
             public boolean rawSeen() {
                 return rawWrote || rawEnded;
@@ -393,16 +423,29 @@ public final class Fronts {
                 rawStrippers.clear();
                 rawWrote = false;
                 rawEnded = false;
+                rawDelivered = false;
                 roleSent = false;
                 seen.setLength(0);
                 toolIndex = 0;
                 toolStarted[0] = false;
+                deliveredText = false;
             }
 
             /* ------------------------------------------------ 响应保真（4.50.0） */
 
-            /** 这个分片有没有"实质内容"（而不是只有 role 的空壳）。 */
+            /**
+             * 这个分片有没有"实质内容"（而不是只有 role 的空壳）。
+             *
+             * 保真透传模式下用它决定"能不能开始往客户端写"：只有 role 的空壳先压着，
+             * 上游在这之前失败时还能安静换号。thinking 分片在这里算实质内容
+             * （要尽早下发，不能憋着），但它**不算交付**，见 {@link #delivered(JSONObject)}。
+             */
             private static boolean substantive(JSONObject chunk) {
+                return delivered(chunk) || hasReasoning(chunk);
+            }
+
+            /** 分片里有没有交付内容：正文 / 工具调用 / 音频。**思考不算**。 */
+            private static boolean delivered(JSONObject chunk) {
                 JSONArray choices = chunk.optJSONArray("choices");
                 if (choices == null || choices.length() == 0) {
                     /* 只有 usage 的收尾分片（OpenAI 在 include_usage 下会单独发一条）。 */
@@ -416,14 +459,25 @@ public final class Fronts {
                     JSONObject d = c.optJSONObject("delta");
                     if (d == null) continue;
                     if (!Proto.optString(d, "content", "").isEmpty()) return true;
-                    if (!Proto.optString(d, "reasoning_content", "").isEmpty()) return true;
-                    if (!Proto.optString(d, "reasoning", "").isEmpty()) return true;
                     if (!Proto.optString(d, "refusal", "").isEmpty()) return true;
-                    /* 音频分片也是实质内容：不认它会把整段音频压进 rawPending，
+                    /* 音频分片也是交付内容：不认它会把整段音频压进 rawPending，
                        既不能增量下发，断流时还会换号重下。 */
                     if (d.opt("audio") != null) return true;
                     JSONArray tc = d.optJSONArray("tool_calls");
                     if (tc != null && tc.length() > 0) return true;
+                }
+                return false;
+            }
+
+            /** 分片里有没有思考内容（会被写出，但不算"交付"）。 */
+            private static boolean hasReasoning(JSONObject chunk) {
+                JSONArray choices = chunk.optJSONArray("choices");
+                for (int i = 0; choices != null && i < choices.length(); i++) {
+                    JSONObject c = choices.optJSONObject(i);
+                    JSONObject d = c == null ? null : c.optJSONObject("delta");
+                    if (d == null) continue;
+                    if (!Proto.optString(d, "reasoning_content", "").isEmpty()) return true;
+                    if (!Proto.optString(d, "reasoning", "").isEmpty()) return true;
                 }
                 return false;
             }
@@ -467,14 +521,17 @@ public final class Fronts {
             public void rawChunk(JSONObject chunk) {
                 if (chunk == null) return;
                 try {
-                    if (!rawWrote && !substantive(chunk)) {
-                        /* role 空壳先攒着。上游在真正出字前失败时，这些分片一个都
-                           没写出去，上层还能安静地换号，客户端不会看到半截流。 */
+                    /* 还没交付正文/工具调用时，连 thinking 分片也先压着：
+                       一是上游在出字前失败时能安静换号，不会给客户端留半截流；
+                       二是"只有思考、没有正文"的响应要能被判成空（见 delivered）。
+                       flushPending 会按原顺序把压着的思考补写出去，正常流里
+                       思考本来就在正文之前，顺序不变。 */
+                    if (!rawWrote && !delivered(chunk)) {
                         rawPending.add(chunk);
                         return;
                     }
                     flushPending();
-                    rawWrote = true;
+                    rawDelivered = true;
                     writeRaw(chunk);
                 } catch (Exception ignored) {
                 }
@@ -483,10 +540,14 @@ public final class Fronts {
             @Override
             public void rawDone() {
                 if (rawEnded) return;
+                if (!rawWrote) {
+                    /* 一个交付内容都没有（可能只有 role 或只有思考）：不写 [DONE]、
+                       不置 rawEnded，把"这算不算一次成功"交给上层——它才有权换候选。
+                       这里要是写了 [DONE]，客户端就收到一条空回答，而且再也换不了。 */
+                    rawPending.clear();
+                    return;
+                }
                 try {
-                    /* 只有 role 分片、没有正文的空 completion：至少把 role 写出去，
-                       否则客户端收到一条只有 [DONE] 的流。 */
-                    flushPending();
                     sse(w, "[DONE]");
                     w.flush();
                 } catch (Exception ignored) {
@@ -536,6 +597,7 @@ public final class Fronts {
                     if (delta != null && seen.length() < 4000) seen.append(delta);   // 原样留一份，判嘴炮用
                     delta = stripper.clean(delta);          // 去掉"我是 XX 模型"
                     if (delta == null || delta.isEmpty()) return;
+                    deliveredText = true;
                     JSONObject d = baseDelta();
                     d.put("content", delta);
                     chunk(d, null);
@@ -558,6 +620,7 @@ public final class Fronts {
                 String fixed = fixToolArgs(argsJson);
                 if (fixed == null) return;
                 try {
+                    deliveredText = true;
                     JSONObject d = baseDelta();
                     JSONObject fn = new JSONObject();
                     fn.put("name", name);
@@ -1071,16 +1134,23 @@ public final class Fronts {
             private String toolId = "";
             /** 是否已经写出 message_start；只有真的来内容时才写，空流才能换号。 */
             private boolean started;
-            /** 是否来过正文/思考/工具调用。 */
-            private boolean substantive;
+            /** 是否来过正文 / 工具调用。**不算 thinking**：思考过程不是回答。 */
+            private boolean delivered;
 
             public Streamer(BufferedWriter w, String model) {
                 this.w = w;
                 this.model = model;
             }
 
+            /**
+             * 这次到底有没有交付内容。
+             *
+             * 只认正文与工具调用。thinking 会写出去（客户端想看思考），但它**不算
+             * 交付**：实测出现过"只有 thinking、没有正文、stop_reason=end_turn"的响应，
+             * 客户端看到的是空回答。这种情况下我们要能换候选，所以不能把它算成功。
+             */
             public boolean substantive() {
-                return substantive;
+                return delivered;
             }
 
             /** 延迟到第一段内容再写 message_start：空流不提交，网关可以换下一个候选。 */
@@ -1155,7 +1225,7 @@ public final class Fronts {
             public void text(String d) {
                 if (d == null || d.isEmpty()) return;
                 try {
-                    substantive = true;
+                    delivered = true;
                     start();
                     if (!"text".equals(openType)) openBlock("text", new JSONObject().put("text", ""));
                     delta("text_delta", new JSONObject().put("type", "text_delta").put("text", d));
@@ -1167,7 +1237,9 @@ public final class Fronts {
             public void thinking(String d) {
                 if (d == null || d.isEmpty()) return;
                 try {
-                    substantive = true;
+                    /* 思考会被写出去（客户端要显示），但**不算交付**：
+                       只有思考没有正文的响应，对客户端就是一个空回答。
+                       这里照常 start()，好让思考过程能流给用户看。 */
                     start();
                     if (!"thinking".equals(openType)) {
                         /* 起始块就带上 signature：非流式那条必须带，流式这里也一并给上，
@@ -1184,7 +1256,7 @@ public final class Fronts {
                 String fixed = fixToolArgs(argsJson);
                 if (fixed == null) return;
                 try {
-                    substantive = true;
+                    delivered = true;
                     start();
                     toolId = callId;
                     toolName = name;
@@ -1206,9 +1278,11 @@ public final class Fronts {
                 try {
                     stop = stopReason;
                     if (u != null) usage = u;
-                    /* 没有任何内容：不要写 message_start / message_delta / message_stop。
-                       调用方看到 substantive()==false 会换下一个候选；写了收尾就换不了。 */
-                    if (!started) return;
+                    /* 没有交付正文/工具调用（可能只有思考，甚至什么都没有）：
+                       什么都不要再写。整个流还压在 DeferredWriter 缓冲里，
+                       调用方看到 substantive()==false 会清掉缓冲并换下一个候选；
+                       这里要是写了收尾，就再也换不了，客户端只会收到空回答。 */
+                    if (!delivered) return;
                     closeBlockIfOpen();
                     JSONObject md = new JSONObject();
                     md.put("type", "message_delta");

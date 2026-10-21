@@ -73,6 +73,8 @@ public final class Selftest {
         add(out, "WorkBuddy 会话头与新版风控归类", Selftest::checkWorkBuddyChannel);
         add(out, "Anthropic Messages 上游（Claude Code 接入地址）", Selftest::checkAnthropicUpstream);
         add(out, "本机多端并发不共用单客户端配额", Selftest::checkLoopbackPeers);
+        add(out, "thinking 跨协议近似翻译", Selftest::checkThinkingTranslation);
+        add(out, "凭据不可用/受限账号退出派发", Selftest::checkUnreadableCredentials);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -956,6 +958,110 @@ public final class Selftest {
         return null;
     }
 
+    /**
+     * thinking 跨协议近似翻译（4.51.4）。
+     *
+     * Claude Code 发 Anthropic 的 thinking.budget_tokens，而选中的上游常常是
+     * OpenAI 协议的中转。以前跨协议一律丢掉 —— 用户开了思考却没思考。
+     * 现在翻成近似的档位/预算，并且同协议仍然原样透传。
+     */
+    private static String checkThinkingTranslation() {
+        JSONObject anth = new JSONObject();
+        try {
+            anth.put("type", "enabled").put("budget_tokens", 8000);
+        } catch (Exception e) {
+            return "构造样例失败：" + e;
+        }
+        /* 同协议原样 */
+        if (XParams.thinking("anthropic", anth, "anthropic") != anth) {
+            return "同协议 thinking 没原样透传";
+        }
+        /* Anthropic → OpenAI：按预算分档 */
+        Object toOpenAi = XParams.thinking("anthropic", anth, "openai");
+        if (!(toOpenAi instanceof JSONObject)) return "Anthropic→OpenAI 的 thinking 没翻译";
+        if (!"medium".equals(Proto.optString((JSONObject) toOpenAi, "effort", ""))) {
+            return "8000 预算没翻成 medium：" + toOpenAi;
+        }
+        /* 大预算 → high，小预算 → low */
+        try {
+            JSONObject big = new JSONObject().put("type", "enabled").put("budget_tokens", 32000);
+            JSONObject small = new JSONObject().put("type", "enabled").put("budget_tokens", 1024);
+            if (!"high".equals(Proto.optString(
+                    (JSONObject) XParams.thinking("anthropic", big, "openai"), "effort", ""))) {
+                return "32000 预算没翻成 high";
+            }
+            if (!"low".equals(Proto.optString(
+                    (JSONObject) XParams.thinking("anthropic", small, "openai"), "effort", ""))) {
+                return "1024 预算没翻成 low";
+            }
+        } catch (Exception e) {
+            return "分档样例失败：" + e;
+        }
+        /* Anthropic → Gemini：带预算 */
+        Object toGem = XParams.thinking("anthropic", anth, "gemini");
+        if (!(toGem instanceof JSONObject)
+                || Proto.optInt((JSONObject) toGem, "thinkingBudget") == null
+                || ((JSONObject) toGem).optInt("thinkingBudget") != 8000) {
+            return "Anthropic→Gemini 的预算没翻译：" + toGem;
+        }
+        /* OpenAI → Anthropic：档位换成约定预算 */
+        try {
+            JSONObject oe = new JSONObject().put("effort", "high");
+            Object back = XParams.thinking("openai", oe, "anthropic");
+            if (!(back instanceof JSONObject)
+                    || !"enabled".equals(Proto.optString((JSONObject) back, "type", ""))
+                    || Proto.optInt((JSONObject) back, "budget_tokens") == null) {
+                return "OpenAI→Anthropic 的档位没翻成预算：" + back;
+            }
+            /* disabled 要翻成 Anthropic 的 disabled */
+            JSONObject off = new JSONObject().put("type", "disabled");
+            Object offBack = XParams.thinking("anthropic", off, "gemini");
+            if (!(offBack instanceof JSONObject)
+                    || ((JSONObject) offBack).optInt("thinkingBudget", -1) != 0) {
+                return "disabled 没翻成 thinkingBudget=0：" + offBack;
+            }
+        } catch (Exception e) {
+            return "档位样例失败：" + e;
+        }
+        return null;
+    }
+
+    /**
+     * 凭据解不开的账号必须退出派发（4.51.4）。
+     *
+     * 真机场景：变体包/换机/Keystore 重建时，配置里的 `enc:v1:` 密文解不开，
+     * 账号的 credentials 在内存里是空的 —— 但以前它照样留在池子里显示"可用"，
+     * 客户端选到就必然失败。现在标记为不可派发，并且用户编辑账号后解除。
+     */
+    private static String checkUnreadableCredentials() {
+        Config.Provider p = new Config.Provider();
+        p.name = "cred-selftest";
+        if (!p.dispatchable()) return "正常账号不该被判定为不可派发";
+        p.credentialsUnreadable = true;
+        if (p.dispatchable()) return "凭据解不开的账号仍然在派发池里";
+        if (p.blockedReason().isEmpty()) return "凭据解不开时没有给出原因";
+        p.clearRestricted();
+        if (p.credentialsUnreadable) return "用户编辑账号后没有解除凭据标记";
+        if (!p.dispatchable()) return "解除标记后仍不可派发";
+
+        /* 上游限制同样要退出派发，并且带原因。 */
+        Config.Provider q = new Config.Provider();
+        q.name = "restricted-selftest";
+        q.markRestricted(60_000L, "账号存在异常行为，已被限制使用");
+        if (q.dispatchable()) return "被上游限制的账号仍然在派发池里";
+        if (!q.blockedReason().contains("限制")) return "受限原因没透出来：" + q.blockedReason();
+        q.clearRestricted();
+        if (!q.dispatchable()) return "解除限制后仍不可派发";
+
+        /* 只有思考的响应不算交付（4.51.4）。 */
+        Fronts.Collector c = new Fronts.Collector();
+        c.thinking("想了很久，但一句话没说");
+        if (c.substantive()) return "只有思考的响应被算成有内容（客户端会看到空回答）";
+        c.text("好了");
+        if (!c.substantive()) return "有正文时没被算成有内容";
+        return null;
+    }
+
     /** 国际版重发的开关与跳过条件。 */
     private static String checkIntlFallback() {
         Config.Provider p = new Config.Provider();
@@ -1400,7 +1506,8 @@ public final class Selftest {
         if (sw2.toString().contains("id-from-A")) return "换号后残留了上一个候选的分片";
         if (!sw2.toString().contains("id-from-B")) return "换号后的正常分片丢了";
 
-        /* 只有 role 的 completion：rawDone 要把 role 写出去，不能只剩 [DONE]。 */
+        /* 只有 role 的 completion：什么都不该写出去，也不能置 rawEnded ——
+           上层要能把它判成空并换候选；写了 [DONE] 就换不了。 */
         java.io.StringWriter sw3 = new java.io.StringWriter();
         Fronts.OpenAiFront.Streamer s3 = new Fronts.OpenAiFront.Streamer(
                 new java.io.BufferedWriter(sw3), "client-model", false);
@@ -1410,8 +1517,51 @@ public final class Selftest {
                 .put("index", 0).put("delta", new JSONObject().put("role", "assistant"))));
         s3.rawChunk(onlyRole);
         s3.rawDone();
-        if (!sw3.toString().contains("role-only")) return "只有 role 的空流把 role 丢了";
-        if (!sw3.toString().contains("data: [DONE]")) return "空流没补 [DONE]";
+        if (!sw3.toString().isEmpty()) {
+            return "只有 role 的空流被写出去了（换不了号，客户端会收到空回答）";
+        }
+        if (s3.rawSeen()) return "只有 role 的空流被标成已提交";
+        if (s3.delivered()) return "只有 role 的空流被算成已交付";
+
+        /* 只有 thinking、没有正文（真机遇到的"回空"）：不许当成交付，也不许写出。
+           思考先压在缓冲里，一旦真来正文会按原顺序补写出去；
+           一直没来正文就整体丢掉、换候选——总比给客户端一个空回答好。 */
+        java.io.StringWriter sw5 = new java.io.StringWriter();
+        Fronts.OpenAiFront.Streamer s5 = new Fronts.OpenAiFront.Streamer(
+                new java.io.BufferedWriter(sw5), "client-model", false);
+        JSONObject think = new JSONObject();
+        think.put("id", "think-only");
+        think.put("choices", new JSONArray().put(new JSONObject().put("index", 0)
+                .put("delta", new JSONObject().put("reasoning_content", "让我想想"))));
+        s5.rawChunk(think);
+        s5.rawDone();
+        if (!sw5.toString().isEmpty()) {
+            return "只有思考的流被写出去了（客户端会看到空回答，而且换不了号）";
+        }
+        if (s5.rawSeen()) return "只有思考的流被标成已提交（换不了号）";
+        if (s5.delivered()) return "只有思考的流被算成已交付";
+
+        /* 思考 + 正文：思考要先补写出去，顺序不能乱，且算已交付。 */
+        java.io.StringWriter sw8 = new java.io.StringWriter();
+        Fronts.OpenAiFront.Streamer s8 = new Fronts.OpenAiFront.Streamer(
+                new java.io.BufferedWriter(sw8), "client-model", false);
+        JSONObject t8 = new JSONObject();
+        t8.put("id", "think-then-text");
+        t8.put("choices", new JSONArray().put(new JSONObject().put("index", 0)
+                .put("delta", new JSONObject().put("reasoning_content", "先思考"))));
+        s8.rawChunk(t8);
+        JSONObject c8 = new JSONObject();
+        c8.put("id", "think-then-text");
+        c8.put("choices", new JSONArray().put(new JSONObject().put("index", 0)
+                .put("delta", new JSONObject().put("content", "再回答"))));
+        s8.rawChunk(c8);
+        s8.rawDone();
+        String o8 = sw8.toString();
+        if (!s8.delivered()) return "带正文的流没被算成已交付";
+        if (o8.indexOf("先思考") < 0 || o8.indexOf("再回答") < 0) {
+            return "思考或正文丢了：" + o8;
+        }
+        if (o8.indexOf("先思考") > o8.indexOf("再回答")) return "思考与正文的顺序反了";
 
         /* 音频分片必须算实质内容，不能压进 pending。 */
         java.io.StringWriter sw4 = new java.io.StringWriter();
@@ -1424,6 +1574,32 @@ public final class Selftest {
                 .put("delta", new JSONObject().put("audio", new JSONObject().put("data", "AAA")))));
         s4.rawChunk(audio);
         if (!sw4.toString().contains("audio-1")) return "音频分片被压进 pending，没有增量下发";
+        if (!s4.delivered()) return "音频分片没被算成交付内容";
+
+        /* Anthropic 出口：只有 thinking 的流同样不算交付。 */
+        try {
+            java.io.StringWriter sw6 = new java.io.StringWriter();
+            Fronts.AnthropicFront.Streamer s6 = new Fronts.AnthropicFront.Streamer(
+                    new java.io.BufferedWriter(sw6), "client-model");
+            s6.thinking("让我想想");
+            s6.finish("stop", new Proto.Usage());
+            if (s6.substantive()) return "只有思考的 Anthropic 流被算成已交付";
+            if (sw6.toString().contains("message_delta")) {
+                return "只有思考的 Anthropic 流写了收尾（换不了号）";
+            }
+            /* 有正文时才是正常交付。 */
+            java.io.StringWriter sw7 = new java.io.StringWriter();
+            Fronts.AnthropicFront.Streamer s7 = new Fronts.AnthropicFront.Streamer(
+                    new java.io.BufferedWriter(sw7), "client-model");
+            s7.thinking("思考");
+            s7.text("回答");
+            s7.finish("stop", new Proto.Usage());
+            if (!s7.substantive()) return "带正文的 Anthropic 流没被算成已交付";
+            if (!sw7.toString().contains("message_stop")) return "正常流少了 message_stop";
+            if (!sw7.toString().contains("thinking_delta")) return "思考过程没下发";
+        } catch (Exception e) {
+            return "Anthropic 空流样例失败：" + e;
+        }
         return null;
     }
 

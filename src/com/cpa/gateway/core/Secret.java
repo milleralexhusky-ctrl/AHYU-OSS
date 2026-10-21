@@ -50,7 +50,17 @@ public final class Secret {
         }
     }
 
-    /** 解密一个值；明文照原样返回，解不开就返回空串（并记日志）。 */
+    /**
+     * 解密失败只打一次日志。
+     *
+     * 为什么必须去重：解不开的字段每次读配置、每次自动保存、每次界面刷新都会被
+     * 解一遍。真机上实测每 10~20 秒刷 6 条同样的 WARN，日志被它淹掉，
+     * 真正的线索反而看不见了。这里按"异常类型 + 字段形状"记一次。
+     */
+    private static final java.util.Set<String> WARNED =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+
+    /** 解密一个值；明文照原样返回，解不开就返回空串（并记一次日志）。 */
     public static String open(String stored) {
         if (!isSealed(stored)) return stored;
         try {
@@ -64,7 +74,10 @@ public final class Secret {
                     new javax.crypto.spec.GCMParameterSpec(128, iv));
             return new String(d.doFinal(ct), "UTF-8");
         } catch (Throwable t) {
-            Log.w("配置解密失败（该字段退回空值，需要重新登录 / 重填 Key）：" + t);
+            if (WARNED.add(String.valueOf(t.getClass().getSimpleName()))) {
+                Log.w("配置解密失败（该字段退回空值，需要重新登录 / 重填 Key）：" + t
+                        + " —— 同类失败后续不再重复记录");
+            }
             return "";
         }
     }

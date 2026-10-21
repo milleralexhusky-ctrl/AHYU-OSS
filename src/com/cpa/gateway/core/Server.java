@@ -2630,9 +2630,10 @@ public final class Server {
                 throw new RaceLost(racerId);
             }
             buf.append(cbuf, off, len);
-            // 只出现"角色"那种前导事件不算数，等真的来内容了才提交
-            if (buf.indexOf("\"content\"") >= 0 || buf.indexOf("content_block_delta") >= 0
-                    || buf.indexOf("\"tool_calls\"") >= 0 || buf.length() > 8192) {
+            /* 只有"角色/心跳"那种前导事件不算数：等真的交付了内容再提交。
+               thinking 也不算（见 hasDeliveredContent）——只有思考、没有正文的响应
+               对客户端就是一个空回答，必须留在缓冲里才有机会换候选。 */
+            if (hasDeliveredContent(buf) || buf.length() > 8192) {
                 // 竞速：谁先出内容谁赢；没抢到就直接认输退出
                 if (race != null && !race.tryWin(racerId)) {
                     throw new RaceLost(racerId);
@@ -2654,6 +2655,34 @@ public final class Server {
         public void close() throws java.io.IOException {
             if (committed) real.close();
         }
+    }
+
+    /**
+     * 缓冲里有没有"已经交付给客户端的内容"。
+     *
+     * 认：正文增量（OpenAI 的 `"content"` / Anthropic 的 `text_delta`）、工具调用。
+     * 不认：role 空壳、message_start、心跳、以及**只有 thinking 的增量**。
+     *
+     * 为什么把 thinking 排除在外：它会被写出（客户端要显示思考过程），但它不是回答。
+     * 真机遇到过"只有 thinking 的增量、没有正文、stop_reason=end_turn"的响应 ——
+     * 那时客户端拿到的是空回答；如果在 thinking 上就提交，就再也没机会换候选了。
+     * 排除之后，这种流会一直留在缓冲里，由上层判定为空并换号。
+     */
+    private static boolean hasDeliveredContent(CharSequence s) {
+        if (s == null) return false;
+        String t = s.toString();
+        if (t.contains("\"tool_calls\"")) return true;
+        /* Anthropic：文字块与工具入参。thinking_delta / signature_delta 不算。 */
+        if (t.contains("text_delta") || t.contains("input_json_delta")) return true;
+        /* OpenAI（含保真透传）：正文增量。
+           这里**不能**用裸的 `"content"`：Anthropic 的 message_start 里就带一个
+           空的 `"content":[]`，用裸匹配的话每条流都会被它提前提交，
+           thinking-only 的判定就白做了。只认后面跟非空字符串的正文增量。 */
+        for (int i = t.indexOf("\"content\":\""); i >= 0; i = t.indexOf("\"content\":\"", i + 1)) {
+            int v = i + "\"content\":\"".length();
+            if (v < t.length() && t.charAt(v) != '"') return true;   // "content":"" 是空增量
+        }
+        return false;
     }
 
     /** SSE 的两件东西：写端 + chunked 流（收尾要它写 0\r\n\r\n）。 */
@@ -3438,7 +3467,7 @@ public final class Server {
         /* 上游回空（200 但没内容）：给客户端一个明确的 502，别回 200 空回答，
            也别伪装成模型/账号问题。 */
         if (last instanceof EmptyUpstream) {
-            writeError(out, r.path, 502, "上游没有返回任何内容，请重试");
+            writeError(out, r.path, 502, "上游没有返回正文或工具调用，请重试");
             return true;
         }
         FailScope scope = FailScope.of(last);
@@ -5166,10 +5195,10 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     serveWithBudget(req.model, p, um, req, streamer, i, tries);
-                    /* 一个内容分片都没有：Streamer 现在不会写收尾，客户端还没收到东西，
-                       直接换下一个候选。 */
-                    if (!streamer.committed() && !streamer.rawSeen()) {
-                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                    /* 没有交付正文/工具调用（可能只有思考，甚至什么都没有）：
+                       换下一个候选。只有思考的响应对客户端就是一个空回答。 */
+                    if (!streamer.delivered()) {
+                        throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
                     if (req.rawResponse && !streamer.rawSeen()) {
@@ -5237,9 +5266,9 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     serveWithBudget(req.model, p, um, req, c, i, tries);
-                    /* 200 但一个正文/思考/工具调用都没有：不是成功，换下一个候选。 */
+                    /* 200 但没有正文也没有工具调用（只有思考也算空）：不是成功，换下一个候选。 */
                     if (!c.substantive()) {
-                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                        throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
                     if (req.rawResponse && c.rawBody == null) {
@@ -5524,7 +5553,7 @@ public final class Server {
                     Fronts.Collector col = new Fronts.Collector();
                     serveWithBudget(req.model, c.provider, c.model, req, col, attempts - 1, tries);
                     if (!col.substantive()) {
-                        throw new EmptyUpstream("上游没有返回任何内容（" + c.key() + "）");
+                        throw new EmptyUpstream("上游没有返回正文或工具调用（" + c.key() + "）");
                     }
                     /* 4.32.0 工具补偿：模型把调用写在正文里、没吐结构化 tool_calls 时，
                        在这里把它捞成真正的调用，再交给客户端。
@@ -5600,9 +5629,9 @@ public final class Server {
                 /* 先发响应头与 `: ready`，客户端立刻看到首字节；内容仍可换候选。 */
                 dw.open();
                 serveWithBudget(req.model, c.provider, c.model, req, streamer, attempts - 1, tries);
-                /* 上游"成功"但一个分片内容都没有：不能提交空流，换下一个候选。 */
-                if (!streamer.committed() && !streamer.rawSeen()) {
-                    throw new EmptyUpstream("上游没有返回任何内容（" + c.key() + "）");
+                /* 没有交付正文/工具调用（只有思考也算空）：不能提交空流，换下一个候选。 */
+                if (!streamer.delivered()) {
+                    throw new EmptyUpstream("上游没有返回正文或工具调用（" + c.key() + "）");
                 }
                 try {
                     w.flush();                       // 把最后一段推进 DeferredWriter
@@ -5675,7 +5704,7 @@ public final class Server {
                 JSONObject err = new JSONObject();
                 err.put("error", new JSONObject()
                         .put("message", last instanceof EmptyUpstream
-                                ? "上游没有返回任何内容，请重试"
+                                ? "上游没有返回正文或工具调用，请重试"
                                 : String.valueOf(last == null ? "没有可用候选" : last.getMessage()))
                         .put("type", "api_error"));
                 dw.raw("data: " + err + "\n\ndata: [DONE]\n\n");
@@ -5880,7 +5909,7 @@ public final class Server {
                     if (ac != null) ac.sseKind = "anthropic";
                     serveWithBudget(req.model, p, um, req, streamer, i, tries);
                     if (!streamer.substantive()) {
-                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                        throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
                     try {
                         w.flush();
@@ -5926,7 +5955,7 @@ public final class Server {
                     ev.put("type", "error");
                     ev.put("error", new JSONObject().put("type", "api_error")
                             .put("message", last instanceof EmptyUpstream
-                                    ? "上游没有返回任何内容，请重试"
+                                    ? "上游没有返回正文或工具调用，请重试"
                                     : String.valueOf(last == null ? "没有可用候选" : last.getMessage())));
                     dw.raw("event: error\ndata: " + ev + "\n\n");
                 } catch (Exception ignored) {
@@ -5935,7 +5964,7 @@ public final class Server {
             }
             if (!writeScopedFailure(out, r, last)) {
                 if (last instanceof EmptyUpstream) {
-                    writeError(out, r.path, 502, "上游没有返回任何内容，请重试");
+                    writeError(out, r.path, 502, "上游没有返回正文或工具调用，请重试");
                     return;
                 }
                 throw last == null ? new IllegalStateException("没有可用候选") : last;
@@ -5952,7 +5981,7 @@ public final class Server {
                 try {
                     serveWithBudget(req.model, p, um, req, c, i, tries);
                     if (!c.substantive()) {
-                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                        throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
                     writeJson(out, 200, Fronts.AnthropicFront.render(req.model, c));

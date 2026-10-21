@@ -159,9 +159,31 @@ public final class Config {
          */
         public boolean catalogOnly = false;
 
-        /** 能不能真正派发推理请求。目录-only 的账号只留着看，不进池子。 */
+        /**
+         * 凭据在**本次运行内解不开**（Keystore 重建 / 换机导入 / 密文损坏）。
+         *
+         * 为什么不落盘：这是"当前这台机器的 Keystore 打不开这个密文"，不是账号自身的
+         * 属性。一旦 Keystore 恢复（或用户重新登录），同一个账号就正常了 ——
+         * 写成持久标记反而会让它一直不可用。
+         *
+         * 语义：本次运行内退出派发与探活，否则它会在池子里显示"可用"，
+         * 客户端选到它必然失败（凭据是空的），表现成随机的"用不了"。
+         */
+        public transient boolean credentialsUnreadable = false;
+
+        /** 能不能真正派发推理请求。目录-only / 受限 / 凭据读不出来的账号都不进池子。 */
         public boolean dispatchable() {
-            return enabled && !catalogOnly && !restricted();
+            return enabled && !catalogOnly && !restricted() && !credentialsUnreadable;
+        }
+
+        /** 账号页要显示的原因；没有就返回空串。 */
+        public String blockedReason() {
+            if (credentialsUnreadable) return "凭据解不开：需要重新登录该账号（或恢复 Keystore）";
+            if (restricted()) {
+                String note = restrictedNote();
+                return note == null || note.isEmpty() ? "上游限制：暂时不可用" : note;
+            }
+            return "";
         }
 
         /**
@@ -197,12 +219,18 @@ public final class Config {
             }
         }
 
-        /** 用户编辑/重新登录账号时清掉限制标记，让下一次请求重新验证。 */
+        /**
+         * 用户编辑/重新登录账号时清掉"不可用"标记，让下一次请求重新验证。
+         *
+         * 同时清 credentialsUnreadable：用户在这里重新填了 Key / 重新登录，就等于
+         * 明确表示"这个账号现在应该是好的"；留着旧标记会让它一直不参与派发。
+         */
         public void clearRestricted() {
             try {
                 options.remove("restricted_until");
                 options.remove("restricted_note");
                 if (throttleNote != null && throttleNote.contains("限制")) throttleNote = "";
+                credentialsUnreadable = false;
             } catch (Throwable ignored) {
             }
         }
@@ -867,17 +895,14 @@ public final class Config {
             /* 账号凭据也可能解不开（Keystore 重建/换机/临时不可用）。必须在 open()
                之前判断：open() 会把解不开的值就地换成空串，之后再保存就会把
                所有 refresh_token 永久写成空。 */
-            String unreadableField = Secret.unreadableSealed(raw);
-            boolean providerSecretLost = unreadableField != null
-                    && unreadableField.startsWith("providers[");
-            if (providerSecretLost) {
-                Log.e("账号凭据解不开（" + unreadableField + "）：本次不保存配置，保留磁盘上的密文。"
-                        + "若 Keystore 已永久失效，需要重新登录对应账号");
-            }
             JSONObject opened = Secret.open(new JSONObject(raw.toString()));
             /* 解不开的密文原样保留，避免后续保存把 refresh_token 覆盖成空串。 */
             Secret.restoreUnreadable(raw, opened);
             Config loaded = fromJson(opened);
+            /* 凭据解不开的账号必须退出派发：它的 credentials 在本次运行里是空的，
+               留在池子里就是"显示可用、一选就失败"。标记只在内存里（见
+               Provider.credentialsUnreadable），Keystore 恢复或重新登录后自然消失。 */
+            markUnreadableProviders(raw, opened, loaded);
             if (keyLost) {
                 /* 绝不能把"解不开"当成"用户清空了 Key"（旧行为：本机模式下直接不校验）。
                    这里生成一把新 Key 并立刻落盘（用当前 Keystore 加密），
@@ -1087,6 +1112,63 @@ public final class Config {
             writeAtomically(snap, readAll(live));
         } catch (Throwable t) {
             Log.w("账号快照失败：" + t);
+        }
+    }
+
+    /**
+     * 把"凭据在本机解不开"的账号标出来，让它们退出派发与探活。
+     *
+     * 为什么值得单做：解密失败以前只是几条 WARN，账号照旧留在池子里显示可用。
+     * 客户端选中它时凭据是空串，上游必然拒绝 —— 用户看到的是"随机某个模型用不了"，
+     * 而真正的原因（Keystore 打不开这个密文）藏在日志里。
+     *
+     * 判定用的是**原始 JSON**（raw）：opened 里解不开的字段已被换成空串或保留密文，
+     * 两者都看不出"是不是刚解失败的"。raw 与 opened 同一顺序，按下标配对。
+     */
+    private static void markUnreadableProviders(JSONObject raw, JSONObject opened, Config loaded) {
+        try {
+            JSONArray rp = raw.optJSONArray("providers");
+            JSONArray op = opened.optJSONArray("providers");
+            if (rp == null || loaded == null) return;
+            int marked = 0;
+            for (int i = 0; i < rp.length() && i < loaded.providers.size(); i++) {
+                JSONObject r = rp.optJSONObject(i);
+                if (r == null) continue;
+                Config.Provider p = loaded.providers.get(i);
+                boolean bad = false;
+                String where = "";
+                if (unreadableSealedField(r, "apiKey")) {
+                    bad = true;
+                    where = "apiKey";
+                }
+                if (unreadableSealedField(r, "credentials")) {
+                    bad = true;
+                    where = where.isEmpty() ? "credentials" : where + "+credentials";
+                }
+                if (bad) {
+                    p.credentialsUnreadable = true;
+                    marked++;
+                    Log.e("账号「" + p.name + "」的 " + where
+                            + " 在本机解不开，本次运行不参与派发与探活；"
+                            + "请重新登录该账号（原密文已保留，未被覆盖）");
+                }
+            }
+            if (marked > 0) {
+                Log.w("共 " + marked + " 个账号因凭据解不开而暂时退出（重启或重新登录后恢复）");
+            }
+        } catch (Throwable t) {
+            Log.w("标记解不开凭据时出错（不影响加载）：" + t);
+        }
+    }
+
+    /** 这个字段是不是"存在且是密文、但解不开"。 */
+    private static boolean unreadableSealedField(JSONObject o, String field) {
+        try {
+            if (o == null || !o.has(field)) return false;
+            String v = Proto.optString(o, field, "");
+            return Secret.isSealed(v) && Secret.open(v).isEmpty();
+        } catch (Throwable t) {
+            return false;
         }
     }
 

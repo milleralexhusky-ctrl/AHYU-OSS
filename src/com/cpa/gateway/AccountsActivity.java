@@ -235,14 +235,23 @@ public class AccountsActivity extends Activity {
            只统计"还没到恢复时刻"的，过期的自然不计。 */
         long nowSec = System.currentTimeMillis() / 1000L;
         int throttled = 0;
+        int blocked = 0;
         for (Config.Provider p : accounts) {
             if (p.throttleUntil > nowSec) throttled++;
+            /* 凭据解不开 / 上游限制：这两种账号在池子里是死的，必须让用户看见原因，
+               否则表现就是"随机某个模型用不了"，根本猜不到要去重新登录。 */
+            if (p.credentialsUnreadable || p.restricted()) blocked++;
         }
         TextView subView = Ui.label(this, sub.toString());
         if (throttled > 0) {
             sub.append(" · ⏳ ").append(throttled).append(" 个限流中（可换号）");
             subView = Ui.label(this, sub.toString());
             subView.setTextColor(0xFFFFB454);
+        }
+        if (blocked > 0) {
+            sub.append(" · ⛔ ").append(blocked).append(" 个不可用（凭据解不开或被上游限制）");
+            subView = Ui.label(this, sub.toString());
+            subView.setTextColor(0xFFFF6B6B);
         }
         info.addView(subView, Ui.lp(this, 3));
         row.addView(info, Ui.weight(this, 1f, 0));
