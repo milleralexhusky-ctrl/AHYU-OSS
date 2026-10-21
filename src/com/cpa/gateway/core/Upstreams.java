@@ -135,6 +135,15 @@ public final class Upstreams {
         }
     }
 
+    /**
+     * 流式上游两次数据之间允许的最长静默。
+     *
+     * 原来这里是 300 秒（5 分钟）：上游思考到一半卡住不关连接，网关就一直等，
+     * 客户端看到的是"思考中"永远不动，直到 5 分钟后才报错。
+     * 60 秒足够覆盖推理模型正常的思考间隔；再长就断开并换候选/报错。
+     */
+    private static final int STREAM_IDLE_MS = 60_000;
+
     static void postStream(String url, Map<String, String> headers, JSONObject body, LineSink sink) throws Exception {
         capture(url, body);
         // 走统一 Http 层：连接复用 + 首字节看门狗 + 竞速真取消。
@@ -150,10 +159,15 @@ public final class Upstreams {
         long firstTokenMs = cancel != null ? 30000L
                 : (override != null && override.longValue() > 0 ? override.longValue() : 90000L);
         byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
-        Http.stream(url, headers, payload, 10000, 300000, firstTokenMs, line -> {
-            if (rawLimit > 0 && RAW.size() < rawLimit) RAW.add(shorten(line));
-            sink.line(line);
-        }, cancel);
+        try {
+            Http.stream(url, headers, payload, 10000, STREAM_IDLE_MS, firstTokenMs, line -> {
+                if (rawLimit > 0 && RAW.size() < rawLimit) RAW.add(shorten(line));
+                sink.line(line);
+            }, cancel);
+        } catch (java.net.SocketTimeoutException idle) {
+            throw new java.io.IOException("上游流式响应超过 " + (STREAM_IDLE_MS / 1000)
+                    + " 秒没有新数据，已断开（换候选或重试）", idle);
+        }
     }
 
     static String shorten(String s) {

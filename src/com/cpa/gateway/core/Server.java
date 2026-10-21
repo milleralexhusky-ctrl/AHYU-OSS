@@ -592,6 +592,10 @@ public final class Server {
          * `: ping` 也算，于是每轮都"有变化"，stalls 永远不会增长，180 秒超时形同虚设。
          */
         volatile long lastUpstreamAt = System.currentTimeMillis();
+        /** 这条流有没有真的出过正文/思考/工具调用（决定"输出中卡住"的判定阈值）。 */
+        volatile boolean sawContent;
+        /** 这条 SSE 的协议："anthropic" 或 "openai"（默认），决定超时错误事件的形状。 */
+        volatile String sseKind = "openai";
         java.util.concurrent.ScheduledFuture<?> pinger;
 
         Conn(OutputStream out, Socket sock) {
@@ -2740,15 +2744,32 @@ public final class Server {
                            旧实现用 client 方向的计数，ping 自己也会让它变化，
                            结果 stalls 永远是 0：既不会发超时，也不会在真正静默时 ping。 */
                         long silentMs = System.currentTimeMillis() - c.lastUpstreamAt;
+                        /* 已经出过内容后，正常的增量间隔是秒级；突然 80 秒没有新内容，
+                           客户端看到的就是"输出到一半卡住"。这时尽快报错让它重试，
+                           不要等 180 秒。还没出过内容的思考期仍保留较长兜底。 */
+                        long idleLimit = c.sawContent
+                                ? 8L * PING_PERIOD_MS
+                                : (long) UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS;
                         synchronized (writer) {
-                            if (silentMs >= (long) UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS) {
-                                Log.w("上游 " + (UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS / 1000)
+                            if (silentMs >= idleLimit) {
+                                Log.w("上游 " + (idleLimit / 1000)
                                         + " 秒没有出字，已通知客户端（upstream_timeout）");
                                 c.responseFailed = true;
-                                writer.write("data: {\"error\":{\"message\":\"上游超过 "
-                                        + (UPSTREAM_IDLE_PERIODS * PING_PERIOD_MS / 1000)
-                                        + " 秒没有返回内容，请重试\",\"type\":\"upstream_timeout\",\"code\":\"upstream_timeout\"}}\n\n");
-                                writer.write("data: [DONE]\n\n");
+                                String why = "上游超过 " + (idleLimit / 1000)
+                                        + " 秒没有返回内容，请重试";
+                                if ("anthropic".equals(c.sseKind)) {
+                                    /* Anthropic 的流内错误必须是 event: error；
+                                       以前这里发的是 OpenAI 形状的 data: {...}，
+                                       Claude Code / ETA 这类客户端不认识，会一直等下去。 */
+                                    writer.write("event: error\ndata: {\"type\":\"error\","
+                                            + "\"error\":{\"type\":\"api_error\",\"message\":\""
+                                            + why + "\"}}\n\n");
+                                } else {
+                                    writer.write("data: {\"error\":{\"message\":\"" + why
+                                            + "\",\"type\":\"upstream_timeout\","
+                                            + "\"code\":\"upstream_timeout\"}}\n\n");
+                                    writer.write("data: [DONE]\n\n");
+                                }
                                 writer.flush();
                                 stop();
                                 return;
@@ -3857,6 +3878,7 @@ public final class Server {
                    而 text(delta) 是逐字过来的，自己数不依赖上游。 */
                 if (delta != null && cur != null) {
                     cur.lastUpstreamAt = System.currentTimeMillis();
+                    cur.sawContent = true;
                     cur.outChars += delta.length();
                     /* 留一份正文样本：用来判定"上游是不是把工具调用写进了正文"。
                        只留前 2000 字符，够识别标记，不会把内存吃满。 */
@@ -3870,7 +3892,10 @@ public final class Server {
 
             @Override
             public void thinking(String delta) {
-                if (cur != null) cur.lastUpstreamAt = System.currentTimeMillis();
+                if (cur != null) {
+                    cur.lastUpstreamAt = System.currentTimeMillis();
+                    cur.sawContent = true;
+                }
                 inner.thinking(delta);
             }
 
@@ -3878,6 +3903,7 @@ public final class Server {
             public void toolCall(String id, String name, String argsJson) {
                 if (cur != null) {
                     cur.lastUpstreamAt = System.currentTimeMillis();
+                    cur.sawContent = true;
                     cur.sawToolCall = true;
                 }
                 inner.toolCall(id, name, argsJson);
@@ -3921,6 +3947,7 @@ public final class Server {
             public void rawChunk(JSONObject chunk) {
                 if (cur != null) {
                     cur.lastUpstreamAt = System.currentTimeMillis();
+                    cur.sawContent = true;
                     JSONArray choices = chunk.optJSONArray("choices");
                     for (int i = 0; choices != null && i < choices.length(); i++) {
                         JSONObject c = choices.optJSONObject(i);
@@ -5849,6 +5876,8 @@ public final class Server {
                     /* 先把响应头与 `: ready` 发出去：客户端立刻看到首字节，
                        不会因为网关在换候选/等首 token 而自己超时重连。 */
                     dw.open();
+                    Conn ac = connFor(out);
+                    if (ac != null) ac.sseKind = "anthropic";
                     serveWithBudget(req.model, p, um, req, streamer, i, tries);
                     if (!streamer.substantive()) {
                         throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
