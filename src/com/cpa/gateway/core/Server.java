@@ -3432,12 +3432,22 @@ public final class Server {
     /** 直连路径一次尝试几个候选（首次 + 重试）。 */
     private static final int DIRECT_TRIES = 3;
 
-    /** 直连与非 OpenAI 协议路径的结果反馈：同步更新 Router 熔断器与首字延迟。 */
-    private static void recordDirectOutcome(Config.Provider p, String um, boolean ephemeral, long t0, Exception err) {
-        if (ephemeral || p == null || um == null || um.isEmpty()) return;
+    /**
+     * 直连与非 OpenAI 协议路径的结果反馈：同步更新 Router 熔断器与首字延迟。
+     *
+     * <p>4.51.5 起多收一个 {@code req}：成功时顺手记下"这条会话走了这个候选"，
+     * 供 {@link Router#candidates} 的会话亲和复用（见 {@link Router#noteSession}）。
+     * 为什么放在这里而不是每个调用点各写一遍：这是**所有**非 OpenAI 协议路径
+     * （Anthropic / Gemini / Responses / Ollama / Completions）唯一的成败汇总点，
+     * 漏掉任何一处，那种协议的客户端就永远学不到亲和 —— Claude Code 走的正是
+     * `/v1/messages`，恰恰是最需要 prompt cache 复用的那个。
+     */
+    private static void recordDirectOutcome(Proto.Req req, Config.Provider p, String um, long t0, Exception err) {
+        if (req == null || req.ephemeral || p == null || um == null || um.isEmpty()) return;
         String key = p.name + "/" + um;
         if (err == null) {
             Router.recordOk(key, Math.max(1L, System.currentTimeMillis() - t0));
+            Router.noteSession(req, key);
         } else {
             FailScope scope = FailScope.of(err);
             /* 坏模型 / 坏请求只作废半开试探，不记账号失败：
@@ -4229,9 +4239,9 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, p, um, req, streamer);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                recordDirectOutcome(req, p, um, t0, null);
             } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                recordDirectOutcome(req, p, um, t0, e);
                 markResponseFailed(out);
                 Log.w("ollama 上游错误（" + p.name + "）：" + e.getMessage());
                 streamer.error(String.valueOf(e.getMessage()));
@@ -4253,13 +4263,13 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, p, um, req, c);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                recordDirectOutcome(req, p, um, t0, null);
                 writeJson(out, 200, generate
                         ? Fronts.OllamaFront.renderGenerate(req.model, c).toString()
                         : Fronts.OllamaFront.render(req.model, c).toString());
                 return;
             } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                recordDirectOutcome(req, p, um, t0, e);
                 last = e;
                 if (e instanceof ClientGone) return;
                 if (!(e instanceof Throttled)) {
@@ -4596,9 +4606,9 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, p, um, req, streamer);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                recordDirectOutcome(req, p, um, t0, null);
             } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                recordDirectOutcome(req, p, um, t0, e);
                 markResponseFailed(out);
                 Log.w("legacy completions 上游错误（" + p.name + "）：" + e.getMessage());
                 streamer.error(String.valueOf(e.getMessage()));
@@ -4618,11 +4628,11 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, p, um, req, c);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                recordDirectOutcome(req, p, um, t0, null);
                 writeJson(out, 200, renderLegacyCompletion(req.model, c).toString());
                 return;
             } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                recordDirectOutcome(req, p, um, t0, e);
                 last = e;
                 if (e instanceof ClientGone) return;
                 if (!(e instanceof Throttled)) {
@@ -5200,7 +5210,7 @@ public final class Server {
                     if (!streamer.delivered()) {
                         throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
-                    recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    recordDirectOutcome(req, p, um, t0, null);
                     if (req.rawResponse && !streamer.rawSeen()) {
                         Log.w("保真请求被渠道降级为 canonical（该渠道不支持原样透传）："
                                 + p.name + "/" + um);
@@ -5208,7 +5218,7 @@ public final class Server {
                     last = null;
                     break;
                 } catch (Exception e) {
-                    recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                    recordDirectOutcome(req, p, um, t0, e);
                     last = e;
                     if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
@@ -5270,7 +5280,7 @@ public final class Server {
                     if (!c.substantive()) {
                         throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
-                    recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    recordDirectOutcome(req, p, um, t0, null);
                     if (req.rawResponse && c.rawBody == null) {
                         Log.w("保真请求被渠道降级为 canonical（该渠道不支持原样透传）："
                                 + p.name + "/" + um);
@@ -5283,7 +5293,7 @@ public final class Server {
                             : Fronts.OpenAiFront.render(req.model, c));
                     return;
                 } catch (Exception e) {
-                    recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                    recordDirectOutcome(req, p, um, t0, e);
                     last = e;
                     /* 写响应时客户端断开：不能换号重发（会白烧一次完整 completion）。 */
                     if (e instanceof ClientGone) return;
@@ -5488,7 +5498,12 @@ public final class Server {
             RaceCancels.endRace(raceBucket);   // 丢掉整场句柄，防止漏 unbind 的输家留痕
             long total = System.currentTimeMillis() - t0;
             // 胜出仅表示最先出内容，不等于已经把完整响应成功交付给客户端。
-            if (raceConn == null || !raceConn.responseFailed) Router.recordOk(winner, total);
+            if (raceConn == null || !raceConn.responseFailed) {
+                Router.recordOk(winner, total);
+                /* 竞速的会话亲和价值最大：下次同一段对话直接点名这条胜出的候选，
+                   连竞速都不用开，首字延迟省下一整轮。 */
+                Router.noteSession(req, winner);
+            }
             lastRaceReport = cands.size() + " 路竞速 · " + winner + " 胜出 · "
                     + (total / 1000.0) + "s";
             Log.i("竞速结束：" + lastRaceReport);
@@ -5562,6 +5577,7 @@ public final class Server {
                     compensateToolCall(req, col);
                     Router.recordOk(c.key(), System.currentTimeMillis() - t0);
                     Router.notePicked(req.model, c.key());
+                    Router.noteSession(req, c.key());
                         writeJson(out, 200, Fronts.OpenAiFront.render(req.model, col));
                     return;
                 } catch (Exception e) {
@@ -5644,6 +5660,7 @@ public final class Server {
                 }
                 Router.recordOk(c.key(), System.currentTimeMillis() - t0);
                 Router.notePicked(req.model, c.key());
+                Router.noteSession(req, c.key());
                       // 客户端拿到结果了，说明不是卡死
                 return;
             } catch (Exception e) {
@@ -5920,10 +5937,10 @@ public final class Server {
                         dw.flush();
                     } catch (Exception ignored) {
                     }
-                    recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    recordDirectOutcome(req, p, um, t0, null);
                     return;
                 } catch (Exception e) {
-                    recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                    recordDirectOutcome(req, p, um, t0, e);
                     if (e instanceof ClientGone) return;
                     last = e;
                     if (dw.committed()) {
@@ -5983,11 +6000,11 @@ public final class Server {
                     if (!c.substantive()) {
                         throw new EmptyUpstream("上游没有返回正文或工具调用（" + p.name + "/" + um + "）");
                     }
-                    recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    recordDirectOutcome(req, p, um, t0, null);
                     writeJson(out, 200, Fronts.AnthropicFront.render(req.model, c));
                     return;
                 } catch (Exception e) {
-                    recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                    recordDirectOutcome(req, p, um, t0, e);
                     last = e;
                     if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
@@ -6052,9 +6069,9 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, p, um, req, streamer);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                recordDirectOutcome(req, p, um, t0, null);
             } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                recordDirectOutcome(req, p, um, t0, e);
                 markResponseFailed(out);
                 Log.w("upstream error (" + p.name + "): " + e.getMessage());
                 JSONObject err = new JSONObject();
@@ -6074,11 +6091,11 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     serve(req.model, p, um, req, c);
-                    recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    recordDirectOutcome(req, p, um, t0, null);
                     writeJson(out, 200, Fronts.GeminiFront.render(model, c));
                     return;
                 } catch (Exception e) {
-                    recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                    recordDirectOutcome(req, p, um, t0, e);
                     last = e;
                     if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {
@@ -6526,9 +6543,9 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, p, um, req, sink);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                recordDirectOutcome(req, p, um, t0, null);
             } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                recordDirectOutcome(req, p, um, t0, e);
                 markResponseFailed(out);
                 Log.w("upstream error (" + p.name + "): " + e.getMessage());
                 JSONObject err = new JSONObject();
@@ -6551,12 +6568,12 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     serve(req.model, cp, cum, req, cc);
-                    recordDirectOutcome(cp, cum, req.ephemeral, t0, null);
+                    recordDirectOutcome(req, cp, cum, t0, null);
                     c = cc;
                     last = null;
                     break;
                 } catch (Exception e) {
-                    recordDirectOutcome(cp, cum, req.ephemeral, t0, e);
+                    recordDirectOutcome(req, cp, cum, t0, e);
                     last = e;
                     if (e instanceof ClientGone) return;
                     if (!(e instanceof Throttled)) {

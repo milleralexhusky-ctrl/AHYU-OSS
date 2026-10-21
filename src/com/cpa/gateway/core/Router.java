@@ -997,21 +997,145 @@ public final class Router {
                 last = LAST_KEY.get(v);
                 streak = LAST_STREAK.getOrDefault(v, 0);
             }
-            if (last != null && streak >= SAME_KEY_LIMIT) {
-                Router.Pick hit = null;
+            /* 会话亲和优先于反粘连：同一段对话的后续轮次本来就应该走同一个候选
+               （prompt cache、风格一致、工具循环不断档）。
+               但客户端**重发同一条请求**时必须让反粘连生效 —— 那种情况下用户要的是
+               换个答案，不是复用（见 Repeats；重发在第 3 次会被直接拦掉）。
+               note() 按 Req 对象幂等：后面 serve()/pick() 里再记一次不会重复计数。 */
+            boolean retried = Repeats.note(req) > 1;
+            /* 亲和只有在候选**确实可用**的时候才有意义：sessionPin 返回的是历史成功键，
+               它可能已经被熔断/限流/账号被删挡在池子外。硬把它插回队首等于绕过熔断
+               （那正是 4.37.0 修掉的问题），所以插回去之前先确认它还在 out 里。
+               注意**不能**再顺手排除"pin 就是上一次选中的那个"：上面那段同分轮转
+               已经按 ROTATE 把并列候选转过一轮了，pin 正好被转下去是完全正常的，
+               那时不把它提回来，亲和就等于没做（实测第一版就是这么失效的）。 */
+            String pinned = retried ? null : sessionPin(req);
+            Router.Pick hit = null;
+            if (pinned != null) {
                 for (Router.Pick c : out) {
-                    if (last.equals(c.key())) {
+                    if (pinned.equals(c.key())) {
                         hit = c;
                         break;
                     }
                 }
-                if (hit != null) {
-                    out.remove(hit);
-                    out.add(Math.min(1, out.size()), hit);   // 挪到第二位：还是好候选，但不再霸着队首
+            }
+            if (hit != null) {
+                out.remove(hit);
+                out.add(0, hit);            // 排到队首：优先复用这条会话的上游
+                if (affinityNoteOnce(v)) {
+                    Log.i("会话亲和：" + v + " 本轮优先复用 " + pinned
+                            + "（同一段对话，换模型会让 prompt cache 失效）");
+                }
+            } else if (last != null && streak >= SAME_KEY_LIMIT) {
+                Router.Pick prev = null;
+                for (Router.Pick c : out) {
+                    if (last.equals(c.key())) {
+                        prev = c;
+                        break;
+                    }
+                }
+                if (prev != null) {
+                    out.remove(prev);
+                    out.add(Math.min(1, out.size()), prev);   // 挪到第二位：还是好候选，但不再霸着队首
                 }
             }
         }
         return out;
+    }
+
+    /* ------------------------------------------------------------ 会话亲和（4.51.5） */
+
+    /**
+     * 会话 → 上次成功交付的候选。内存表，重启即空（重启后重新学习，没有害处）。
+     *
+     * 为什么需要：选路完全是"每请求独立打分"，同一段对话的第 1 轮和第 5 轮可能
+     * 落在不同账号的不同模型上。后果有三，都是用户能感知但难查的：
+     *   · prompt cache 全废 —— agent 每轮发整段历史，换模型等于换缓存前缀，
+     *     每一轮都按全新计费、重新计算，延迟和成本一起上去；
+     *   · 风格/格式漂移 —— 工具调用习惯、输出格式都变，看起来像"网关不稳定"；
+     *   · 工具循环断档 —— 中途换模型，上一轮的 tool_call 形状可能对不上。
+     */
+    private static final Map<String, String> SESSION_PICK = new LinkedHashMap<>();
+    /** 会话 → 上次投放时刻，用来淘汰老会话（避免这张表无限长）。 */
+    private static final Map<String, Long> SESSION_AT = new LinkedHashMap<>();
+    private static final int SESSION_MAX = 256;
+    private static final long SESSION_TTL_MS = 30 * 60 * 1000L;
+    /** 已经就某个虚拟模型打过亲和日志了（避免每轮都刷屏）。 */
+    private static final java.util.Set<String> AFFINITY_LOGGED =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+
+    /** 每个虚拟模型只提示一次"这段会话在复用同一候选"。 */
+    private static boolean affinityNoteOnce(String virtual) {
+        return AFFINITY_LOGGED.add(virtual);
+    }
+
+    /**
+     * 这条会话上次走的候选；没有、或者已经过期则返回 null。
+     *
+     * <p>**按会话存，不按虚拟模型存**：同一段对话里客户端换用 `auto` 又换用
+     * `auto-code`（agent 客户端按任务切虚拟模型很常见），仍然是同一段对话、
+     * 仍然该复用同一个上游。所以这里不需要虚拟模型名。
+     *
+     * <p>返回 null 时调用方走原来的反粘连逻辑，行为与之前完全一致。
+     * 候选**当前可不可用**不在这里判断：真发起调用前还有很多过滤在跑，
+     * 由调用方在候选表里核对（见 {@code candidates}）。
+     */
+    private static String sessionPin(Proto.Req req) {
+        String session = Conversation.session(req);
+        if (session.isEmpty()) return null;
+        long now = System.currentTimeMillis();
+        synchronized (SESSION_PICK) {
+            Long at = SESSION_AT.get(session);
+            if (at == null || now - at.longValue() > SESSION_TTL_MS) {
+                SESSION_PICK.remove(session);
+                SESSION_AT.remove(session);
+                return null;
+            }
+            return SESSION_PICK.get(session);
+        }
+    }
+
+    /**
+     * 记住"这条会话这一轮走的是哪个候选"。
+     *
+     * 只在**成功交付**时调用（见 Server 的 recordOk 调用点）。失败的候选不进表，
+     * 所以下一轮不会再被亲和回那个已经证明不行的候选。
+     */
+    public static void noteSession(Proto.Req req, String pickKey) {
+        if (req == null || pickKey == null || pickKey.isEmpty()) return;
+        String session = Conversation.session(req);
+        if (session.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        synchronized (SESSION_PICK) {
+            SESSION_PICK.put(session, pickKey);
+            SESSION_AT.put(session, Long.valueOf(now));
+            if (SESSION_PICK.size() > SESSION_MAX) {
+                /* 淘汰最老的一批：这张表按会话增长，长期挂着会一直吃内存。 */
+                java.util.Iterator<Map.Entry<String, Long>> it = SESSION_AT.entrySet().iterator();
+                int drop = SESSION_PICK.size() - SESSION_MAX;
+                while (it.hasNext() && drop-- > 0) {
+                    String dead = it.next().getKey();
+                    it.remove();
+                    SESSION_PICK.remove(dead);
+                }
+            }
+        }
+    }
+
+    /** 自检用：读某条请求所属会话的亲和候选（不看虚拟模型名，也不检查可用性）。 */
+    static String sessionPinForTest(Proto.Req req) {
+        String session = Conversation.session(req);
+        if (session.isEmpty()) return null;
+        synchronized (SESSION_PICK) {
+            return SESSION_PICK.get(session);
+        }
+    }
+
+    /** 诊断用：当前记了多少条会话亲和。 */
+    public static int sessionPins() {
+        synchronized (SESSION_PICK) {
+            return SESSION_PICK.size();
+        }
     }
 
     private static final java.util.concurrent.atomic.AtomicInteger ROTATE =

@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.51.4**（versionCode 652，见 `version.properties`）
+- 当前版本：**4.51.5**（versionCode 653，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -142,6 +142,11 @@ docs/research/             协议调查脚本
   轮换中还没轮到的候选首 token 只等 10 秒、最后一个 45 秒；回空模型 45 秒内不再选。
 - 流中卡住：上游 60 秒没有任何字节即断开；已经出过内容后 80 秒没有新内容
   就发协议对应的超时错误（Anthropic 用 `event: error`），不再一直停在“思考中”。
+- 会话亲和（`auto*`）：同一段对话的后续轮次优先复用上次成功交付的候选，
+  保住 prompt cache、风格一致与工具循环不断档。会话键按“system + 首条 user”
+  派生（也认客户端自带的 `prompt_cache_key`），所以跨虚拟模型（`auto` → `auto-code`）
+  仍然命中；客户端**重发同一条请求**时则让反粘连生效，不硬绑。
+  失败的候选不进亲和表，且亲和只调顺序、不绕过熔断。
 - 同协议转发时保留未建模字段（`top_k` / `service_tier` / `metadata` / `safetySettings` 等），
   不因网关不认识而丢掉；跨协议不硬塞。
 - 客户端要 `n>1`、`logprobs` / `top_logprobs` 或音频输出时，OpenAI 兼容渠道走

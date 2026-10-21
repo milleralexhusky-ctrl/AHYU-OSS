@@ -75,6 +75,7 @@ public final class Selftest {
         add(out, "本机多端并发不共用单客户端配额", Selftest::checkLoopbackPeers);
         add(out, "thinking 跨协议近似翻译", Selftest::checkThinkingTranslation);
         add(out, "凭据不可用/受限账号退出派发", Selftest::checkUnreadableCredentials);
+        add(out, "会话亲和（跨轮稳定 / 随会话区分）", Selftest::checkSessionAffinity);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -1060,6 +1061,82 @@ public final class Selftest {
         c.text("好了");
         if (!c.substantive()) return "有正文时没被算成有内容";
         return null;
+    }
+
+    /**
+     * 会话亲和（4.51.5）。
+     *
+     * 两件事必须同时成立，缺一个这套机制就是错的：
+     *   · {@link Conversation#session} 对**同一段对话的不同轮次**必须给出同一个键 ——
+     *     这是亲和的全部意义（换模型会让 prompt cache 全部失效）；
+     *   · 对**不同对话**必须给出不同的键 —— 否则所有用户/所有会话共用一条亲和，
+     *     等于把选路锁死在一个候选上。
+     *
+     * 顺带钉住"不能拿 {@link Conversation#id} 当亲和键"这个坑：它哈希全部消息，
+     * 每多一轮就变一个值，用它做亲和会永远命不中（这就是当初写 session() 的原因）。
+     */
+    private static String checkSessionAffinity() {
+        Proto.Req turn1 = sessionReq("你是一个严谨的助手。", "帮我看看这个函数");
+        Proto.Req turn2 = sessionReq("你是一个严谨的助手。", "帮我看看这个函数");
+        /* 第 2 轮：同一段对话继续问（前面多了 assistant 回复 + 新的 user 消息） */
+        turn2.messages.add(new Proto.Msg("assistant").add(Proto.Part.text("好，我看一下。")));
+        turn2.messages.add(new Proto.Msg("user").add(Proto.Part.text("再解释一下第二行")));
+
+        String s1 = Conversation.session(turn1);
+        String s2 = Conversation.session(turn2);
+        if (s1.isEmpty()) return "同一条会话派生出了空键（亲和永远不命中）";
+        if (!s1.equals(s2)) {
+            return "同一段对话的第 1 轮和第 2 轮派生出不同的键（" + s1 + " / " + s2
+                    + "），亲和会永远命不中";
+        }
+        /* id 必须仍然随轮次变化，否则说明我们把它和 session 搞混了 */
+        if (Conversation.id(turn1).equals(Conversation.id(turn2))) {
+            return "Conversation.id 在跨轮次时没有变化，多跳追溯会串成一跳";
+        }
+
+        Proto.Req other = sessionReq("你是一个严谨的助手。", "另一个完全不同的问题");
+        if (s1.equals(Conversation.session(other))) {
+            return "两段不同的对话共用了同一个会话键，会把选路锁死";
+        }
+        /* 客户端自带的会话提示优先：同一条首条 user、不同 prompt_cache_key 要分开 */
+        Proto.Req a = sessionReq("sys", "同样的问题");
+        Proto.Req b = sessionReq("sys", "同样的问题");
+        try {
+            a.extraBody.put("prompt_cache_key", "sess-a");
+            b.extraBody.put("prompt_cache_key", "sess-b");
+        } catch (Exception e) {
+            return "构造 prompt_cache_key 样例失败：" + e;
+        }
+        if (Conversation.session(a).equals(Conversation.session(b))) {
+            return "客户端声明了不同的 prompt_cache_key，网关却当成同一段会话";
+        }
+        if (!Conversation.session(a).equals(Conversation.session(a))) {
+            return "会话键不稳定（同一请求两次调用结果不同）";
+        }
+        /* 只有 system、没有 user：不足以区分会话，应当返回空让调用方跳过亲和 */
+        Proto.Req sysOnly = new Proto.Req();
+        sysOnly.system = "只有系统提示";
+        if (!Conversation.session(sysOnly).isEmpty()) {
+            return "没有 user 消息时不该派生出会话键";
+        }
+        /* 亲和表本身：记进去能读回来，null / 空键不写坏表。 */
+        Router.noteSession(turn1, "acc/model-x");
+        if (!"acc/model-x".equals(Router.sessionPinForTest(turn1))) {
+            return "记下的亲和读不回来";
+        }
+        Router.noteSession(turn1, "");
+        if (!"acc/model-x".equals(Router.sessionPinForTest(turn1))) {
+            return "空候选名把亲和表写坏了";
+        }
+        return null;
+    }
+
+    /** 构造一条"system + 首条 user"的样例请求。 */
+    private static Proto.Req sessionReq(String system, String firstUser) {
+        Proto.Req r = new Proto.Req();
+        r.system = system;
+        r.messages.add(new Proto.Msg("user").add(Proto.Part.text(firstUser)));
+        return r;
     }
 
     /** 国际版重发的开关与跳过条件。 */
