@@ -944,6 +944,33 @@ public final class WorkBuddy {
         return Http.softChannel(m);
     }
 
+    /**
+     * 账号被上游限制（WorkBuddy 11140："Your account has been restricted due to
+     * unusual activity" / "账号存在异常行为，已被限制使用"）。
+     *
+     * 和渠道校验区分：渠道校验还能换号重发；这个是账号级封禁，重试只会加重风控。
+     */
+    static boolean isRestricted(Throwable t) {
+        String m = t == null ? "" : String.valueOf(t.getMessage()).toLowerCase(java.util.Locale.US);
+        return m.contains("unusual activity") || m.contains("has been restricted")
+                || m.contains("异常行为") || m.contains("异常使用")
+                || (m.contains("11140") && (m.contains("restrict") || m.contains("illegal")));
+    }
+
+    /** 把整个账号移出派发/探活池，并留一条能看懂的日志（过期后自动允许再试一次）。 */
+    static void markRestricted(Config.Provider p, Throwable t) {
+        if (p == null || p.restricted()) return;
+        String note = "上游限制：账号存在异常行为，已被限制使用（11140）。请申诉或换号。";
+        p.markRestricted(6 * 3_600_000L, note);
+        Log.e("workbuddy：" + p.name + " 被上游限制（异常行为），已暂停该账号的派发与探活；"
+                + "请在官方客户端申诉或换号。原始信息："
+                + Upstreams.shortenPublic(String.valueOf(t == null ? "" : t.getMessage())));
+        try {
+            Gateway.persistSoon();
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** 每次尝试都重新构造 body：重试绝不能复用被改过的对象。 */
     private static JSONObject buildBody(String model, Proto.Req req, String uid) throws Exception {
         JSONObject body = Upstreams.openAiBody(model, req, true);
@@ -1023,6 +1050,12 @@ public final class WorkBuddy {
                         return;
                     } catch (Throttled t) {
                         Throttled err = t;
+                        /* 11140 / "unusual activity" 是账号被上游限制，不是限流。
+                           继续换模型重试只会制造更多"异常活动"证据，直接停掉整个账号。 */
+                        if (isRestricted(err)) {
+                            markRestricted(p, err);
+                            throw err;
+                        }
                         /* "Illegal API invocation from an unapproved channel" 的官方提示就是
                            “请重新发送”：同一账号最多重发 2 次（间隔 500ms / 1.5s）；
                            账号被标记的旧 11128（conversation id missing / request illegal）

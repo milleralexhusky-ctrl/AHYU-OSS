@@ -947,6 +947,12 @@ public final class Selftest {
         if (!Server.isLoopbackPeer("0:0:0:0:0:0:0:1")) return "IPv6 回环没被认出来";
         if (!Server.isLoopbackPeer("::ffff:127.0.0.1")) return "IPv4-mapped 回环没被认出来";
         if (Server.isLoopbackPeer("192.168.1.5")) return "局域网地址被误认成回环";
+        if (!"/v1/models".equals(Server.normalizePath("/v1/v1/models"))) {
+            return "重复的 /v1 没被收掉：" + Server.normalizePath("/v1/v1/models");
+        }
+        if (!"/v1/messages".equals(Server.normalizePath("\\v1\\v1\\messages"))) {
+            return "反斜杠/重复前缀没被规范化";
+        }
         return null;
     }
 

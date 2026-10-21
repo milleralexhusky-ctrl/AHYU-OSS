@@ -865,6 +865,11 @@ public final class Server {
             } else {
                 r.path = target;
             }
+            /* 客户端把 Base URL 填成 ".../v1" 时，Anthropic/OpenAI SDK 往往还会
+               再拼一次 "/v1/models" 或 "/v1/messages"，于是发来 "/v1/v1/..."。
+               网关不要求用户猜"该不该带 /v1"：重复的协议前缀在这里收掉。
+               顺带把反斜杠当分隔符的客户端也容错掉（真有 App 这么拼）。 */
+            r.path = normalizePath(r.path);
         }
         String h;
         int headerBytes = 0;
@@ -1018,6 +1023,21 @@ public final class Server {
     private static String peerKeyOf(String peer) {
         int at = peer.indexOf('/');
         return at > 0 ? peer.substring(at + 1) : peer;
+    }
+
+    /**
+     * 收掉客户端重复拼出来的协议前缀与多余分隔符。
+     *
+     * Base URL 写成 `http://host/v1` 时，不少 SDK 还会再拼 `/v1/models`，
+     * 实际请求是 `/v1/v1/models`；以前网关只回 404，用户以为"加不进去"。
+     * 这不是放宽鉴权，只是把同一个端点认出来。
+     */
+    static String normalizePath(String p) {
+        if (p == null || p.isEmpty()) return "/";
+        String s = p.replace('\\', '/');
+        while (s.contains("//")) s = s.replace("//", "/");
+        while (s.equals("/v1/v1") || s.startsWith("/v1/v1/")) s = s.substring(3);
+        return s;
     }
 
     private void handle(Socket s) {
@@ -3358,6 +3378,12 @@ public final class Server {
      */
     private boolean writeScopedFailure(OutputStream out, Req r, Throwable last) throws Exception {
         if (last == null) return false;
+        /* 上游回空（200 但没内容）：给客户端一个明确的 502，别回 200 空回答，
+           也别伪装成模型/账号问题。 */
+        if (last instanceof EmptyUpstream) {
+            writeError(out, r.path, 502, "上游没有返回任何内容，请重试");
+            return true;
+        }
         FailScope scope = FailScope.of(last);
         if (!scope.modelScoped() && scope != FailScope.REQUEST) return false;
         int code = scope == FailScope.MODEL_ACCESS ? 404 : 400;
@@ -5059,6 +5085,11 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     serve(req.model, p, um, req, streamer);
+                    /* 一个内容分片都没有：Streamer 现在不会写收尾，客户端还没收到东西，
+                       直接换下一个候选。 */
+                    if (!streamer.committed() && !streamer.rawSeen()) {
+                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                    }
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
                     if (req.rawResponse && !streamer.rawSeen()) {
                         Log.w("保真请求被渠道降级为 canonical（该渠道不支持原样透传）："
@@ -5125,6 +5156,10 @@ public final class Server {
                 long t0 = System.currentTimeMillis();
                 try {
                     serve(req.model, p, um, req, c);
+                    /* 200 但一个正文/思考/工具调用都没有：不是成功，换下一个候选。 */
+                    if (!c.substantive()) {
+                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                    }
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
                     if (req.rawResponse && c.rawBody == null) {
                         Log.w("保真请求被渠道降级为 canonical（该渠道不支持原样透传）："
@@ -5404,6 +5439,9 @@ public final class Server {
                 try {
                     Fronts.Collector col = new Fronts.Collector();
                     serve(req.model, c.provider, c.model, req, col);
+                    if (!col.substantive()) {
+                        throw new EmptyUpstream("上游没有返回任何内容（" + c.key() + "）");
+                    }
                     /* 4.32.0 工具补偿：模型把调用写在正文里、没吐结构化 tool_calls 时，
                        在这里把它捞成真正的调用，再交给客户端。
                        只做非流式：Collector 的正文还在内存里、还没写给客户端，
@@ -5474,11 +5512,15 @@ public final class Server {
             long t0 = System.currentTimeMillis();
             try {
                 serve(req.model, c.provider, c.model, req, streamer);
+                /* 上游"成功"但一个分片内容都没有：不能提交空流，换下一个候选。 */
+                if (!streamer.committed() && !streamer.rawSeen()) {
+                    throw new EmptyUpstream("上游没有返回任何内容（" + c.key() + "）");
+                }
                 try {
                     w.flush();                       // 把最后一段推进 DeferredWriter
                 } catch (Exception ignored) {
                 }
-                if (!dw.committed()) dw.commit();    // 正常结束但内容太少，也得把响应发出去
+                if (!dw.committed()) dw.commit();
                 try {
                     dw.flush();
                 } catch (Exception ignored) {
@@ -5672,66 +5714,120 @@ public final class Server {
            /v1/messages，缺 id 的工具调用会一路发到上游，再被记成渠道失败。
            补在解析之后、选路之前：坏请求不占候选、不进熔断。 */
         RequestCheck.check(req);
-        if (Router.isVirtual(req.model)) {
-            String real = resolveVirtual(req.model, req);
-            if (real.isEmpty()) {
+        /* 虚拟模型（auto*）不能只解析成"一个具体模型"再走 pickAll：
+           那等于把多模型轮换退化成单模型重试，某个模型回空/被限就整轮失败，
+           客户端表现为一直重连。这里直接拿 Router 的候选列表（含跨模型），
+           和 OpenAI 协议的虚拟模型路径保持同一语义。 */
+        final boolean virtual = Router.isVirtual(req.model);
+        List<Config.Provider> cands = new ArrayList<>();
+        List<Router.Pick> picks = new ArrayList<>();
+        if (virtual) {
+            picks = Router.candidates(req.model, !req.tools.isEmpty(), req);
+            if (picks.isEmpty()) {
                 writeError(out, r.path, 503, "虚拟模型 " + req.model + " 暂时没有可用候选");
                 return;
             }
-            req.model = real;
-        }
-        List<Config.Provider> cands = pickAll(req.model);
-        if (cands.isEmpty()) {
-            writeError(out, r.path, 404, unknownModelMessage(req.model));
-            return;
+        } else {
+            cands = pickAll(req.model);
+            if (cands.isEmpty()) {
+                writeError(out, r.path, 404, unknownModelMessage(req.model));
+                return;
+            }
+            for (Config.Provider p2 : cands) {
+                picks.add(Router.newPick(p2, upstreamModel(p2, req.model)));
+            }
         }
         /* 试几个候选由累积失败概率决定，不再固定 3 次（见 Router.budget） */
-        int tries = Router.budget(cands, req.model);
+        int tries = virtual ? Router.budget(picks) : Router.budget(cands, req.model);
+        tries = Math.min(tries, picks.size());
 
         /* 全部候选都被上游**明确告知**要等到某个时刻时，别去撞墙了。
-           详见 confirmedBlock 的说明。 */
-        ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
-        if (block.until > 0L) {
-            writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
-            return;
+           虚拟模型的候选来自 Router.candidates()，已经过滤过冷却；这里只对
+           点名模型走 confirmedBlock。 */
+        if (!virtual) {
+            ConfirmedBlock block = confirmedBlock(cands, req.model, tries);
+            if (block.until > 0L) {
+                writeAllThrottled(out, r.path, req.model, block.until, tries, block.channel);
+                return;
+            }
         }
         if (req.stream) {
-            // 注意：Anthropic 协议**流式不能 failover** —— 它的 `streamer.start()`
-            // 会在 serve 之前就写出 message_start 事件（协议要求事件序列以它开头），
-            // 那一刻就已经"提交"了。换个上游接上去会拼出两个 message_start。
-            // 这是协议的结构性限制，不是这里偷懒；非流式那条已接 failover。
-            Config.Provider p = cands.get(0);
-            String um = upstreamModel(p, req.model);
-            BufferedWriter w = startSse(out);
-            Fronts.AnthropicFront.Streamer streamer = new Fronts.AnthropicFront.Streamer(w, req.model);
-            streamer.start();
-            long t0 = System.currentTimeMillis();
-            try {
-                serve(req.model, p, um, req, streamer);
-                recordDirectOutcome(p, um, req.ephemeral, t0, null);
-            } catch (Exception e) {
-                recordDirectOutcome(p, um, req.ephemeral, t0, e);
-                markResponseFailed(out);
-                Log.w("upstream error (" + p.name + "): " + e.getMessage());
-                JSONObject ev = new JSONObject();
-                ev.put("type", "error");
-                ev.put("error", new JSONObject().put("type", "api_error").put("message", String.valueOf(e.getMessage())));
-                Fronts.sseEvent(w, "error", ev.toString());
+            /* Anthropic 流式以前不能 failover：message_start 在 serve 之前就写出去，
+               那一刻就"提交"了。现在 Streamer 延迟到第一段内容才写 message_start，
+               空流不会提交，于是可以像 OpenAI 那样换候选；只有已经出过内容才不能换。
+               这也顺手修掉了"上游回空 → 客户端显示空回答/重连失败"。 */
+            Exception last = null;
+            for (int i = 0; i < tries; i++) {
+                Router.Pick c = picks.get(i);
+                Config.Provider p = c.provider;
+                String um = c.model;
+                DeferredWriter dw = new DeferredWriter(out);
+                BufferedWriter w = new BufferedWriter(dw, 8192);
+                Fronts.AnthropicFront.Streamer streamer =
+                        new Fronts.AnthropicFront.Streamer(w, req.model);
+                long t0 = System.currentTimeMillis();
+                try {
+                    serve(req.model, p, um, req, streamer);
+                    if (!streamer.substantive()) {
+                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                    }
+                    try {
+                        w.flush();
+                    } catch (Exception ignored) {
+                    }
+                    if (!dw.committed()) dw.commit();
+                    try {
+                        dw.flush();
+                    } catch (Exception ignored) {
+                    }
+                    recordDirectOutcome(p, um, req.ephemeral, t0, null);
+                    return;
+                } catch (Exception e) {
+                    recordDirectOutcome(p, um, req.ephemeral, t0, e);
+                    if (e instanceof ClientGone) return;
+                    last = e;
+                    if (dw.committed()) {
+                        markResponseFailed(out);
+                        Log.w("Anthropic 流已提交，无法换号（" + p.name + "）：" + e.getMessage());
+                        try {
+                            JSONObject ev = new JSONObject();
+                            ev.put("type", "error");
+                            ev.put("error", new JSONObject().put("type", "api_error")
+                                    .put("message", String.valueOf(e.getMessage())));
+                            Fronts.sseEvent(w, "error", ev.toString());
+                            w.flush();
+                        } catch (Exception ignored) {
+                        }
+                        return;
+                    }
+                    if (!(e instanceof Throttled)) {
+                        Log.w("Anthropic 流式第 " + (i + 1) + " 个候选失败（" + p.name + "）："
+                                + e.getMessage());
+                    }
+                    if (FailScope.of(e).stopDirect()) break;
+                }
             }
-            try {
-                w.flush();
-            } catch (Exception ignored) {
+            if (!writeScopedFailure(out, r, last)) {
+                if (last instanceof EmptyUpstream) {
+                    writeError(out, r.path, 502, "上游没有返回任何内容，请重试");
+                    return;
+                }
+                throw last == null ? new IllegalStateException("没有可用候选") : last;
             }
         } else {
             // 非流式全程可 failover（Collector 纯内存，失败前没写过东西）
             Exception last = null;
             for (int i = 0; i < tries; i++) {
-                Config.Provider p = cands.get(i);
-                String um = upstreamModel(p, req.model);
+                Router.Pick pick = picks.get(i);
+                Config.Provider p = pick.provider;
+                String um = pick.model;
                 Fronts.Collector c = new Fronts.Collector();
                 long t0 = System.currentTimeMillis();
                 try {
                     serve(req.model, p, um, req, c);
+                    if (!c.substantive()) {
+                        throw new EmptyUpstream("上游没有返回任何内容（" + p.name + "/" + um + "）");
+                    }
                     recordDirectOutcome(p, um, req.ephemeral, t0, null);
                     writeJson(out, 200, Fronts.AnthropicFront.render(req.model, c));
                     return;

@@ -161,7 +161,50 @@ public final class Config {
 
         /** 能不能真正派发推理请求。目录-only 的账号只留着看，不进池子。 */
         public boolean dispatchable() {
-            return enabled && !catalogOnly;
+            return enabled && !catalogOnly && !restricted();
+        }
+
+        /**
+         * 上游明确说"账号存在异常行为，已被限制使用"（WorkBuddy 11140）。
+         *
+         * 这不是限流，等一会儿不会好；继续拿几十个模型去试探只会让上游看到
+         * 更多"异常活动"。所以整个账号直接退出派发/探活，直到用户申诉/换号，
+         * 或标记自然过期（{@link #markRestricted} 写入的时间）。
+         */
+        public boolean restricted() {
+            try {
+                return options.optLong("restricted_until", 0L) > System.currentTimeMillis();
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+
+        public String restrictedNote() {
+            try {
+                return Proto.optString(options, "restricted_note", "");
+            } catch (Throwable t) {
+                return "";
+            }
+        }
+
+        /** 标记账号被上游限制；{@code ms} 之后自动允许再试一次。 */
+        public void markRestricted(long ms, String note) {
+            try {
+                options.put("restricted_until", System.currentTimeMillis() + Math.max(60_000L, ms));
+                options.put("restricted_note", note == null ? "" : note);
+                throttleNote = note == null ? "" : note;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        /** 用户编辑/重新登录账号时清掉限制标记，让下一次请求重新验证。 */
+        public void clearRestricted() {
+            try {
+                options.remove("restricted_until");
+                options.remove("restricted_note");
+                if (throttleNote != null && throttleNote.contains("限制")) throttleNote = "";
+            } catch (Throwable ignored) {
+            }
         }
         public final List<String> models = new java.util.concurrent.CopyOnWriteArrayList<>();
         /**

@@ -41,6 +41,8 @@ enum FailScope {
             return ((ToolFix.BadToolCall) t).truncated ? REQUEST : MODEL_BAD;
         }
         if (t instanceof Throttled) return ACCOUNT;
+        /* 上游返回了空内容：不是账号坏了，也不是请求不合法；换一个候选往往就有内容。 */
+        if (t instanceof EmptyUpstream) return TRANSIENT;
         if (t instanceof ClientGone || t instanceof RaceLost) return UNKNOWN;
 
         String msg = t.getMessage() == null ? "" : t.getMessage().toLowerCase(Locale.US);

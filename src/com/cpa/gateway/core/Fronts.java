@@ -66,6 +66,12 @@ public final class Fronts {
          */
         public JSONObject rawBody;
 
+        /** 这次响应里到底有没有"东西"：正文 / 思考 / 工具调用 / 原样透传的完整响应。 */
+        public boolean substantive() {
+            return rawBody != null || text.length() > 0 || thinking.length() > 0
+                    || !toolCalls.isEmpty();
+        }
+
         @Override
         public void rawBody(JSONObject body) {
             rawBody = body;
@@ -573,6 +579,10 @@ public final class Fronts {
                 try {
                     stop = stopReason;
                     if (u != null) usage = u;
+                    /* 一个内容分片都没有：不要写收尾分片/[DONE]。
+                       调用方据此判定"上游回空"并换候选；写了收尾，
+                       客户端会先收到一个空回答，换号后又会收到第二份收尾。 */
+                    if (!committed()) return;
                     /* 保真模式：上游的分片（含 finish_reason 与 usage）已经原样写出去了，
                        这里只更新记账状态，别再补一条 canonical 收尾把客户端搞乱。 */
                     if (rawWrote || rawEnded) return;
@@ -1059,13 +1069,24 @@ public final class Fronts {
             private final StringBuilder toolArgs = new StringBuilder();
             private String toolName = "";
             private String toolId = "";
+            /** 是否已经写出 message_start；只有真的来内容时才写，空流才能换号。 */
+            private boolean started;
+            /** 是否来过正文/思考/工具调用。 */
+            private boolean substantive;
 
             public Streamer(BufferedWriter w, String model) {
                 this.w = w;
                 this.model = model;
             }
 
+            public boolean substantive() {
+                return substantive;
+            }
+
+            /** 延迟到第一段内容再写 message_start：空流不提交，网关可以换下一个候选。 */
             public void start() throws Exception {
+                if (started) return;
+                started = true;
                 JSONObject msg = new JSONObject();
                 msg.put("id", id);
                 msg.put("type", "message");
@@ -1132,7 +1153,10 @@ public final class Fronts {
 
             @Override
             public void text(String d) {
+                if (d == null || d.isEmpty()) return;
                 try {
+                    substantive = true;
+                    start();
                     if (!"text".equals(openType)) openBlock("text", new JSONObject().put("text", ""));
                     delta("text_delta", new JSONObject().put("type", "text_delta").put("text", d));
                 } catch (Exception ignored) {
@@ -1141,7 +1165,10 @@ public final class Fronts {
 
             @Override
             public void thinking(String d) {
+                if (d == null || d.isEmpty()) return;
                 try {
+                    substantive = true;
+                    start();
                     if (!"thinking".equals(openType)) {
                         /* 起始块就带上 signature：非流式那条必须带，流式这里也一并给上，
                            免得客户端按"起始块 + signature_delta"两处取值时拿到 undefined。 */
@@ -1157,6 +1184,8 @@ public final class Fronts {
                 String fixed = fixToolArgs(argsJson);
                 if (fixed == null) return;
                 try {
+                    substantive = true;
+                    start();
                     toolId = callId;
                     toolName = name;
                     JSONObject extra = new JSONObject();
@@ -1177,6 +1206,9 @@ public final class Fronts {
                 try {
                     stop = stopReason;
                     if (u != null) usage = u;
+                    /* 没有任何内容：不要写 message_start / message_delta / message_stop。
+                       调用方看到 substantive()==false 会换下一个候选；写了收尾就换不了。 */
+                    if (!started) return;
                     closeBlockIfOpen();
                     JSONObject md = new JSONObject();
                     md.put("type", "message_delta");

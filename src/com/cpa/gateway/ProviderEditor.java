@@ -288,6 +288,9 @@ final class ProviderEditor {
             p.apiKey = apiKey.getText().toString().trim();
             p.credentials = creds.getText().toString().trim();
             p.enabled = enabled.isChecked();
+            /* 用户改账号/重新登录，等于明确表示"再试一次"：清掉上游限制标记。
+               否则账号页会一直显示"异常行为被限制"，改完也不生效。 */
+            p.clearRestricted();
             p.rpm = intOf(rpm);
             p.rpd = intOf(rpd);
             p.maxConcurrent = intOf(conc);
