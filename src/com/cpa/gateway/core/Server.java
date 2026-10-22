@@ -3995,6 +3995,15 @@ public final class Server {
                 inner.responseId(id);
             }
 
+            /* 上游在流开头报的 input_tokens（4.51.9）：**必须原样往下传**。
+               这层是记账包装，漏转发就等于把这个信号吃掉 ——
+               下游 Streamer 收不到，message_start 又退回写 0。
+               （写这条注释是因为 responseId 上面刚有一样的教训。） */
+            @Override
+            public void inputTokens(int tokens) {
+                inner.inputTokens(tokens);
+            }
+
             /* 响应保真（4.50.0）：原样透传的分片也要穿过这层记账包装，
                否则 Streamer/Collector 永远收不到 raw 回调，客户端会拿到空响应。 */
             @Override

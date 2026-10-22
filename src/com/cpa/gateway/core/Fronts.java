@@ -1136,6 +1136,16 @@ public final class Fronts {
             private boolean started;
             /** 是否来过正文 / 工具调用。**不算 thinking**：思考过程不是回答。 */
             private boolean delivered;
+            /**
+             * 上游在流开头报来的输入 token 数（4.51.9）。
+             *
+             * <p>存在的理由：我们的 `message_start` 是**延迟提交**的
+             * （第一段正文才写，这样空流还能换候选），而提交时上游那个带
+             * `input_tokens` 的 `message_start` 早就到过了 —— 值就在手上。
+             * 以前没有通道传进来，于是写死 0，客户端（官方 SDK / Claude Code）
+             * 在整个流里读到的上下文都是 0。
+             */
+            private int earlyInputTokens;
 
             public Streamer(BufferedWriter w, String model) {
                 this.w = w;
@@ -1153,6 +1163,19 @@ public final class Fronts {
                 return delivered;
             }
 
+            /**
+             * 上游在流开头报来的 input_tokens（4.51.9）。
+             *
+             * <p>必须**在 `start()` 之前**收到才有效 —— 上游的 `message_start` 确实
+             * 排在最前面（在我们写自己的 `message_start` 之前），所以这条路是通的。
+             * 万一某个上游把 usage 放到后面才给，这里也只是回到旧行为（写 0），
+             * 真值仍会由 `finish()` 经 `message_delta` 送到，不会更差。
+             */
+            @Override
+            public void inputTokens(int tokens) {
+                if (tokens > 0) earlyInputTokens = tokens;
+            }
+
             /** 延迟到第一段内容再写 message_start：空流不提交，网关可以换下一个候选。 */
             public void start() throws Exception {
                 if (started) return;
@@ -1166,7 +1189,10 @@ public final class Fronts {
                 msg.put("stop_reason", JSONObject.NULL);
                 msg.put("stop_sequence", JSONObject.NULL);
                 JSONObject u = new JSONObject();
-                u.put("input_tokens", 0);
+                /* input_tokens 用上游早先报来的真值（4.51.9）。拿不到时才是 0 ——
+                   OpenAI 协议的上游 usage 在末帧才给，那类渠道这里只能是 0，
+                   但真值仍会通过 message_delta 送到（见 finish()）。 */
+                u.put("input_tokens", earlyInputTokens);
                 u.put("output_tokens", 0);
                 msg.put("usage", u);
                 JSONObject ev = new JSONObject();

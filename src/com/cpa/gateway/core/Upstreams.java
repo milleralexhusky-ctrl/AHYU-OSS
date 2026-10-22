@@ -1472,6 +1472,11 @@ public final class Upstreams {
                 JSONObject msg = ev.optJSONObject("message");
                 if (msg != null) {
                     applyUsage(usage, msg.optJSONObject("usage"), "input_tokens", "output_tokens", "cache_read_input_tokens");
+                    /* 上游在流开头就报了 input_tokens —— 立刻转给下游渲染器，
+                       让它在写自己的 message_start 时能带上真值（4.51.9）。
+                       以前只等到 finish() 才给，而那时 message_start 早已写完，
+                       客户端在整个流里读到的 input_tokens 都是 0。 */
+                    if (usage.input > 0) sink.inputTokens(usage.input);
                     if (!idReported[0]) {
                         String rid = Proto.optString(msg, "id", "");
                         if (!rid.isEmpty()) {

@@ -2477,6 +2477,13 @@ public final class Selftest {
             if (!"msg_test".equals(cap.rid)) return "Anthropic responseId 没上报：" + cap.rid;
             if (!"stop".equals(cap.stop)) return "Anthropic stop 不对：" + cap.stop;
             if (cap.in != 7 || cap.out != 3) return "Anthropic usage 不对：" + cap.in + "/" + cap.out;
+            /* 4.51.9：上游 message_start 里的 input_tokens 必须在**流开头**就转给下游。
+               客户端（官方 SDK / Claude Code）会在自己的 message_start 里读它做上下文
+               计数；以前没有这个通道，那个值被写死成 0。 */
+            if (cap.earlyIn != 7) {
+                return "Anthropic 没有在流开头上报 input_tokens（期望 7，实际 " + cap.earlyIn
+                        + "）—— 客户端的上下文计数会是 0";
+            }
         } catch (Throwable t) {
             return "Anthropic 回放异常：" + t;
         }
@@ -2572,6 +2579,13 @@ public final class Selftest {
         String stop = "";
         int in;
         int out;
+        /** 上游在流开头报来的 input_tokens（4.51.9 的新通道），没报则为 -1。 */
+        int earlyIn = -1;
+
+        @Override
+        public void inputTokens(int tokens) {
+            earlyIn = tokens;
+        }
 
         @Override
         public void text(String delta) {

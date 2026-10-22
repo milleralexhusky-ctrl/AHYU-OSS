@@ -295,6 +295,22 @@ public final class Proto {
         default void responseId(String id) {
         }
 
+        /**
+         * 上游**在流开头**就报出的输入 token 数（4.51.9）。
+         *
+         * <p>为什么要单独开一个中途回调：Anthropic 的 `message_start` 在最前面、
+         * 且带 `input_tokens`；而 {@link #finish} 要等到流结束才被调用。
+         * 客户端（官方 SDK / Claude Code）会在 `message_start` 里读 `usage.input_tokens`
+         * 做上下文计数 —— 我们自己的输出流延迟提交（第一段正文才写 `message_start`，
+         * 这样空流还能换候选），提交那一刻上游的值其实**早就到了**，
+         * 只是没有通道把它传进来，于是写死成 0，客户端看到的上下文永远是 0。
+         *
+         * <p>不强制实现：OpenAI 协议的上游 usage 在**末帧**才给（这是规范），
+         * 那类渠道走不到这里，{@link #finish} 里的值仍然正确。
+         */
+        default void inputTokens(int tokens) {
+        }
+
         /* ---------------------------------------------------- 响应保真（4.50.0）
          *
          * 下面三个回调只有"同协议原始透传"才会用到。默认实现是空操作，
