@@ -34,6 +34,7 @@ public class SettingsActivity extends Activity {
     private Switch lanSwitch;
     private Switch autostartSwitch;
     private Switch keepAliveSwitch;
+    private Switch updateSwitch;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -202,9 +203,14 @@ public class SettingsActivity extends Activity {
         dataCard.addView(Ui.label(this, "包含脱敏配置、日志、用量、自检结果；"
                 + "rawcap 尾部可能含回答内容，发送前请自行检查。"), Ui.lp(this, 6));
 
-        TextView updateBtn = Ui.outlineButton(this, "检查更新（GitHub Release）");
+        updateSwitch = Ui.toggle(this, "自动检查新版本（下载后提示安装）", cfg.autoUpdate);
+        dataCard.addView(updateSwitch, Ui.lp(this, 10));
+        TextView updateBtn = Ui.outlineButton(this, "检查更新");
         updateBtn.setOnClickListener(v -> checkUpdate());
-        dataCard.addView(updateBtn, Ui.lp(this, 10));
+        dataCard.addView(updateBtn, Ui.lp(this, 8));
+        dataCard.addView(Ui.label(this, "更新包只从本项目的发布页下载，安装前会比对签名；"
+                + "与当前应用签名不一致的包一律拒绝。安装时系统会弹一次确认框（安卓不允许静默安装）。"),
+                Ui.lp(this, 6));
 
         TextView exportBtn = Ui.outlineButton(this, "导出加密备份");
         exportBtn.setOnClickListener(v -> startExport());
@@ -350,6 +356,7 @@ public class SettingsActivity extends Activity {
         cfg.lanAccess = lanSwitch.isChecked();
         cfg.autostart = autostartSwitch.isChecked();
         cfg.keepAlive = keepAliveSwitch.isChecked();
+        cfg.autoUpdate = updateSwitch.isChecked();
         if (keyCleared && cfg.lanAccess) {
             /* 局域网模式下没有 Key 会被 Server 直接 401 拒绝整个请求（那是有意的），
                这里先把话说清楚，不要让用户以为"保存成功了但客户端连不上"是 bug。 */
@@ -592,79 +599,102 @@ public class SettingsActivity extends Activity {
     }
 
     /**
-     * 检查公库最新 Release。只提示并跳转，不做静默安装。
+     * 检查更新（4.52.0）：查版本 → 下载 → 校验签名 → 引导安装。
      *
-     * 走 GitHub 公开 API，用户点一次才发一次请求；失败只 toast，不打扰。
+     * <p>走 {@code Updater}，不再只跳发布页。查版本读的是仓库里的
+     * {@code version.properties}（三个源都通），Release 说明才去 API 取
+     * —— API 经镜像是 403，所以要允许"没说明但有更新"。
      */
     private void checkUpdate() {
         toast("正在检查最新版本…");
-        Threads.io(() -> {
-            try {
-                java.util.Map<String, String> headers = new java.util.HashMap<>();
-                headers.put("Accept", "application/vnd.github+json");
-                com.cpa.gateway.core.Http.Resp resp = com.cpa.gateway.core.Http.call(
-                        "GET",
-                        "https://api.github.com/repos/milleralexhusky-ctrl/AHYU-OSS/releases/latest",
-                        headers, null, null, 10000, 15000, false);
-                org.json.JSONObject o = new org.json.JSONObject(resp.body);
-                final String tag = o.optString("tag_name", "");
-                final String url = o.optString("html_url", "");
-                String notes = o.optString("body", "");
-                if (tag.isEmpty()) throw new IllegalStateException("GitHub 返回里没有版本号");
-                String cur = com.cpa.gateway.core.Backup.versionTag();
-                boolean newer = compareVersion(tag, cur) > 0;
-                String title = newer
-                        ? "发现新版本 " + tag + "（当前 " + cur + "）"
-                        : "已是最新版本（当前 " + cur + "）";
-                if (notes.length() > 4000) notes = notes.substring(0, 4000) + "…";
-                final String msg = notes.isEmpty() ? "这个 Release 没有写说明。" : notes;
-                runOnUiThread(() -> {
-                    android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
-                            .setTitle(title)
-                            .setMessage(msg)
-                            .setNegativeButton("关闭", null);
-                    if (!url.isEmpty()) {
-                        b.setPositiveButton("打开发布页", (d, w) -> {
+        com.cpa.gateway.core.Updater.checkManual(this, (info, apk) -> {
+            final String cur = com.cpa.gateway.core.Updater.currentVersion(this);
+            runOnUiThread(() -> {
+                if (!info.ok()) {
+                    toast("检查更新失败：" + info.error);
+                    return;
+                }
+                if (!info.newer) {
+                    new android.app.AlertDialog.Builder(this)
+                            .setTitle("已是最新版本")
+                            .setMessage("当前 " + cur + "（" + info.version + "）")
+                            .setPositiveButton("知道了", null)
+                            .show();
+                    return;
+                }
+                android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+                        .setTitle("发现新版本 " + info.version + "（当前 " + cur + "）")
+                        .setMessage(info.notes.isEmpty()
+                                ? "这个版本没取到说明（发布说明需要直连 GitHub API，"
+                                        + "当前网络可能要走代理）。可以直接安装。"
+                                : info.notes)
+                        .setNegativeButton("暂不", null)
+                        .setNeutralButton("打开发布页", (d, w) -> {
                             try {
                                 startActivity(new Intent(Intent.ACTION_VIEW,
-                                        android.net.Uri.parse(url)));
+                                        android.net.Uri.parse(info.pageUrl)));
                             } catch (Throwable ignored) {
                             }
                         });
-                    }
-                    b.show();
-                });
-            } catch (Throwable t) {
-                runOnUiThread(() -> toast("检查更新失败：" + t.getMessage()));
-            }
+                /* 已经有下好的包时，按钮就是"立即安装"；没有则先下再装。
+                   两条路都落到同一个 install()，不重复一套逻辑。 */
+                b.setPositiveButton(apk != null ? "立即安装" : "下载并安装",
+                        (d, w) -> installOrDownload(apk, info));
+                b.show();
+            });
         });
     }
 
-    private static int compareVersion(String a, String b) {
-        String[] x = versionParts(a);
-        String[] y = versionParts(b);
-        int n = Math.max(x.length, y.length);
-        for (int i = 0; i < n; i++) {
-            int vx = i < x.length ? parseIntOr0(x[i]) : 0;
-            int vy = i < y.length ? parseIntOr0(y[i]) : 0;
-            if (vx != vy) return vx < vy ? -1 : 1;
+    /** 有包就装，没包就下载（进度在通知栏之外，用 toast 说明"在下"）。 */
+    private void installOrDownload(final java.io.File ready,
+                                   final com.cpa.gateway.core.Updater.Info info) {
+        if (ready != null) {
+            doInstall(ready);
+            return;
         }
-        return 0;
+        toast("正在下载更新包…");
+        Threads.io(() -> {
+            final java.io.File got = com.cpa.gateway.core.Updater.download(this, info);
+            runOnUiThread(() -> {
+                if (got == null) {
+                    toast("下载或校验失败，详见网关日志（已拒绝可疑文件）");
+                    return;
+                }
+                doInstall(got);
+            });
+        });
     }
 
-    private static String[] versionParts(String v) {
-        String s = v == null ? "" : v.trim();
-        while (s.startsWith("v") || s.startsWith("V")) s = s.substring(1);
-        if (s.isEmpty()) return new String[0];
-        return s.split("[^0-9]+");
-    }
-
-    private static int parseIntOr0(String s) {
-        try {
-            return Integer.parseInt(s);
-        } catch (Throwable t) {
-            return 0;
+    /**
+     * 发起安装。
+     *
+     * <p>这里**直接调用**而不经过通知那条路：设置页本身就是前台界面，
+     * 在这里发起安装不会被"后台启动 Activity"的限制拦住，
+     * 也没有必要先发一条通知再让用户去点它。
+     */
+    private void doInstall(java.io.File apk) {
+        String err = com.cpa.gateway.core.Updater.install(this, apk);
+        if (err == null) {
+            toast("已发起安装，请在弹出的系统窗口里确认");
+            return;
         }
+        if (com.cpa.gateway.core.Updater.NEED_PERMISSION.equals(err)) {
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("需要允许安装应用")
+                    .setMessage("系统要求先允许本应用「安装未知应用」，否则无法完成更新。"
+                            + "点「去设置」开启后再回来点一次「立即安装」。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("去设置", (d, w) -> {
+                        try {
+                            startActivity(com.cpa.gateway.core.Updater.installPermissionIntent(this));
+                        } catch (Throwable t) {
+                            toast("这台 ROM 打不开该设置页，请到系统设置里手动允许");
+                        }
+                    })
+                    .show();
+            return;
+        }
+        toast("发起安装失败：" + err);
     }
 
     /** 选一个位置，导出脱敏后的诊断 zip。 */

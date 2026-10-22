@@ -89,6 +89,15 @@ public final class Config {
     public long lastAutoDetect = 0L;
     /** Minimum seconds between two automatic sweeps. */
     public long autoDetectInterval = 21600L;
+    /**
+     * 后台自动检查新版本（4.52.0）。默认开。
+     *
+     * <p>只控制"要不要偷偷查 + 下载"，**安装永远要用户点系统确认框**，
+     * 这个开关关不掉也绕不过那条 —— 那是安卓的约束，也是安全机制。
+     */
+    public boolean autoUpdate = true;
+    /** Unix seconds of the last automatic update check. */
+    public long lastUpdateCheck = 0L;
 
     /**
      * 本机回环访问 Key。**默认空串＝不校验**。
@@ -726,6 +735,8 @@ public final class Config {
         o.put("autoDetect", autoDetect);
         o.put("lastAutoDetect", lastAutoDetect);
         o.put("autoDetectInterval", autoDetectInterval);
+        o.put("autoUpdate", autoUpdate);
+        o.put("lastUpdateCheck", lastUpdateCheck);
         JSONArray a = new JSONArray();
         for (String u : aliveStations) a.put(u);
         o.put("aliveStations", a);
@@ -777,6 +788,9 @@ public final class Config {
         c.lastAutoDetect = lad == null ? 0L : lad.longValue();
         Long adi = Proto.optLong(o, "autoDetectInterval");
         c.autoDetectInterval = adi == null ? 21600L : Math.max(600L, adi.longValue());
+        c.autoUpdate = o.optBoolean("autoUpdate", true);
+        Long luc = Proto.optLong(o, "lastUpdateCheck");
+        c.lastUpdateCheck = luc == null ? 0L : luc.longValue();
         JSONArray al = o.optJSONArray("aliveStations");
         for (int i = 0; al != null && i < al.length(); i++) {
             String u = al.optString(i, "");

@@ -1835,6 +1835,54 @@ public final class Server {
             }
             return;
         }
+        if ("/v1/debug/update-check".equals(path)) {
+            /* 调试包专用：把"查版本 / 下载 / 校验"三步的真实结果吐出来。
+               存在的唯一理由是**签名校验这条无法离线验证** —— 我们的包只有
+               v2/v3 签名（apksigner verify 实测 v1=false），而 GET_SIGNATURES
+               在 API 28+ 读这种包返回空签名；到底读到读不到，只能在这台设备上问一次。 */
+            try {
+                writeJson(out, 200, Updater.report(Gateway.context()).toString());
+            } catch (Throwable t) {
+                writeError(out, path, 500, String.valueOf(t));
+            }
+            return;
+        }
+        if ("/v1/debug/wb-balance".equals(path)) {
+            /* 调试包专用：把 WorkBuddy 账号的真实资源包余额打出来。
+               用途是分清"上游不认我们是官方客户端（11128 渠道校验）"和
+               "这个账号的额度真用完了（14018）"——两者的修法完全不同，
+               而它们在客户端看到的都是"WorkBuddy 用不了"。 */
+            JSONObject res = new JSONObject();
+            try {
+                for (Config.Provider p : config.providers) {
+                    if (!Config.TYPE_WORKBUDDY.equals(p.type)) continue;
+                    JSONObject one = new JSONObject();
+                    try {
+                        one.put("balance", WbTasks.balance(p));
+                    } catch (Throwable t) {
+                        one.put("balanceError", String.valueOf(t));
+                    }
+                    try {
+                        one.put("credits", WbTasks.credits(p));
+                    } catch (Throwable t) {
+                        one.put("creditsError", String.valueOf(t));
+                    }
+                    /* 上游原始回包：balance() 的解析若与上游字段名对不上，
+                       会出现"总额 500 但每个包 remain=0"这种自相矛盾的读数，
+                       而光看解析结果无法判断是解析错了还是账号真的空了。 */
+                    try {
+                        one.put("rawResource", WbTasks.rawResource(p));
+                    } catch (Throwable t) {
+                        one.put("rawError", String.valueOf(t));
+                    }
+                    res.put(p.name, one);
+                }
+                writeJson(out, 200, res.toString(2));
+            } catch (Throwable t) {
+                writeError(out, path, 500, String.valueOf(t));
+            }
+            return;
+        }
         if ("/v1/debug/diagnostics".equals(path)) {
             /* 调试包专用：直接下载诊断 zip，方便用 curl 取回，也方便测试。 */
             byte[] zip = Diagnostics.build();

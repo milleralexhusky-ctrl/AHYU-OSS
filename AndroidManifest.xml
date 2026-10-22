@@ -10,6 +10,15 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!--
+      自动更新（4.52.0）：让本应用能发起安装。
+      这个权限**不等于**静默安装 —— 系统仍会弹"是否安装"确认框，用户必须点一次。
+      没有它的话 PackageInstaller 会话会被系统直接拦掉（STATUS_FAILURE_BLOCKED），
+      表现是"点立即更新没反应"。
+      Android 14+ 的 Play 政策对这类权限有限制，但本项目从 GitHub Release 自装自更新，
+      是它合法的用途（应用自己升级自己）。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name="com.cpa.gateway.CpaApp"
@@ -172,6 +181,15 @@
             android:name="com.cpa.gateway.KeepAliveJobService"
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!--
+          自动更新（4.52.0）：收 PackageInstaller 的安装结果，装成功后清理下载包。
+          exported=false —— 它只接本应用自己 PendingIntent 发出的广播，
+          对外开放等于让任何应用伪造"安装成功"来删文件（虽然危害小，但没必要冒）。
+        -->
+        <receiver
+            android:name="com.cpa.gateway.InstallResultReceiver"
+            android:exported="false" />
 
         <receiver
             android:name="com.cpa.gateway.BootReceiver"

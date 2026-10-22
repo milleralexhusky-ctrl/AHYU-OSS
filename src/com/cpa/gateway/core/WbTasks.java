@@ -313,6 +313,18 @@ public final class WbTasks {
     }
 
     /**
+     * 调试专用：上游 {@code get-user-resource} 的**原始回包**。
+     *
+     * <p>只给 {@code /v1/debug/wb-balance} 用。存在的理由：{@link #balance} 是把回包
+     * 按字段名解析成摘要的，一旦字段名对不上（上游改版），摘要就会出现
+     * "总额 500 但每个包剩余都是 0"这类自相矛盾的读数 —— 而**看摘要无法判断**
+     * 是解析错了还是账号真的空了。这时只有原始 JSON 能给出答案。
+     */
+    public static JSONObject rawResource(Config.Provider p) throws Exception {
+        return call(p, "/v2/billing/meter/get-user-resource", "POST", new JSONObject());
+    }
+
+    /**
      * 只读余额快照，给账号页显示"还剩多少 / 哪个包先到期"。
      *
      * 为什么值得单独做：4.31.1 实测同一批 global 账号的推理回包里都写着

@@ -22,6 +22,35 @@ public class GatewayService extends Service {
 
     public static final String ACTION_START = "com.cpa.gateway.START";
     public static final String ACTION_STOP = "com.cpa.gateway.STOP";
+    /**
+     * 安装已下载好的更新包。
+     *
+     * <p>必须**由服务接这个动作**，而不是让通知直接 startActivity 设置页：
+     * 从通知启动 Activity 不会把应用带到前台，Android 10+ 禁止后台应用启动 Activity，
+     * {@code canStartBackgroundActivity()} 会返回 false —— 于是用户点「立即更新」
+     * **什么都不发生**（看着就是"通知坏了"）。服务是前台服务，由它发起就合法。
+     * 这是自动更新里唯一一个"不报错、只是不响应"的坑。
+     */
+    public static final String ACTION_INSTALL_UPDATE = "com.cpa.gateway.INSTALL_UPDATE";
+    /** 更新提醒通知的 id（与运行状态、账号告警、电池引导各占一条，互不覆盖）。 */
+    private static final int UPDATE_NOTIF_ID = 8324;
+    /**
+     * 本次进程里已经为哪个版本发过"新就绪"通知。
+     *
+     * <p>放服务这里而不是只放 Updater：点了通知去安装之后应当**撤销**它，
+     * 撤销后若不再记一次，同一个进程里就会重复弹。
+     */
+    private static volatile String updateNotifiedFor = "";
+
+    /** 更新已装上（新进程启动）：撤销残留的更新通知。 */
+    public static void dismissUpdateNotification(android.content.Context c) {
+        try {
+            NotificationManager nm = (NotificationManager)
+                    c.getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(UPDATE_NOTIF_ID);
+        } catch (Throwable ignored) {
+        }
+    }
     private static final String CHANNEL_ID = "cpa_gateway";
     private static final int NOTIF_ID = 8321;
     /** 账号告警：跟"运行状态"分开一条通知，别把状态通知刷新掉。 */
@@ -69,6 +98,45 @@ public class GatewayService extends Service {
         instance = this;
         ensureBatteryWhitelist();
         String action = intent == null ? ACTION_START : intent.getAction();
+        /* 自动更新：装已下载好的更新包（用户点通知触发）。
+           不能靠通知直接 startActivity，后台启动 Activity 在 Android 10+ 会被拦。 */
+        if (ACTION_INSTALL_UPDATE.equals(action)) {
+            java.io.File apk = com.cpa.gateway.core.Updater.apkFile(this);
+            String err = com.cpa.gateway.core.Updater.install(this, apk);
+            if (err != null) {
+                if (com.cpa.gateway.core.Updater.NEED_PERMISSION.equals(err)) {
+                    try {
+                        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                        if (nm != null) {
+                            String cid = "cpa_update_ready";
+                            if (nm.getNotificationChannel(cid) == null) {
+                                NotificationChannel ch = new NotificationChannel(cid, "版本更新",
+                                        NotificationManager.IMPORTANCE_DEFAULT);
+                                ch.setDescription("发现可安全安装的新版本时提醒");
+                                ch.setShowBadge(false);
+                                nm.createNotificationChannel(ch);
+                            }
+                            android.content.Intent it =
+                                    com.cpa.gateway.core.Updater.installPermissionIntent(this);
+                            PendingIntent pi = PendingIntent.getActivity(this, 8, it,
+                                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                            Notification.Builder b = new Notification.Builder(this, cid)
+                                    .setContentTitle("需要允许「安装未知应用」")
+                                    .setContentText("点击去系统设置开启，然后重新点「立即更新」")
+                                    .setSmallIcon(R.drawable.ic_notify)
+                                    .setAutoCancel(true)
+                                    .setContentIntent(pi);
+                            nm.notify(UPDATE_NOTIF_ID, b.build());
+                        }
+                    } catch (Throwable t) {
+                        Log.w("发送权限通知失败：" + t);
+                    }
+                } else {
+                    Log.w("安装更新失败：" + err);
+                }
+            }
+            return START_NOT_STICKY;
+        }
         if (ACTION_STOP.equals(action)) {
             /*
              * 用 stopByUser 而不是 stop()：前者把状态置为 STOPPED_BY_USER，
@@ -293,6 +361,52 @@ public class GatewayService extends Service {
      * 卡住的连接池）再 start()，不看那个 boolean；5 分钟冷却防止把刚起来的实例
      * 又立刻打下去。
      */
+    /** 自动更新：跟随保活调用，每天只查一次。 */
+    private void handleAutoUpdate() {
+        try {
+            Config cfg = Gateway.config();
+            if (cfg == null || !cfg.autoUpdate) return;
+            long now = System.currentTimeMillis() / 1000L;
+            if (cfg.lastUpdateCheck > 0 && now - cfg.lastUpdateCheck < com.cpa.gateway.core.Updater.AUTO_INTERVAL_S) {
+                return;
+            }
+            cfg.lastUpdateCheck = now;
+            Gateway.persistSoon();
+            com.cpa.gateway.core.Updater.checkInBackground(this, info -> {
+                try {
+                    NotificationManager nm =
+                            (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                    if (nm == null) return;
+                    /* 建一个和运行状态分开的 channel，避免更新通知混入网关运行状态 */
+                    String cid = "cpa_update_ready";
+                    if (nm.getNotificationChannel(cid) == null) {
+                        NotificationChannel ch = new NotificationChannel(cid, "版本更新",
+                                NotificationManager.IMPORTANCE_DEFAULT);
+                        ch.setDescription("发现可安全安装的新版本时提醒");
+                        ch.setShowBadge(false);
+                        nm.createNotificationChannel(ch);
+                    }
+                    /* 点通知 → 触发安装（走前台服务的 onStartCommand，合法） */
+                    android.content.Intent inst = new Intent(this, GatewayService.class)
+                            .setAction(ACTION_INSTALL_UPDATE);
+                    PendingIntent pi = PendingIntent.getService(this, 7, inst,
+                            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                    Notification.Builder b = new Notification.Builder(this, cid)
+                            .setContentTitle("AHYU " + info.version + " 已就绪")
+                            .setContentText("点击安装（需确认系统弹窗）")
+                            .setSmallIcon(R.drawable.ic_notify)
+                            .setAutoCancel(true)
+                            .setContentIntent(pi);
+                    nm.notify(UPDATE_NOTIF_ID, b.build());
+                } catch (Throwable t) {
+                    Log.w("发送更新通知失败：" + t);
+                }
+            });
+        } catch (Throwable t) {
+            Log.w("自动更新处理失败：" + t);
+        }
+    }
+
     private void startWatchdog() {
         if (watching) return;
         watching = true;
@@ -317,6 +431,7 @@ public class GatewayService extends Service {
                 // CPU 锁的续期/释放必须每轮都跑：
                 // 原来放在探活成功之后，而探活成功会 continue —— 那段代码永远走不到，
                 // 锁于是只能靠 10 分钟超时自然失效（既没续期、也没"空闲释放"）。
+                handleAutoUpdate();
                 if (wakeLock != null && wakeLock.isHeld()) {
                     long idle = System.currentTimeMillis()
                             - com.cpa.gateway.core.Gateway.lastClientRequestMs();

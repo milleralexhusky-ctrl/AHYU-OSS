@@ -99,6 +99,7 @@ public final class Selftest {
         add(out, "HTTP 头与行长度上限（防内存耗尽）", Selftest::checkHttpLimits);
         add(out, "浏览器跨源防护（无 Key 时拒绝外部网页）", Selftest::checkBrowserOrigin);
         add(out, "日志脱敏（token/state/JWT，不误伤业务码）", Selftest::checkLogScrub);
+        add(out, "自动更新：只升不降 + version.properties 解析", Selftest::checkUpdater);
         return out;
     }
 
@@ -1690,6 +1691,60 @@ public final class Selftest {
             return "配置里已经没有的渠道没被标成「已删除」——"
                     + "用户会在行为画像里看到不存在的账号";
         }
+        return null;
+    }
+
+    /**
+     * 自动更新：只升不降 + version.properties 解析（4.52.0）。
+     *
+     * <p>钉两处**不会报错、只会静默做错**的地方：
+     *
+     * <ol>
+     *   <li>{@code shouldOffer} 写成 {@code >=}：每次检查都认为有新版，
+     *       于是每天下一次同一个包、每天弹一次通知，日志里全是"已是最新"以外的正常字样。</li>
+     *   <li>{@code version.properties} 的解析：这个文件是**版本号的唯一来源**，
+     *       而它同时含 {@code version.code}（递增号，如 657）和 {@code version.name}
+     *       （如 4.51.9）。早先的版本拿版本名反推 versionCode 得到 45109，
+     *       和真实的 657 一比永远"有新版" —— 功能从第一天起就是坏的却不报错。
+     *       所以这里必须断言"读到的 code 是文件里写的那个"，而不是推算值。</li>
+     * </ol>
+     *
+     * <p>顺带钉住"注释行和空行不能被当成配置"：文件头两行是 {@code #} 注释，
+     * 写错解析的话 {@code version.code} 那行反而可能被跳过。
+     */
+    private static String checkUpdater() {
+        /* 1. 只升不降 */
+        if (Updater.shouldOffer(658, 657) != true) return "更高版本号没被判为可更新";
+        if (Updater.shouldOffer(657, 657)) return "同版本号被判为可更新 —— 会每天重复下载同一个包";
+        if (Updater.shouldOffer(656, 657)) return "更低版本号被判为可更新 —— 只升不降失效（可被诱导装回旧版）";
+        if (Updater.shouldOffer(0, 657)) return "版本号 0 被判为可更新";
+        if (Updater.shouldOffer(658, -1)) return "拿不到当前版本号时不该判为可更新（应由版本名兜底）";
+        if (Updater.compareVersion("4.52.0", "4.51.9") <= 0) return "4.52.0 应大于 4.51.9";
+        if (Updater.compareVersion("4.51.10", "4.51.9") <= 0) return "4.51.10 应按数字段大于 4.51.9";
+
+        /* 2. version.properties 解析（必须读到文件里真实写的 code，不是推算的） */
+        String sample = "# 版本号的唯一来源\n"
+                + "version.code=657\n"
+                + "version.name=4.51.9\n";
+        Updater.Info a = new Updater.Info();
+        if (!Updater.parseVersionProps(sample, a)) return "version.properties 解析失败";
+        if (a.versionCode != 657) {
+            return "version.code 应为 657，实得 " + a.versionCode
+                    + " —— 若拿版本名 4.51.9 反推得到 45109，就会永远认为有新版本";
+        }
+        if (!"4.51.9".equals(a.version)) return "version.name 解析错误：" + a.version;
+
+        /* 3. 认不出的内容要返回 false（让调用方换下一个源），而不是当成"版本 0" */
+        Updater.Info b = new Updater.Info();
+        if (Updater.parseVersionProps("<html>404 not found</html>", b)) {
+            return "解析不了的内容被当成有效版本 —— 源返回错误页时会被误判成有更新";
+        }
+        Updater.Info c = new Updater.Info();
+        if (Updater.parseVersionProps(null, c)) return "null 输入被当成有效版本";
+
+        /* 4. 资产地址形状（发布流程的约定；改了这里就再也下不到包） */
+        String url = Updater.assetUrl("4.52.0");
+        if (!url.endsWith("/v4.52.0/AHYU-4.52.0.apk")) return "资产地址形状不对：" + url;
         return null;
     }
 
