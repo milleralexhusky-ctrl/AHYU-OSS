@@ -716,9 +716,47 @@ public final class Router {
             v += costScore * 6 - 3;                              // -1.02 .. +1.98
         }
 
-        if (c.provider.credits <= 0) v -= 200;                       /* 额度用尽 */
+        /* 额度：**只惩罚"确认耗尽"，不惩罚"未知"**（4.51.7）。
+         *
+         * credits 的默认值是 -1，而全项目只有 workbuddy / trae / loomy 三种类型
+         * 会去刷新它（见 Server 的 credits/refresh 与 GatewayService 的后台刷新）。
+         * 原来写的是 `credits <= 0`，于是 openai / anthropic / gemini / kimi /
+         * deepseek / doubao / xai / cline / codex / claude / antigravity 这些类型的
+         * 账号，credits 一辈子都是 -1、**每个候选永远背着 -200 分**。
+         * 候选总分区间约 100~155，这个惩罚直接把它们沉到池底 —— 表现就是
+         * "加了个自定义中转，auto 老是轮不到它"，而且不报错、不写失败，查都没得查。
+         *
+         * 界面一直是这么理解的（AccountsActivity / AccountDetailActivity 都是
+         * `if (credits >= 0)` 才显示），只有这里把 -1 读成了"耗尽"。同一份数据
+         * 两种读法，错的是这里。
+         *
+         * 另外注意 -200 是**断崖式**的：它比"冷却中"(-100) 还重，也就是说
+         * 一个确认耗尽的账号比一个刚熔断的账号更该被躲开——这是对的，保留。 */
+        if (c.provider.credits == 0) v -= 200;                       /* 额度确认用尽 */
         if (cooldownUntil > now) v -= 100;                           /* 冷却中 */
         if (lastFailAt > 0 && now - lastFailAt < 120_000) v -= 50;   /* 刚报过错 */
+        /* 截断率（4.51.7）：回答被 max_tokens 切成一半就结束。
+         *
+         * 为什么该进选路：截断**不是失败** —— HTTP 200、有正文、质量档记 cut，
+         * 传输层全绿。熔断看不见它、限流退避看不见它、`ok` 计数还是成功。
+         * 于是"这个模型话说到一半就停"在选路里完全隐形，每次都会选中它，
+         * 用户拿到半句话的回答却不知道为什么。
+         *
+         * 数据来源是现成的：usage.tsv 第 12 列 stopReason（4.32.0 就在写），
+         * Stats 已经把它聚合成 seed.truncRate（4.32.0 就在算）——
+         * 只是从来没进过 score()。当时留的注释说"先攒够样本再决定"，
+         * 现在 30 天窗口里样本已经够判分了。
+         *
+         * 判据干净：Proto.canonicalStop 里 hasToolCalls 优先返回 tool_calls，
+         * 所以 truncRate 只统计"纯正文被 length 切断"，不会冤枉爱调工具的模型。
+         *
+         * 权重按可信度打折（和延迟项同一个公式）：1 笔样本的截断不该定生死。
+         * 惩罚上限 -15，刻意排在"刚报过错"(-50) 之下 ——
+         * 截断难堪，但毕竟给了大半句可用的话。 */
+        if (seed != null && seed.truncRate > 0 && seed.wContent >= 2) {
+            double trustT = seed.wContent / (seed.wContent + HIST_K);
+            v -= 15 * seed.truncRate * trustT;
+        }
         /* 工具能力：实测会调的加分，打嘴炮的狠狠扣（后面还有硬门禁兜底） */
         if (needsTools) {
             int st = ToolAbility.state(c.provider, c.model);

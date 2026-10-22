@@ -414,6 +414,7 @@ public final class Server {
         to.stopReason = from.stopReason;
         to.tokIn = from.tokIn;
         to.tokOut = from.tokOut;
+        to.tokCached = from.tokCached;
         to.parseOutcome = from.parseOutcome;
         to.responseShape = from.responseShape;
         to.upstreamResponseId = from.upstreamResponseId;
@@ -550,6 +551,15 @@ public final class Server {
         volatile boolean responseFailed;
         volatile int tokIn;
         volatile int tokOut;
+        /**
+         * 其中**命中前缀缓存**的输入 token 数（0 = 没有 / 上游没报）。
+         *
+         * 为什么要单独留：命中缓存的输入 token 比未命中的便宜得多
+         * （Anthropic 约 1/10、OpenAI 约 1/2），混在一起按全价算会让
+         * "成本 ≈$"这个数明显偏高。更要紧的是——**这是会话亲和唯一的效果指标**：
+         * 亲和的意义就是保住 prompt cache，命中率涨没涨只有这个数能回答。
+         */
+        volatile int tokCached;
         /* 4.32.0 内容信号：三样都不依赖上游返回 usage，全从 Sink 回调里数出来。
            为什么需要它们见 Usage 的列说明——前九列没有一列能反映"回答内容行不行"。 */
         /** 本次响应流给客户端的正文字符数（增量累加）。 */
@@ -1192,6 +1202,9 @@ public final class Server {
                             conn.clientRetried, conn.sawToolCall);
                     obs.responseId = conn.upstreamResponseId;
                     obs.conversationId = conn.conversationId;
+                    /* 命中前缀缓存的输入 token（4.51.7）：上游解析出来之后
+                       以前走到 Conn 就断了，既没落盘也没进成本计算。 */
+                    obs.cached = conn.tokCached;
                     /* 没报错但结果为空 —— 这也是一种失败，单独归类 */
                     obs.toolNames = conn.toolNames;
                     obs.errorKind = !ErrorKind.NONE.equals(errKind)
@@ -1226,6 +1239,7 @@ public final class Server {
                 conn.responseFailed = false;
                 conn.tokIn = 0;
                 conn.tokOut = 0;
+                conn.tokCached = 0;
                 conn.outChars = 0;
                 conn.sawToolCall = false;
                 conn.stopReason = "";
@@ -3962,6 +3976,7 @@ public final class Server {
                     if (usage != null) {
                         c.tokIn = usage.input;
                         c.tokOut = usage.output;
+                        c.tokCached = usage.cached;
                     }
                 }
                 inner.finish(stopReason, usage);

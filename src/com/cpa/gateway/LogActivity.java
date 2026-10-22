@@ -446,8 +446,16 @@ public class LogActivity extends Activity {
             if (st.tokIn + st.tokOut > 0) {
                 line.append(" · ").append(st.tokIn).append("/").append(st.tokOut).append(" tok");
             }
+            /* 缓存命中率（4.51.7）：这是**会话亲和唯一的成效指标**。
+               亲和让同一段对话复用同一个上游来保住 prompt cache，
+               命中率涨没涨只有这个数能回答——不显示出来就等于没法验证。 */
+            double hit = st.cacheHitRate();
+            if (hit >= 0 && st.tokCached > 0) {
+                line.append(" · 缓存 ").append(Math.round(hit * 100)).append("%");
+            }
             if (withCost) {
-                double c = com.cpa.gateway.core.Prices.costUsd(e.getKey(), st.tokIn, st.tokOut);
+                double c = com.cpa.gateway.core.Prices.costUsd(
+                        e.getKey(), st.tokIn, st.tokCached, st.tokOut);
                 line.append(c >= 0 ? " · ≈$" + com.cpa.gateway.core.Usage.usd(c) : " · 成本未知");
             }
             box.addView(Ui.text(this, line.toString(), 13f, Ui.MUTED, false), Ui.lp(this, 6));

@@ -73,14 +73,19 @@ public final class Prices {
                             String fam = fi.next();
                             JSONObject f = o.optJSONObject(fam);
                             if (f == null) continue;
-                            builtFamily.put(fam, new double[]{f.optDouble("i", 0), f.optDouble("o", 0)});
+                            builtFamily.put(fam, new double[]{f.optDouble("i", 0), f.optDouble("o", 0), -1});
                         }
                         continue;
                     }
                     double i = o.optDouble("i", 0);
                     double out = o.optDouble("o", 0);
                     if (i <= 0 && out <= 0) continue;
-                    double[] pair = new double[]{i, out};
+                    /* cr = 命中前缀缓存的输入单价（4.51.7）。
+                       源数据里约 45% 的收费模型有这一项，中位折扣是输入价的 1/10。
+                       没有的填 -1 而不是 0：0 会被当成"免费"，而实际是"不知道"——
+                       按输入价算（保守，宁可高估也不要假装免费）。 */
+                    double cr = o.optDouble("cr", -1);
+                    double[] pair = new double[]{i, out, cr};
                     builtTable.put(norm(key), pair);
                     int slash = key.lastIndexOf('/');
                     if (slash >= 0 && slash < key.length() - 1) {
@@ -151,9 +156,50 @@ public final class Prices {
 
     /** 这次请求的估算成本（美元）；-1 表示未知。 */
     public static double costUsd(String model, long tokIn, long tokOut) {
+        return costUsd(model, tokIn, 0, tokOut);
+    }
+
+    /**
+     * 带缓存命中的估算成本（4.51.7）。
+     *
+     * <p>命中的输入 token 按 {@code cr} 计价，其余按 {@code i}。这是"这个数到底准不准"
+     * 的关键：会话亲和（4.51.5）让同一段对话复用同一个上游，命中率能到很高——
+     * 若仍按全价算，一个 20K 上下文、命中 90% 的多轮对话会被高估近一个数量级。
+     *
+     * <p>两处保守处理：
+     * <ul>
+     *   <li>{@code cr < 0}（源数据没给缓存价）时**整段按输入价算**，不猜折扣 ——
+     *       宁可高估也不要凭空发明一个便宜的价；</li>
+     *   <li>{@code tokCached > tokIn} 时按 tokIn 截断：上游偶尔会把缓存 token
+     *       单独计在 input 之外，那样相减会得出负数成本。夹住即可，
+     *       不去猜到底哪个字段的语义更对。</li>
+     * </ul>
+     *
+     * @param tokCached 其中命中前缀缓存的输入 token 数（0 = 没有 / 上游没报）
+     */
+    public static double costUsd(String model, long tokIn, long tokCached, long tokOut) {
         double[] p = lookup(model);
         if (p == null) return -1;
-        return tokIn * p[0] + tokOut * p[1];
+        double i = p[0];
+        double cr = p.length > 2 ? p[2] : -1;
+        long cached = Math.max(0, Math.min(tokCached, tokIn));
+        long fresh = Math.max(0, tokIn - cached);
+        double inCost = fresh * i;
+        /* cr<0：没数据，整段按输入价（保守） */
+        inCost += cached * (cr >= 0 ? cr : i);
+        return inCost + tokOut * p[1];
+    }
+
+    /**
+     * 缓存折扣（命中价 / 输入价）；源数据没给返回 -1。
+     *
+     * 给界面用：用量页要能说明"这个 ≈$ 是按几折算的"，否则用户没法判断
+     * 这个数可不可信。
+     */
+    public static double cacheDiscount(String model) {
+        double[] p = lookup(model);
+        if (p == null || p.length < 3 || p[2] < 0 || p[0] <= 0) return -1;
+        return p[2] / p[0];
     }
 
     /** 价格表是否已就绪（UI 用来决定要不要显示"—"）。 */
@@ -164,5 +210,27 @@ public final class Prices {
     /** 加载了多少条（日志/诊断用）。 */
     public static int size() {
         return count;
+    }
+
+    /**
+     * 其中多少条带缓存读单价（4.51.7）。
+     *
+     * <p>为什么要有这个计数：`res/raw/model_prices.json` 是**离线裁剪**生成的，
+     * 裁剪脚本不在仓库里（见 4.27.0 的变更记录）。也就是说，下次有人重建这张表时，
+     * 很容易又一次把 `cr` 字段丢掉 —— 而丢掉的后果是**静默的**：
+     * 成本退回按全价算，界面照旧显示一个数，只是那个数悄悄变贵了。
+     *
+     * <p>{@code Selftest.checkCachedCost} 用它做绊线：这个数掉到 0，自检就红。
+     */
+    public static int countCachePriced() {
+        if (!loaded) {
+            ensureLoaded();
+            return 0;
+        }
+        int n = 0;
+        for (double[] p : TABLE.values()) {
+            if (p != null && p.length > 2 && p[2] >= 0) n++;
+        }
+        return n;
     }
 }

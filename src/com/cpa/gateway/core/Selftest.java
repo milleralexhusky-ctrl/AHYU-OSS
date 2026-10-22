@@ -79,6 +79,10 @@ public final class Selftest {
         add(out, "导航玻璃 tint：各配色背景亮度确实接近（自适应无必要）",
                 Selftest::checkGlassTintRange);
         add(out, "下拉刷新手势（方向 / 阈值 / 不抢点击与滚动）", Selftest::checkPullGesture);
+        add(out, "缓存价成本分段（缺价按全价 / 命中数不可超输入）", Selftest::checkCachedCost);
+        add(out, "额度未知（-1）不能被当成额度用尽", Selftest::checkCreditsUnknown);
+        add(out, "截断率与内容率的信号口径", Selftest::checkContentSignalScope);
+        add(out, "缓存命中率的分母只算带缓存列的行", Selftest::checkCacheRateDenominator);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -600,6 +604,170 @@ public final class Selftest {
             }
         }
         return n;
+    }
+
+    /**
+     * 缓存价成本分段计算（4.51.7）。
+     *
+     * <p>三件必须同时成立的事：
+     * <ol>
+     *   <li>命中缓存的输入 token 按缓存价算，**不是**按输入价；</li>
+     *   <li>源数据没给缓存价时整段按输入价算（保守），不能凭空发明一个便宜的价；</li>
+     *   <li>命中数超过输入数时夹住 —— 上游偶尔把缓存 token 计在 input 之外，
+     *       相减会得出负成本。</li>
+     * </ol>
+     *
+     * <p>再加一条**绊线**：价格表里带缓存价的条目数不能掉到 0。
+     * 那张表是离线裁剪出来的、脚本不在仓库里（见 4.27.0），重建时很容易又把
+     * `cr` 字段丢掉 —— 而丢掉的后果是静默的（成本悄悄变贵），必须有人喊。
+     */
+    private static String checkCachedCost() {
+        /* 绊线：带缓存价的条目数。当前表里是 1214 条。
+           阈值取 500：留足余量（源数据本身也在变），但"字段被整个丢掉"必红。 */
+        int cachePriced = Prices.countCachePriced();
+        if (cachePriced < 500) {
+            return "价格表里带缓存单价（cr）的条目只剩 " + cachePriced
+                    + " 条 —— 重建 res/raw/model_prices.json 时很可能把 cr 字段丢了，"
+                    + "成本会静默退回按全价计算";
+        }
+
+        /* 找一个真的带缓存价的模型来验分段计算。
+           找不到就跳过（不伪装成通过）—— 上面那条绊线已经保证表里有货。 */
+        String model = null;
+        double[] p = null;
+        for (String m : new String[]{"claude-sonnet-4-5", "gpt-5", "gemini/gemini-2.5-pro",
+                "deepseek/deepseek-chat", "anthropic/claude-sonnet-4-5"}) {
+            double[] got = Prices.lookup(m);
+            if (got != null && got.length > 2 && got[2] >= 0 && got[0] > 0) {
+                model = m;
+                p = got;
+                break;
+            }
+        }
+        if (model == null) return null;
+
+        double in = p[0], out = p[1], cr = p[2];
+
+        /* 1) 全部命中：成本应为 输入数×缓存价，明显低于全价 */
+        double allHit = Prices.costUsd(model, 1000, 1000, 0);
+        double expectAllHit = 1000 * cr;
+        if (Math.abs(allHit - expectAllHit) > 1e-12) {
+            return "全部命中缓存时成本应为 " + expectAllHit + "，实际 " + allHit;
+        }
+        double noHit = Prices.costUsd(model, 1000, 0, 0);
+        if (!(allHit < noHit)) {
+            return "命中缓存的成本没有低于未命中（" + allHit + " vs " + noHit + "）";
+        }
+        if (Math.abs(noHit - 1000 * in) > 1e-12) {
+            return "未命中时成本应为 " + (1000 * in) + "，实际 " + noHit;
+        }
+
+        /* 2) 输出价不受缓存影响 */
+        double withOut = Prices.costUsd(model, 0, 0, 1000);
+        if (Math.abs(withOut - 1000 * out) > 1e-12) {
+            return "输出成本应为 " + (1000 * out) + "，实际 " + withOut;
+        }
+
+        /* 3) 命中数超过输入数：夹住，不能出现负成本 */
+        double over = Prices.costUsd(model, 100, 999999, 0);
+        if (over < 0) return "命中数超过输入数时算出了负成本：" + over;
+        if (Math.abs(over - 100 * cr) > 1e-12) {
+            return "命中数超过输入数时应按输入数夹住（期望 " + (100 * cr) + "），实际 " + over;
+        }
+
+        /* 4) 折扣率读得出来，且落在 (0,1] 内 */
+        double disc = Prices.cacheDiscount(model);
+        if (!(disc > 0 && disc <= 1.0)) return "缓存折扣率不合理：" + disc;
+
+        /* 5) 没收录的模型仍然返回 -1（未知 ≠ 免费） */
+        if (Prices.costUsd("definitely-not-a-real-model-zz9", 1000, 500, 1000) != -1) {
+            return "查不到价格的模型应返回 -1（未知），不能当成 0";
+        }
+        return null;
+    }
+
+    /**
+     * 「额度未知」不能被当成「额度用尽」（4.51.7）。
+     *
+     * <p>这条修的是一个**只在特定渠道组合下才发作**的排序缺陷：`credits` 默认 -1，
+     * 而只有 workbuddy / trae / loomy 三种类型会刷新它。原判据 `credits <= 0`
+     * 于是让其余所有类型的每个候选永远背着 -200 分，稳沉池底。
+     *
+     * <p>断言直接打 `scorePublic`：造两个除了 credits 完全相同的账号，
+     * 确认"未知"与"有额度"得分**完全一致**，而"确认耗尽"明显更低。
+     * 这样即使以后有人重排 score 的各项权重，这条关系仍然成立。
+     */
+    private static String checkCreditsUnknown() {
+        Config.Provider unknown = new Config.Provider();
+        unknown.name = "cred-selftest-unknown";
+        unknown.credits = -1;              // 默认值：没查过
+        Config.Provider paid = new Config.Provider();
+        paid.name = "cred-selftest-paid";
+        paid.credits = 12345;              // 有额度
+        Config.Provider empty = new Config.Provider();
+        empty.name = "cred-selftest-empty";
+        empty.credits = 0;                 // 确认耗尽
+
+        Router.Pick a = Router.newPick(unknown, "selftest-model");
+        Router.Pick b = Router.newPick(paid, "selftest-model");
+        Router.Pick z = Router.newPick(empty, "selftest-model");
+        double sa = Router.scorePublic(a, false);
+        double sb = Router.scorePublic(b, false);
+        double sz = Router.scorePublic(z, false);
+
+        if (sa != sb) {
+            return "额度**未知**（-1）与有额度的账号得分不同（" + sa + " vs " + sb
+                    + "）—— 未知被当成了扣分项，非 workbuddy/trae/loomy 的渠道会永远沉底";
+        }
+        if (!(sz < sa)) {
+            return "额度确认用尽的账号得分没有低于额度未知的（" + sz + " vs " + sa + "）";
+        }
+        if (sa - sz < 100) {
+            return "额度用尽的惩罚太轻（只有 " + (sa - sz) + " 分），挡不住它被选中";
+        }
+        return null;
+    }
+
+    /**
+     * 内容侧信号的口径（4.51.7）。
+     *
+     * <p>截断率（`stopReason=length` 的占比）这次进了选路，所以必须钉住它的口径 ——
+     * 否则一个口径错误会**直接变成选路偏差**，比只做展示时危险得多。
+     *
+     * <p>要钉的是：`canonicalStop` 在**有工具调用时优先返回 `tool_calls`**，
+     * 所以 `truncRate` 只统计"纯正文被 max_tokens 切断"，
+     * 不会把爱调工具的模型冤枉成"老是被截断"。
+     *
+     * <p>顺带记录一个**刻意没进选路**的信号：`contentRate`。
+     * 它的分母里 `outChars` 只数正文 delta（见 Server 的 tap），
+     * 于是**只回工具调用、不吐正文**的响应会被算成"没内容"。
+     * 拿它进选路会系统性压低爱调工具的模型 —— 正好和"agent 场景要能调工具"相反。
+     * 所以这次只用 truncRate，contentRate 继续只做观测。
+     */
+    private static String checkContentSignalScope() {
+        /* 有工具调用 → 永远归 tool_calls，不会记成 length */
+        if (!"tool_calls".equals(Proto.canonicalStop("length", true))) {
+            return "同时有工具调用和 length 时没优先归 tool_calls";
+        }
+        if (!"tool_calls".equals(Proto.canonicalStop("max_tokens", true))) {
+            return "有工具调用时 max_tokens 没归 tool_calls";
+        }
+        /* 没有工具调用时，length 才算截断 */
+        if (!"length".equals(Proto.canonicalStop("length", false))) {
+            return "纯文本被 max_tokens 截断却没归 length";
+        }
+        if (!"length".equals(Proto.canonicalStop("max_tokens", false))) {
+            return "max_tokens（OpenAI 写法）没归 length";
+        }
+        if (!"length".equals(Proto.canonicalStop("MAX_TOKENS", false))) {
+            return "MAX_TOKENS（Anthropic/Gemini 写法）没归 length";
+        }
+        /* 正常结束不能被误判成截断 */
+        for (String s : new String[]{"stop", "end_turn", "STOP", "stop_sequence", null}) {
+            String got = Proto.canonicalStop(s, false);
+            if (!"stop".equals(got)) return "正常结束 " + s + " 被归成了 " + got;
+        }
+        return null;
     }
 
     /**
@@ -1372,6 +1540,53 @@ public final class Selftest {
 
     private static String fmt(float v) {
         return String.format(java.util.Locale.US, "%.3f", Float.valueOf(v));
+    }
+
+    /**
+     * 缓存命中率的分母（4.51.7）。
+     *
+     * <p>这条断言钉的是<b>我自己刚踩的那个坑</b>，值得写下来：第一版把命中率算成
+     * {@code tokCached / tokIn}，真机上立刻显示"缓存 0%"——看上去像"亲和没生效"，
+     * 实际是**分母算错了**。
+     *
+     * <p>原因：升级之后 usage.tsv 里会长期混着两种行。4.51.7 之前写的行没有第 23 列
+     * （读出来 cached=0），之后写的才有。用全部历史 tokIn 当分母，等于把那批
+     * "根本没有这个信息"的行当成"输入了但一次都没命中"。本机当天 175M 历史 token
+     * 只对应几百个新 token，比值直接被压成 0。
+     *
+     * <p>{@code Stats} 处理内容信号时已经写明过同一条纪律（"旧行不能算进分母，
+     * 否则会低估"），我在 Usage 这边没照做——**同一个项目里同样的坑还是会再踩一次**，
+     * 所以这条要单独钉住。
+     *
+     * <p>断言打在 {@code cacheHitRate()} 的口径上：分母必须是
+     * {@code tokInWithCacheInfo}，不是 {@code tokIn}。
+     */
+    private static String checkCacheRateDenominator() {
+        Usage.Stat s = new Usage.Stat();
+        s.tokIn = 10_000;           // 全部输入 token（含没有缓存信息的历史行）
+        s.tokInWithCacheInfo = 100; // 其中"确实带缓存列"的行贡献的输入 token
+        s.tokCached = 50;
+
+        double rate = s.cacheHitRate();
+        if (Math.abs(rate - 0.5) > 1e-9) {
+            return "命中率应为 0.5（50/100，只算带缓存列的行），实际 " + rate
+                    + " —— 分母很可能又用回了全部历史 tokIn，会把命中率系统性压低";
+        }
+        /* 没有任何带缓存列的行时返回 -1（未知），不是 0（没命中） */
+        Usage.Stat none = new Usage.Stat();
+        none.tokIn = 5000;
+        if (none.cacheHitRate() >= 0) {
+            return "完全没有缓存信息时应返回 -1（未知），实际返回 " + none.cacheHitRate()
+                    + " —— 会被界面显示成一个假的 0% 命中率";
+        }
+        /* 有缓存信息但一次都没命中：这才是真正的 0 */
+        Usage.Stat real0 = new Usage.Stat();
+        real0.tokIn = 100;
+        real0.tokInWithCacheInfo = 100;
+        if (Math.abs(real0.cacheHitRate()) > 1e-9) {
+            return "有缓存列但确实没命中时应为 0，实际 " + real0.cacheHitRate();
+        }
+        return null;
     }
 
     /** 国际版重发的开关与跳过条件。 */

@@ -187,7 +187,8 @@ public final class Stats {
                 int outChars = hasContent ? (int) parseLong(c[9]) : 0;
                 boolean toolCall = hasContent && "1".equals(c[10]);
                 String stopReason = hasContent && c[11] != null ? c[11] : "";
-                list.add(new Point(ts, ok, ms, tokIn, tokOut,
+                long tokCached = c.length >= 23 ? parseLong(c[22]) : 0;
+                list.add(new Point(ts, ok, ms, tokIn, tokOut, tokCached,
                         hasContent, outChars, toolCall, stopReason));
             }
         } finally {
@@ -233,7 +234,9 @@ public final class Stats {
                     wMs += w;
                     vMs += w * p.ms;
                 }
-                double cost = Prices.costUsd(model, p.tokIn, p.tokOut);
+                /* 成本种子也要按缓存价算：选路里的"成本"项若用全价，
+                   一个缓存命中率高的组合会被算得更贵，反而被压低排序。 */
+                double cost = Prices.costUsd(model, p.tokIn, p.tokCached, p.tokOut);
                 if (cost >= 0) {
                     wCost += w;
                     vCost += w * cost;
@@ -291,23 +294,26 @@ public final class Stats {
         final long ms;
         final long tokIn;
         final long tokOut;
+        /** 命中前缀缓存的输入 token（第 23 列，4.51.7）；旧行没有这一列为 0。 */
+        final long tokCached;
         /* 4.32.0 内容信号；hasContent=false 表示这行是旧格式（没有这三列） */
         final boolean hasContent;
         final int outChars;
         final boolean toolCall;
         final String stopReason;
 
-        Point(long ts, boolean ok, long ms, long tokIn, long tokOut) {
-            this(ts, ok, ms, tokIn, tokOut, false, 0, false, "");
+        Point(long ts, boolean ok, long ms, long tokIn, long tokOut, long tokCached) {
+            this(ts, ok, ms, tokIn, tokOut, tokCached, false, 0, false, "");
         }
 
-        Point(long ts, boolean ok, long ms, long tokIn, long tokOut,
+        Point(long ts, boolean ok, long ms, long tokIn, long tokOut, long tokCached,
               boolean hasContent, int outChars, boolean toolCall, String stopReason) {
             this.ts = ts;
             this.ok = ok;
             this.ms = ms;
             this.tokIn = tokIn;
             this.tokOut = tokOut;
+            this.tokCached = tokCached;
             this.hasContent = hasContent;
             this.outChars = outChars;
             this.toolCall = toolCall;

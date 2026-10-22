@@ -40,8 +40,10 @@ public final class Usage {
      * 三样都是**零成本**：全部来自已有的回调点，不额外请求、不改协议、不改上游。
      *
      * 4.33.0 起又在末尾追加了 10 列观测上下文（见 {@link Obs} 与 record()），
-     * 现在一共 22 列。读取端一律按长度判断，缺列当 0/空处理——旧行不能因为
-     * "没有新列"就被算成失败或零值。
+     * 4.51.7 再加 1 列缓存命中 token，现在一共 23 列。
+     * 读取端一律按长度判断，缺列当 0/空处理——旧行不能因为
+     * "没有新列"就被算成失败或零值。**新增列只能追加在末尾**：
+     * 中间插一列会打乱后面所有列的索引，而旧行还在磁盘上躺着。
      */
     private static final String FILE = "usage.tsv";
     private static final long KEEP_MS = 30L * 24 * 3600 * 1000;
@@ -113,6 +115,23 @@ public final class Usage {
          * 只记名字不记完整 schema：schema 太长，落盘会把用量文件撑爆。
          */
         public String toolNames = "";
+        /**
+         * 命中**前缀缓存**的输入 token 数（4.51.7）。
+         *
+         * 为什么值得单开一列：命中缓存的输入 token 单价低得多（Anthropic 约 1/10、
+         * OpenAI 约 1/2），混在 tokIn 里按全价算会让"成本 ≈$"明显偏高。
+         * 更要紧的是——**这是会话亲和（4.51.5）唯一的成效指标**：
+         * 亲和存在的意义就是让同一段对话复用同一个上游、保住 prompt cache，
+         * 而"缓存命中率涨没涨"只有这个数能回答。
+         *
+         * 为什么放在 Obs 而不是当一个独立参数：`record()` 已经有 12 个参数、
+         * 还有两个只传前几个的旧签名。再加一个位置参数会变成 13 个，
+         * 调用点全要改、且以后每加一个观测项都要再来一遍。
+         * 附着在 Obs 上是因为它**本来就是观测数据**（不影响任何判断），
+         * 语义也对：老调用点不传就是 0，与"上游没报缓存"完全等价，
+         * 不需要区分"没数据"和"真的是 0"——这两个在成本计算里是同一个意思。
+         */
+        public int cached;
 
         public static final Obs EMPTY = new Obs();
     }
@@ -185,7 +204,12 @@ public final class Usage {
                 + "\t" + clean(o.responseId)
                 + "\t" + clean(o.conversationId)
                 + "\t" + clean(o.errorKind)
-                + "\t" + clean(o.toolNames);
+                + "\t" + clean(o.toolNames)
+                /* 第 23 列：命中前缀缓存的输入 token（4.51.7）。
+                   追加在**末尾**是刻意的：所有读取端都按 `c.length` 判断列数、
+                   缺列当 0/空处理（见文件头的说明），所以旧行不会因为"没有这一列"
+                   被读成失败或零值。插在中间会打乱 13~22 列的全部索引。 */
+                + "\t" + Math.max(0, o.cached);
         synchronized (LOCK) {
             pending.add(line);
             if (pending.size() >= 20 || System.currentTimeMillis() - lastWrite > 60000) {
@@ -260,9 +284,34 @@ public final class Usage {
     /** 一组统计。 */
     public static final class Stat {
         public long requests, ok, ms, tokIn, tokOut;
+        /** 其中命中前缀缓存的输入 token（4.51.7）。旧数据没有这一列，读出来是 0。 */
+        public long tokCached;
+        /**
+         * **只统计带缓存列的那些行**的输入 token（4.51.7），用来给命中率做分母。
+         *
+         * <p>为什么要单独攒一份：升级之后 usage.tsv 里会**长期混着**两种行 ——
+         * 4.51.7 之前写的行根本没有第 23 列（读出来 cached=0），之后写的才有。
+         * 直接拿 {@link #tokIn} 当分母，会把那批"没有这个信息"的历史行全算成
+         * "输入了但没命中"，于是命中率被系统性压低（实测：升级当天 175M 历史 token
+         * 对几百个新 token，显示出来就是 0%）。
+         *
+         * <p>这正是 {@code Stats} 处理内容信号时踩过并写明的那条：
+         * "旧行不能算进分母，否则会低估"。这里沿用同一条纪律。
+         */
+        public long tokInWithCacheInfo;
 
         public double avgMs() {
             return requests == 0 ? 0 : (double) ms / requests;
+        }
+
+        /**
+         * 缓存命中率（命中 token / 输入 token）；没有输入 token 时返回 -1。
+         *
+         * <p>返回 -1 而不是 0 是刻意的：没有输入 token 的样本（旧数据、上游不报 usage）
+         * 和"有输入但一次都没命中"是两件事，混成 0 会让界面显示一个假的"命中率 0%"。
+         */
+        public double cacheHitRate() {
+            return tokInWithCacheInfo <= 0 ? -1 : (double) tokCached / tokInWithCacheInfo;
         }
     }
 
@@ -308,12 +357,24 @@ public final class Usage {
                     boolean ok = "1".equals(c[5]);
                     int tokIn = parseInt(c[6]);
                     int tokOut = parseInt(c[7]);
-                    add(s.total, ms, ok, tokIn, tokOut);
-                    add(s.byApi, c[1], ms, ok, tokIn, tokOut);
-                    if (!c[2].isEmpty()) add(s.byModel, c[2], ms, ok, tokIn, tokOut);
-                    if (!c[3].isEmpty()) add(s.byProvider, c[3], ms, ok, tokIn, tokOut);
-                    if (c.length >= 9 && !c[8].isEmpty()) add(s.byKey, c[8], ms, ok, tokIn, tokOut);
-                    add(s.byDay, day.format(new java.util.Date(ts * 1000L)), ms, ok, tokIn, tokOut);
+                    /* 第 23 列（4.51.7）：命中前缀缓存的输入 token。
+                       旧行没有这一列，按长度判断当 0 处理——不能因为"没有新列"就当成
+                       "没命中"，那会把历史全算成 0% 命中率。 */
+                    boolean hasCacheInfo = c.length >= 23;
+                    int tokCached = hasCacheInfo ? parseInt(c[22]) : 0;
+                    add(s.total, ms, ok, tokIn, tokOut, tokCached, hasCacheInfo);
+                    add(s.byApi, c[1], ms, ok, tokIn, tokOut, tokCached, hasCacheInfo);
+                    if (!c[2].isEmpty()) {
+                        add(s.byModel, c[2], ms, ok, tokIn, tokOut, tokCached, hasCacheInfo);
+                    }
+                    if (!c[3].isEmpty()) {
+                        add(s.byProvider, c[3], ms, ok, tokIn, tokOut, tokCached, hasCacheInfo);
+                    }
+                    if (c.length >= 9 && !c[8].isEmpty()) {
+                        add(s.byKey, c[8], ms, ok, tokIn, tokOut, tokCached, hasCacheInfo);
+                    }
+                    add(s.byDay, day.format(new java.util.Date(ts * 1000L)), ms, ok,
+                            tokIn, tokOut, tokCached, hasCacheInfo);
                 }
             } finally {
                 in.close();
@@ -341,7 +402,8 @@ public final class Usage {
         double cost = 0;
         boolean any = false;
         for (Map.Entry<String, Stat> e : byModel.entrySet()) {
-            double c = Prices.costUsd(e.getKey(), e.getValue().tokIn, e.getValue().tokOut);
+            double c = Prices.costUsd(e.getKey(), e.getValue().tokIn,
+                    e.getValue().tokCached, e.getValue().tokOut);
             if (c >= 0) {
                 cost += c;
                 any = true;
@@ -391,6 +453,7 @@ public final class Usage {
                     String model = c[2];
                     if (model == null || model.isEmpty()) continue;
                     long tokIn = parseLong(c[6]), tokOut = parseLong(c[7]);
+                    long tokCached = c.length >= 23 ? parseLong(c[22]) : 0;
                     if (tokIn + tokOut <= 0) continue;
                     String key = day.format(new java.util.Date(ts * 1000L));
                     java.util.LinkedHashMap<String, long[]> byModel = acc.get(key);
@@ -400,11 +463,12 @@ public final class Usage {
                     }
                     long[] pair = byModel.get(model);
                     if (pair == null) {
-                        pair = new long[2];
+                        pair = new long[3];        // [输入, 输出, 命中缓存]
                         byModel.put(model, pair);
                     }
                     pair[0] += tokIn;
                     pair[1] += tokOut;
+                    pair[2] += tokCached;
                 }
             } finally {
                 in.close();
@@ -413,7 +477,8 @@ public final class Usage {
                 double cost = 0;
                 boolean any = false;
                 for (Map.Entry<String, long[]> m : e.getValue().entrySet()) {
-                    double c = Prices.costUsd(m.getKey(), m.getValue()[0], m.getValue()[1]);
+                    double c = Prices.costUsd(m.getKey(), m.getValue()[0],
+                            m.getValue()[2], m.getValue()[1]);
                     if (c >= 0) {
                         cost += c;
                         any = true;
@@ -517,6 +582,10 @@ public final class Usage {
         if (t.tokIn + t.tokOut > 0) {
             sb.append(" · ").append(fmt(t.tokIn)).append("/").append(fmt(t.tokOut)).append(" tokens");
         }
+        /* 缓存命中率：只在真的有命中时才显示。一次都没命中时不显示"缓存 0%"——
+           那多半是"上游没报这个字段"，而不是"真的没命中"，显示出来会误导。 */
+        double hit = t.cacheHitRate();
+        if (hit > 0) sb.append(" · 缓存 ").append(Math.round(hit * 100)).append("%");
         if (s.costUsd >= 0) {
             sb.append(" · 成本 ≈$").append(usd(s.costUsd));
         }
@@ -544,20 +613,25 @@ public final class Usage {
         }
     }
 
-    private static void add(Map<String, Stat> map, String key, int ms, boolean ok, int tokIn, int tokOut) {
+    private static void add(Map<String, Stat> map, String key, int ms, boolean ok,
+                            int tokIn, int tokOut, int tokCached, boolean hasCacheInfo) {
         Stat st = map.get(key);
         if (st == null) {
             st = new Stat();
             map.put(key, st);
         }
-        add(st, ms, ok, tokIn, tokOut);
+        add(st, ms, ok, tokIn, tokOut, tokCached, hasCacheInfo);
     }
 
-    private static void add(Stat st, int ms, boolean ok, int tokIn, int tokOut) {
+    private static void add(Stat st, int ms, boolean ok, int tokIn, int tokOut,
+                            int tokCached, boolean hasCacheInfo) {
         st.requests++;
         if (ok) st.ok++;
         st.ms += ms;
         st.tokIn += tokIn;
         st.tokOut += tokOut;
+        st.tokCached += tokCached;
+        /* 只有"确实带缓存列"的行才进命中率的分母 */
+        if (hasCacheInfo) st.tokInWithCacheInfo += tokIn;
     }
 }
