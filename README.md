@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.53.0**（versionCode 661，见 `version.properties`）
+- 当前版本：**4.53.1**（versionCode 662，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -42,6 +42,16 @@ OpenAI/Anthropic/Gemini 兼容中转。
 带上 Claude Code 形状的 UA / `x-app` / `anthropic-beta`，并保留 `system` 块的
 `cache_control` 前缀缓存。
 
+**客户端该填哪个地址**（两种协议不一样，首页把两条都列出来、各自可复制）：
+
+| 客户端 | 填这个 | 原因 |
+| --- | --- | --- |
+| Claude Code / Anthropic SDK | `http://127.0.0.1:8321` | 它会**自己补** `/v1/messages`，所以末尾**不要带 `/v1`** |
+| 其它（OpenAI 兼容） | `http://127.0.0.1:8321/v1` | 各家 SDK 拼法不统一，带 `/v1` 是常见预期 |
+
+给 Claude Code 填了带 `/v1` 的地址会请求 `/v1/v1/messages`；网关有一条容错
+（`Server.normalizePath`）能认，但那只是兜底，不是它本来就对。
+
 **选路与稳定性**：`auto` / `auto-code` / `auto-long` / `auto-race` 虚拟模型；
 按成功率、延迟、成本、额度、工具能力打分；首字节前自动换号；限流指数退避、
 熔断与半开试探、渠道校验单独回避、本地限额与并发槽。
@@ -64,7 +74,7 @@ OpenAI/Anthropic/Gemini 兼容中转。
 **界面**：主页面下拉刷新；日志页**上翻即暂停跟随**（右下角「回到最新」恢复，
 不再把正在读历史的人拽回底部）；主题选择器用聚焦语义（选中的放大提亮、
 未选中的降饱和缩小）；按压手感走真阻尼弹簧（`Jelly`），帧预算由 `Perf`
-自动调档。自检 **52 项**，含手势状态机、配色亮度极差、缓存价绊线等"防静默失效"断言。
+自动调档。自检 **53 项**，含手势状态机、配色亮度极差、缓存价绊线等"防静默失效"断言。
 
 ## 构建
 

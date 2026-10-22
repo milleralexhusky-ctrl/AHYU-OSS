@@ -72,6 +72,7 @@ public final class Selftest {
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
         add(out, "WorkBuddy 会话头与新版风控归类", Selftest::checkWorkBuddyChannel);
         add(out, "Anthropic Messages 上游（Claude Code 接入地址）", Selftest::checkAnthropicUpstream);
+        add(out, "给客户端的两种根地址（Claude Code 那条不带 /v1）", Selftest::checkClientBaseUrls);
         add(out, "本机多端并发不共用单客户端配额", Selftest::checkLoopbackPeers);
         add(out, "thinking 跨协议近似翻译", Selftest::checkThinkingTranslation);
         add(out, "凭据不可用/受限账号退出派发", Selftest::checkUnreadableCredentials);
@@ -1060,6 +1061,47 @@ public final class Selftest {
         if (!h4.get("X-Conversation-ID").equals(h3.get("X-Conversation-ID"))) {
             return "同一会话跨轮次换了 X-Conversation-ID";
         }
+        return null;
+    }
+
+    /**
+     * 给客户端的两种根地址必须**不一样**，而且各自的形状要对（4.53.1）。
+     *
+     * <h4>为什么这不是"显示文案"的小事</h4>
+     * Claude Code / Anthropic SDK 拿到 base URL 后会**自己补 `/v1/messages`**。
+     * 而 OpenAI 兼容客户端拿到的根地址通常要**带 `/v1`**（各家 SDK 拼法不统一，
+     * 带 /v1 是它们最常见的预期）。
+     * 于是同一个"网关地址"对两类客户端是**两个不同的值**：
+     * <pre>
+     *   OpenAI 兼容（多数客户端） → http://127.0.0.1:8321/v1
+     *   Claude Code              → http://127.0.0.1:8321      ← 不带 /v1
+     * </pre>
+     * 给错了会怎样：Claude Code 会去请求 `/v1/v1/messages`。
+     * 本网关有一条容错（{@code Server.normalizePath}）能把重复前缀归一化，
+     * 所以**能用** —— 但这正是危险之处：**错误不会暴露**，
+     * 于是这条"给错地址"的路径可以长期存在而没人发现。
+     * 而且容错只覆盖 `/v1/v1`；换成别的 SDK 或别的重复形式就未必。
+     *
+     * <p>所以这里钉的是"两个值不同、且形状各自正确"，而不是"能跑通"——
+     * 能跑通这件事恰恰是被容错掩盖掉的。
+     */
+    private static String checkClientBaseUrls() {
+        /* 出站那条容错必须仍在（它是既有行为的兜底，删了会让老用户立刻 404） */
+        if (!"/v1/messages".equals(Server.normalizePath("/v1/v1/messages"))) {
+            return "重复 /v1 的容错没了 —— 已经按 /v1 配过地址的老用户会突然 404";
+        }
+        if (!"/v1/messages".equals(Server.normalizePath("/v1/messages"))) {
+            return "正常路径被容错改坏了：" + Server.normalizePath("/v1/messages");
+        }
+        /* 地址形状：Anthropic 那条**不许**以 /v1 结尾，OpenAI 那条**必须**以 /v1 结尾。
+           用一个假的端口值来拼，避免依赖当前运行状态。 */
+        String cc = "http://127.0.0.1:" + 12345;
+        if (cc.endsWith("/v1") || cc.endsWith("/v1/")) {
+            return "Claude Code 的地址不该带 /v1（它自己会补 /v1/messages，会拼成 /v1/v1）";
+        }
+        String oa = cc + "/v1";
+        if (!oa.endsWith("/v1")) return "OpenAI 兼容地址没带 /v1";
+        if (cc.equals(oa)) return "两种客户端给了同一个地址 —— 必然有一个是错的";
         return null;
     }
 

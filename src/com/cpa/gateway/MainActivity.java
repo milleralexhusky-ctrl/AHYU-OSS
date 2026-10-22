@@ -51,7 +51,31 @@ public class MainActivity extends Activity {
     private TextView accountButtonHint;
     private TextView primaryButton;
     private TextView addressText;
+    /** Claude Code 那条地址（末尾不带 /v1，它会自己补 /v1/messages）。 */
+    private TextView claudeText;
     private TextView keyText;
+
+    /**
+     * OpenAI 兼容客户端该填的根地址：**带 /v1**。
+     *
+     * <p>绝大多数 SDK 拿到根地址后会自己拼 `/v1/chat/completions`，但拼法不统一，
+     * 带上 /v1 才是它们最常见的预期（这也是这个字段一直以来的值，不改既有行为）。
+     */
+    private String openAiBaseUrl() {
+        return "http://127.0.0.1:" + Gateway.config().port + "/v1";
+    }
+
+    /**
+     * Claude Code 该填的根地址：**末尾不带 /v1**。
+     *
+     * <p>Claude Code / Anthropic SDK 拿到地址后会自己补 `/v1/messages`
+     * （各家文档里"Claude Code 接入"给的就是这种不带 /v1 的地址）。
+     * 给它带 /v1 的地址会拼成 `/v1/v1/messages`：本网关有容错能认，
+     * 但那是我们替它兜底；给对的地址才是应当的。
+     */
+    private String anthropicBaseUrl() {
+        return "http://127.0.0.1:" + Gateway.config().port;
+    }
     private android.app.Dialog currentDialog;
     /** 下拉刷新的浮动指示器（见 PullRefresh）。 */
     private TextView pullIndicator;
@@ -289,16 +313,44 @@ public class MainActivity extends Activity {
         }
 
         LinearLayout conn = Ui.column(this);
-        LinearLayout addrRow = Ui.row(this);
+        /* 两种协议给的**根地址不一样**，这不是小事：
+         *
+         *   OpenAI 兼容客户端（绝大多数）拿到根地址后会自己拼 `/v1/chat/completions`
+         *   —— 但各家 SDK 的拼法并不统一，有的直接拼 `/chat/completions`。
+         *   所以给它们的地址要**带 /v1**，这也是原来一直给的那个。
+         *
+         *   Claude Code 走 Anthropic Messages：它拿到的地址会自己补 `/v1/messages`。
+         *   于是给它带 /v1 的地址就会变成 `/v1/v1/messages` ——
+         *   本网关有一条容错把这种重复前缀归一化掉了（Server.normalizePath），
+         *   所以**能用**；但那是我们替它擦屁股，不是它本来就对。
+         *   按官方文档给不带 /v1 的根地址，才是真正的"正确"。
+         *
+         * 两边分开显示、各自可复制，用户不用猜该用哪个。
+         */
         addressText = Ui.mono(this, "", 13f);
+        LinearLayout addrRow = Ui.row(this);
         addrRow.addView(addressText, Ui.weight(this, 1f, 0));
         TextView copyAddr = Ui.ghostButton(this, "复制");
         copyAddr.setOnClickListener(v -> {
-            copyText("http://127.0.0.1:" + Gateway.config().port + "/v1");
-            toast("已复制地址");
+            copyText(openAiBaseUrl());
+            toast("已复制 OpenAI 地址");
         });
         addrRow.addView(copyAddr);
         conn.addView(addrRow);
+
+        /* Claude Code 单独一行：地址末尾**不带 /v1**（它会自己补 /v1/messages） */
+        LinearLayout ccRow = Ui.row(this);
+        claudeText = Ui.mono(this, "", 13f);
+        ccRow.addView(claudeText, Ui.weight(this, 1f, 0));
+        TextView copyCc = Ui.ghostButton(this, "复制");
+        copyCc.setOnClickListener(v -> {
+            copyText(anthropicBaseUrl());
+            toast("已复制 Claude Code 地址");
+        });
+        ccRow.addView(copyCc);
+        conn.addView(ccRow, Ui.lp(this, 6));
+        conn.addView(Ui.label(this, "Claude Code 用下面那条：地址末尾不带 /v1，"
+                + "它会自己补 /v1/messages。"), Ui.lp(this, 4));
         LinearLayout keyRow = Ui.row(this);
         keyText = Ui.mono(this, "", 13f);
         keyRow.addView(keyText, Ui.weight(this, 1f, 0));
@@ -478,7 +530,8 @@ public class MainActivity extends Activity {
             statusPill.setBackground(Ui.round(this, running ? Ui.GREEN_SOFT : Ui.RED_SOFT, 999));
         }
         if (primaryButton != null) primaryButton.setText(running ? "停止网关" : "启动网关");
-        if (addressText != null) addressText.setText("http://127.0.0.1:" + cfg.port + "/v1");
+        if (addressText != null) addressText.setText(openAiBaseUrl());
+        if (claudeText != null) claudeText.setText(anthropicBaseUrl());
         if (keyText != null) {
             String k = cfg.apiKey;
             keyText.setText(k.isEmpty() ? "（未设置密钥）"
