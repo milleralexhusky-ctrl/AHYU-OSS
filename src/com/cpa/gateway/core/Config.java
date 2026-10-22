@@ -100,6 +100,34 @@ public final class Config {
     public long lastUpdateCheck = 0L;
 
     /**
+     * 每天自动签到 + 接任务（4.53.0）。默认开。
+     *
+     * <p>这类平台的免费额度是**按天发**的（WorkBuddy 的签到、Trae/Loomy 的任务），
+     * 当天不领就作废。而网关是常驻的，让它在后台顺手领掉，用户就不用记着去点。
+     *
+     * <p>为什么默认开：不做的话额度就是白白过期；做了最坏情况只是"今天已经领过"
+     * （上游回 code=10001，一次幂等失败，没有任何副作用）。
+     * 全项目的其它写操作（删账号、清数据）都要用户明确点，这一条不同 ——
+     * 它是**幂等**的，重复执行无害，所以适合自动化。
+     */
+    public boolean autoCheckin = true;
+    /** Unix seconds of the last automatic check-in sweep. */
+    public long lastCheckinAt = 0L;
+
+    /**
+     * 两次自动签到之间的最小间隔（秒），取 20 小时。
+     *
+     * <p>放在 core 而不是 GatewayService 里：调试端点（core/Server）也要照同一个值
+     * 报"下次还有多久"。让 core 反向依赖服务层是错的依赖方向 —— 第一版就写成
+     * 引用 GatewayService 的常量，javac 直接拒绝了（不 public 就跨不了包）。
+     *
+     * <p>为什么是 20 而不是 24 小时：跨天的边界在上游不在本机，按本地日历日判会
+     * 被时区/夏令时/用户改时间带偏；20 &lt; 24 保证每天至少覆盖一次，
+     * 而签到是幂等的，多跑只会得到"今天已签到"。
+     */
+    public static final long CHECKIN_INTERVAL_S = 20 * 3600L;
+
+    /**
      * 本机回环访问 Key。**默认空串＝不校验**。
      *
      * 以前这里是 `"sk-cpa-local-" + 时间戳低 24 位`，本意是"开箱有个 Key 更安全"，
@@ -737,6 +765,8 @@ public final class Config {
         o.put("autoDetectInterval", autoDetectInterval);
         o.put("autoUpdate", autoUpdate);
         o.put("lastUpdateCheck", lastUpdateCheck);
+        o.put("autoCheckin", autoCheckin);
+        o.put("lastCheckinAt", lastCheckinAt);
         JSONArray a = new JSONArray();
         for (String u : aliveStations) a.put(u);
         o.put("aliveStations", a);
@@ -791,6 +821,9 @@ public final class Config {
         c.autoUpdate = o.optBoolean("autoUpdate", true);
         Long luc = Proto.optLong(o, "lastUpdateCheck");
         c.lastUpdateCheck = luc == null ? 0L : luc.longValue();
+        c.autoCheckin = o.optBoolean("autoCheckin", true);
+        Long lca = Proto.optLong(o, "lastCheckinAt");
+        c.lastCheckinAt = lca == null ? 0L : lca.longValue();
         JSONArray al = o.optJSONArray("aliveStations");
         for (int i = 0; al != null && i < al.length(); i++) {
             String u = al.optString(i, "");

@@ -1948,6 +1948,50 @@ public final class Server {
             }
             return;
         }
+        if ("/v1/debug/checkin".equals(path)) {
+            /* 调试包专用：查看/立即触发"每天自动签到"（4.53.0）。
+               存在的理由：这条链路是**定时 + 后台**的，平时只能靠等 45 秒一轮的看门狗
+               （还要跨过 20 小时的日限）才看得到一行日志，出了错也无从下手。
+               这里把两件事分开：
+                 GET  /v1/debug/checkin            → 只报状态（不碰上游、不耗额度）
+                 POST /v1/debug/checkin?force=1    → 清掉日限、立刻真跑一次
+               force 只对**这一次**生效，不改用户设置里的开关。 */
+            try {
+                Config cfg = Gateway.config();
+                JSONObject o = new JSONObject();
+                o.put("autoCheckin", cfg.autoCheckin);
+                long now = System.currentTimeMillis() / 1000L;
+                o.put("lastCheckinAt", cfg.lastCheckinAt);
+                o.put("ageSeconds", cfg.lastCheckinAt > 0 ? now - cfg.lastCheckinAt : -1);
+                o.put("intervalSeconds", Config.CHECKIN_INTERVAL_S);
+                o.put("due", cfg.lastCheckinAt <= 0
+                        || now - cfg.lastCheckinAt >= Config.CHECKIN_INTERVAL_S);
+                JSONArray cands = new JSONArray();
+                for (Config.Provider p : cfg.providers) {
+                    if (!p.enabled) continue;
+                    if (hasChores(p.type)) {
+                        JSONObject row = new JSONObject();
+                        row.put("name", p.name);
+                        row.put("type", p.type);
+                        row.put("credits", p.credits);
+                        cands.put(row);
+                    }
+                }
+                o.put("candidates", cands);
+                boolean force = "1".equals(queryParam(r, "force"));
+                if ("POST".equals(r.method) && force) {
+                    cfg.lastCheckinAt = 0L;          // 清掉日限，让下一轮立刻跑
+                    Gateway.persistSoon();
+                    o.put("forced", true);
+                    o.put("note", "日限已清零，看门狗下一轮（≤45 秒）会真跑一次；"
+                            + "界面上的开关没有被改动");
+                }
+                writeJson(out, 200, o.toString());
+            } catch (Throwable t) {
+                writeError(out, path, 500, String.valueOf(t));
+            }
+            return;
+        }
         if ("/v1/debug/diagnostics".equals(path)) {
             /* 调试包专用：直接下载诊断 zip，方便用 curl 取回，也方便测试。 */
             byte[] zip = Diagnostics.build();
@@ -3743,6 +3787,21 @@ public final class Server {
     private static final java.util.Set<String> TASKS_RUNNING =
             java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
+    /**
+     * 这个类型有没有"每日签到 / 成长任务"可做（4.53.0 抽成唯一判据）。
+     *
+     * <p>原来这个三条枚举（LOOMY / TRAE / WORKBUDDY）散在至少四处：
+     * {@link #runTasksInner}、{@link #runAccountChores} 的分派、
+     * MainActivity 的 doesChores、以及新加的自动签到。漏一处就少做一个平台
+     * ——Loomy 的"每日宠物打工"积分就差点被自动签到漏掉。
+     * 收成一个方法后，加平台只改这里。
+     */
+    public static boolean hasChores(String type) {
+        return Config.TYPE_LOOMY.equals(type)
+                || Config.TYPE_TRAE.equals(type)
+                || Config.TYPE_WORKBUDDY.equals(type);
+    }
+
     /** 供进程内 UI（一键做任务）直接调用：不依赖网关 HTTP 端口是否运行。 */
     public static JSONObject runAccountChores(Config.Provider p) {
         JSONObject row = new JSONObject();
@@ -3789,9 +3848,7 @@ public final class Server {
             for (Config.Provider p : new ArrayList<>(config.providers)) {
                 if (!only.isEmpty() && !only.equals(p.name)) continue;
                 if (!p.dispatchable()) continue;
-                if (Config.TYPE_LOOMY.equals(p.type)
-                        || Config.TYPE_TRAE.equals(p.type)
-                        || Config.TYPE_WORKBUDDY.equals(p.type)) {
+                if (hasChores(p.type)) {
                     ran.put(runAccountChores(p));
                 }
             }

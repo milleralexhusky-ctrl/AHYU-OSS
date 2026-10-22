@@ -407,6 +407,82 @@ public class GatewayService extends Service {
         }
     }
 
+    /**
+     * 每天自动签到 / 领免费额度（4.53.0）。
+     *
+     * <h4>为什么值得自动化</h4>
+     * WorkBuddy / Trae / Loomy 的免费额度是**按天发**的：当天签到才有、
+     * 任务当天不接就作废。而网关是常驻的 —— 让它在后台顺手领掉，
+     * 用户就不用记着每天去点一次「一键做任务」。
+     * 这是"更多免费余额"最省事的来源：不用新增账号、不用花钱，只是别把已有的额度放过期。
+     *
+     * <h4>为什么这一条可以自动做，而删账号之类不行</h4>
+     * 它是**幂等**的：重复执行只会得到"今天已签到"（上游 code=10001）或
+     * "该任务已接过"，没有副作用、不丢数据。全项目其它写操作都要用户明确点，
+     * 就是因为它们不幂等。
+     *
+     * <h4>为什么不用"本地零点"判跨天</h4>
+     * 跨天的边界在上游，不在本机。用固定间隔（20 小时）比"按本地日历日"更稳：
+     * 时区、夏令时、用户改手机时间，都不会让它漏跑或多跑。
+     * 20 小时 &lt; 24 小时保证每天至少覆盖一次，幂等性保证多跑无害。
+     *
+     * <h4>为什么走 Server.runAccountChores 而不是直接调各平台的方法</h4>
+     * 那是"一键做任务"用的**同一个分派器**，覆盖 LOOMY / TRAE / WORKBUDDY 三类。
+     * 自己写类型开关迟早会漏 —— 这版最初就漏了 Loomy 的每日积分。
+     * 判据也收成了 {@link com.cpa.gateway.core.Server#hasChores}（唯一一份）。
+     */
+    /** 间隔值的唯一来源是 {@link Config#CHECKIN_INTERVAL_S}（调试端点要用同一个数）。 */
+    private static final long CHECKIN_INTERVAL_S = Config.CHECKIN_INTERVAL_S;
+
+    private void handleAutoCheckin() {
+        try {
+            Config cfg = Gateway.config();
+            if (cfg == null || !cfg.autoCheckin) return;
+            long now = System.currentTimeMillis() / 1000L;
+            if (cfg.lastCheckinAt > 0 && now - cfg.lastCheckinAt < CHECKIN_INTERVAL_S) return;
+
+            final java.util.List<Config.Provider> targets = new java.util.ArrayList<>();
+            for (Config.Provider p : cfg.providers) {
+                if (!p.enabled) continue;
+                if (com.cpa.gateway.core.Server.hasChores(p.type)) targets.add(p);
+            }
+            if (targets.isEmpty()) return;
+
+            cfg.lastCheckinAt = now;
+            Gateway.persistSoon();
+
+            com.cpa.gateway.core.Threads.io(() -> {
+                for (Config.Provider p : targets) {
+                    try {
+                        org.json.JSONObject r =
+                                com.cpa.gateway.core.Server.runAccountChores(p);
+                        Log.i("自动签到：" + p.name
+                                + " · 余额 " + r.optDouble("creditsBefore", -1)
+                                + " → " + r.optDouble("creditsAfter", -1)
+                                + "（本次 +" + r.optDouble("gained", 0) + "）"
+                                + checkinNote(r));
+                    } catch (Throwable t) {
+                        /* 单个账号失败不影响其它账号，也不影响网关本身。
+                           签到失败是常态（网络抖动、上游维护），不值得推送通知打扰用户。 */
+                        Log.w("自动签到失败（不影响网关）：" + p.name + " · " + t);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            Log.w("自动签到调度失败：" + t);
+        }
+    }
+
+    /** 把签到结果说成一句人话，供日志用。 */
+    private static String checkinNote(org.json.JSONObject run) {
+        org.json.JSONObject ci = run.optJSONObject("checkin");
+        if (ci == null) return run.has("checkinError") ? " · 签到异常" : "";
+        if (ci.optBoolean("unsupported", false)) return " · 本区域无签到活动";
+        if (ci.optBoolean("already", false)) return " · 今天已签到";
+        if (ci.optBoolean("ok", false)) return " · 签到成功";
+        return " · 签到未成功（" + com.cpa.gateway.core.Proto.optString(ci, "msg", "") + "）";
+    }
+
     private void startWatchdog() {
         if (watching) return;
         watching = true;
@@ -432,6 +508,7 @@ public class GatewayService extends Service {
                 // 原来放在探活成功之后，而探活成功会 continue —— 那段代码永远走不到，
                 // 锁于是只能靠 10 分钟超时自然失效（既没续期、也没"空闲释放"）。
                 handleAutoUpdate();
+                handleAutoCheckin();
                 if (wakeLock != null && wakeLock.isHeld()) {
                     long idle = System.currentTimeMillis()
                             - com.cpa.gateway.core.Gateway.lastClientRequestMs();

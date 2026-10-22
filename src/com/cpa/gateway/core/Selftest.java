@@ -1899,6 +1899,55 @@ public final class Selftest {
                 return "展示层说是额度、传输层却不认（两处措辞漂开了）：" + body + " → " + cls;
             }
         }
+        /* 5. 挂着 402 的**短窗口限流**不能当成额度（4.53.0，实测 Pollinations 匿名池） */
+        String freeLimit = "HTTP 402 {\"status\":402,\"success\":false,\"error\":{\"code\":"
+                + "\"FREE_LIMIT\",\"message\":\"Free limit reached: 1 reply every 30 seconds per IP."
+                + " Retry after 26s, or get unlimited replies with a pollen key\"}}";
+        if (!"rate".equals(Http.kindOf(402, freeLimit))) {
+            return "402 + 「Retry after 26s」被判成 " + Http.kindOf(402, freeLimit)
+                    + " —— quota 会被抬到最少 30 分钟、还会把整个账号名下所有模型一起拉黑，"
+                    + "于是一个 26 秒就能恢复的限制把免费池锁 30 分钟";
+        }
+        /* 时长也要跟着归类走：402 的默认退避是 1 小时，判成 rate 后必须是 5 分钟 */
+        if (Http.defaultBackoffMs(402, "rate") != 300_000L) {
+            return "归类成 rate 之后默认退避仍是 " + Http.defaultBackoffMs(402, "rate")
+                    + "ms —— 归类改对了、时长还是按 402 的 1 小时走（改一半最难查）";
+        }
+        if (Http.defaultBackoffMs(402, "quota") != 3_600_000L) {
+            return "真额度耗尽的 402 退避被改短了（应保持 1 小时）";
+        }
+        /* 上游明说的窗口必须被采用，哪怕比默认值更近 */
+        if (!Http.transientWindow(freeLimit)) return "没认出「Retry after 26s」是个短窗口";
+        long stated = Http.parseResetAtMs(freeLimit);
+        if (stated <= 0L) return "parseResetAtMs 没解析出正文里的 26 秒";
+        long delta = stated - System.currentTimeMillis();
+        /* 允许一点误差：26 秒不该变成 5 分钟或 1 小时 */
+        if (delta < 10_000L || delta > 60_000L) {
+            return "正文里的「Retry after 26s」解析成了 " + (delta / 1000) + " 秒";
+        }
+
+        /* 6. 反方向：真额度耗尽**没有**承诺短窗口，不能被判成限流 */
+        String realQuota = "HTTP 429 {\"code\":14018,\"msg\":\"额度已用尽，"
+                + "请访问以下链接，购买加量包以获取更多额度\"}";
+        if (Http.transientWindow(realQuota)) {
+            return "把「去买加量包」当成了会自己恢复的短窗口 —— 真额度耗尽会被当限流，"
+                    + "只躲 5 分钟就又去撞";
+        }
+        if (!"quota".equals(Http.kindOf(429, realQuota))) return "真额度耗尽的归类错了";
+        if (!"quota".equals(Http.kindOf(402, realQuota))) {
+            return "402 + 真额度耗尽（无短窗口）应仍是 quota，现在成了 "
+                    + Http.kindOf(402, realQuota);
+        }
+        /* 7. 优先级：上游**点名**的 insufficient_quota 高于措辞推测。
+           真额度的报文里常带一句客套的 "please try again later"，
+           如果按措辞判成限流，4.52.2 修的问题会以另一种形式回来（只躲 5 分钟就又去撞）。 */
+        String quotaWithPleasantry = "{\"error\":{\"code\":\"insufficient_quota\","
+                + "\"message\":\"You exceeded your current quota, please try again later\"}}";
+        if (!"quota".equals(Http.kindOf(402, quotaWithPleasantry))) {
+            return "带「please try again later」客套话的真额度耗尽被判成了 "
+                    + Http.kindOf(402, quotaWithPleasantry)
+                    + " —— 上游点名的 insufficient_quota 必须优先于措辞推测";
+        }
         return checkAccountAvoid();
     }
 

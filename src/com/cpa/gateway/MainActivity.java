@@ -1093,8 +1093,10 @@ public class MainActivity extends Activity {
 
     /** Channels whose daily chores this app can actually run. */
     private static boolean doesChores(Config.Provider p) {
-        return Config.TYPE_WORKBUDDY.equals(p.type) || Config.TYPE_TRAE.equals(p.type)
-                || Config.TYPE_LOOMY.equals(p.type);
+        /* 判据收在 Server.hasChores（唯一一份）：以前这里、Server.runTasksInner、
+           以及新加的自动签到各写一遍 LOOMY/TRAE/WORKBUDDY，加平台要改三处，
+           漏一处的表现是"自动签到悄悄少做一个平台"——不报错，只是额度过期。 */
+        return com.cpa.gateway.core.Server.hasChores(p.type);
     }
 
     /**
@@ -1623,7 +1625,7 @@ public class MainActivity extends Activity {
                 "小米 MiMo",
                 "xAI Grok", "Groq", "Mistral", "Cerebras", "Together",
                 "讯飞星火", "百度千帆", "Google AI Studio", "Cloudflare Workers AI",
-                "NVIDIA NIM", "Cohere", "HuggingFace", "GitHub Models",
+                "NVIDIA NIM", "Cohere", "HuggingFace",
                 "SambaNova", "Fireworks", "DeepInfra", "Nebius AI Studio",
                 "商汤日日新 SenseNova", "美团 LongCat", "魔搭 ModelScope",
                 "阶跃星辰 StepFun", "Pollinations（免注册）", "Venice AI",
@@ -1642,7 +1644,7 @@ public class MainActivity extends Activity {
                 "https://generativelanguage.googleapis.com/v1beta/openai",
                 "https://api.cloudflare.com/client/v4/accounts/<账号ID>/ai/v1",
                 "https://integrate.api.nvidia.com/v1", "https://api.cohere.ai/compatibility/v1",
-                "https://router.huggingface.co/v1", "https://models.inference.ai.azure.com",
+                "https://router.huggingface.co/v1",
                 "https://api.sambanova.ai/v1", "https://api.fireworks.ai/inference/v1",
                 "https://api.deepinfra.com/v1/openai", "https://api.studio.nebius.ai/v1",
                 "https://api.sensenova.cn/compatible-mode/v1",

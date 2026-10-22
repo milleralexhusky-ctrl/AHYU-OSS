@@ -61,15 +61,75 @@ public final class Http {
         }
     }
 
-    /** 分类：凭证失效 / 额度耗尽 / 渠道校验 / 普通限流。 */
+    /**
+     * 分类：凭证失效 / 额度耗尽 / 渠道校验 / 普通限流。
+     *
+     * <h4>402 不能一律当"额度耗尽"（4.53.0 实测发现的坑）</h4>
+     * 按 RFC 402 是 Payment Required，所以原来 `code == 402` 直接判 quota。
+     * 但真机实测 Pollinations 的匿名免费池用它表达**30 秒的速率限制**：
+     * <pre>
+     * HTTP 402 {"code":"FREE_LIMIT","message":"Free limit reached: 1 reply every 30
+     *           seconds per IP. Retry after 26s, or get unlimited replies with a pollen key"}
+     * </pre>
+     * 按 quota 处理会有两个连锁误伤（都不报错）：
+     * <ul>
+     *   <li>{@code Router.recordThrottled} 把 quota 抬到**最少 30 分钟**；</li>
+     *   <li>quota 是账号级事实 → 整个账号名下所有模型一起进回避表。</li>
+     * </ul>
+     * 合起来就是"等 26 秒就好的一次限流，把整个池子锁 30 分钟"——
+     * 比不加这个渠道更糟。所以：**正文里给了明确的短恢复窗口的，算限流不算额度。**
+     *
+     * <p>判据只看"有没有说多久能重试"，不看金额：真额度耗尽的上游
+     * （WorkBuddy 14018 / OpenAI insufficient_quota）说的是"去充值/购买"，
+     * 从不承诺"26 秒后再来"。所以这条不会把真耗尽误判成限流 ——
+     * 反过来的那条路径（短窗口 → rate）才是新加的。
+     */
     static String kindOf(int code, String body) {
         if (code == 401 || code == 403) return "auth";
+        /* 先排掉"挂着 402 的短窗口限流"，再判 quota。
+           但 insufficient_quota 是上游**点名的**事实，优先级高于措辞推测：
+           真额度的报文里也可能带一句"please try again later"（客套话），
+           那种情况必须仍算额度耗尽 —— 否则 4.52.2 修的那个问题会以另一种形式回来。 */
+        if (!quota(body) && code == 402 && transientWindow(body)) return "rate";
         if (code == 402 || quota(body)) return "quota";
         /* 渠道校验（WorkBuddy 的 11128 "channel verification"）：账号/会话被上游标记，
            退避没有意义、换号才有用 —— 单列一类，别混进"限流"。 */
         if (channel(body)) return softChannel(body) ? "channel_soft" : "channel";
         return "rate";
     }
+
+    /**
+     * 正文是否承诺了一个**短的**重试窗口（"Retry after 26s" / "every 30 seconds"）。
+     *
+     * <p>"短"的界限取 1 小时：免费池的速率窗口是秒级到分钟级；
+     * 而上游真说"几小时/几天后再来"的，本来就该长回避，不算这条。
+     * 小时以上的不提，是为了不去改变 OpenRouter 那种"日配额用尽"的行为（那确实接近额度）。
+     */
+    static boolean transientWindow(String body) {
+        if (body == null || body.isEmpty()) return false;
+        String b = body.toLowerCase(java.util.Locale.US);
+        if (!(b.contains("retry after") || b.contains("try again in")
+                || b.contains("every ") || b.contains("per minute")
+                || b.contains("per second") || b.contains("slow down"))) {
+            return false;
+        }
+        java.util.regex.Matcher m = WINDOW_SECONDS.matcher(b);
+        if (m.find()) {
+            long n = Long.parseLong(m.group(1));
+            String unit = m.group(2);
+            long secs = unit.startsWith("h") ? n * 3600L
+                    : unit.startsWith("m") ? n * 60L : n;
+            return secs < 3600L;
+        }
+        /* 没有时间数字，但措辞是"稍后再试"这一类：也按限流处理。
+           宁可退避短一点再去撞一次，也不要锁 30 分钟。 */
+        return b.contains("please try again") || b.contains("try again later")
+                || b.contains("slow down");
+    }
+
+    /** "retry after 26s" / "in 5 minutes" / "every 30 seconds" 里的数字与单位。 */
+    private static final java.util.regex.Pattern WINDOW_SECONDS = java.util.regex.Pattern.compile(
+            "(\\d+)\\s*(seconds?|secs?|s\\b|minutes?|mins?|m\\b|hours?|hrs?|h\\b|days?)");
 
     /**
      * 渠道校验里的"请求级风控"：上游明说"请重新发送"的那一种。
@@ -245,24 +305,91 @@ public final class Http {
     }
 
     /**
+     * **按归类**取默认退避（4.53.0）。
+     *
+     * <p>为什么不能只看状态码：{@code kindOf()} 现在会把"挂着 402 的短窗口限流"
+     * 判成 {@code rate}（见 {@code kindOf} 的注释），但退避如果仍按 402 取 1 小时，
+     * 归类改对了、时长却还是错的 —— 一个 26 秒就能恢复的限制会把池子锁 1 小时。
+     * 这类"改了一半"正是最难查的：日志、归类、文案都对，只有等待时长不对。
+     */
+    static long defaultBackoffMs(int code, String kind) {
+        if ("rate".equals(kind)) return 300_000L;      // 按限流走，不按计费走
+        return defaultBackoffMs(code);
+    }
+
+    /**
+     * **一次限流该退避多久**（4.53.0 统一到这里）。
+     *
+     * <p>原来三处抛 {@code Throttled} 的地方都只写
+     * {@code retryAfterMs(conn, defaultBackoffMs(code))} —— 只看 HTTP 头里的
+     * {@code Retry-After}。问题是很多上游**把窗口写在正文里**而不写头，
+     * 实测的 Pollinations 匿名池就是这样：
+     * <pre>
+     * HTTP 402 {"code":"FREE_LIMIT","message":"…Retry after 26s…"}   （响应头里没有 Retry-After）
+     * </pre>
+     * 于是明明"上游说了 26 秒"，我们却按 402 的默认值退避 **1 小时**。
+     * 这不是归类问题（{@code kindOf} 已经会把它判成 rate），而是**时长**问题：
+     * 日志、归类、文案全都对，只有等待时间是错的 —— 最难查的一类。
+     *
+     * <p>所以优先级是：
+     * <ol>
+     *   <li>正文/头里**上游明说**的恢复时刻（{@link #parseResetAtMs} 已经认
+     *       "retry after 26s" / "in 5 minutes" / 绝对时刻，头里的 Retry-After 也算）；</li>
+     *   <li>按**归类**取的默认值（{@code rate} 一律 5 分钟，不再因为状态码是 402 就跳 1 小时）。</li>
+     * </ol>
+     * 明说的时刻若比默认值**更近**也要用它：26 秒就是 26 秒，不该被"保守"的 5 分钟盖掉。
+     */
+    static long throttleBackoffMs(HttpURLConnection conn, int code, String kind, String body) {
+        long fallback = defaultBackoffMs(code, kind);
+        long fromHeader = retryAfterMs(conn, 0L);
+        long fromBody = 0L;
+        long resetAt = parseResetAtMs(body);
+        if (resetAt > 0L) {
+            fromBody = resetAt - System.currentTimeMillis();
+        }
+        /* 头里没写时 retryAfterMs 会返回 fallback（这里传 0 就不会），
+           所以下面直接用"有没有解析出正数"来判断。 */
+        long stated = Math.max(fromHeader, fromBody);
+        if (stated > 0L) {
+            /* 上游明说的窗口，比默认更近就用它；比默认更远也用它（那是事实）。
+               但别拿一个明显离谱的值当退避（负数 / 0）。 */
+            return Math.max(1000L, stated);
+        }
+        return fallback;
+    }
+
+    /**
      * 把我们发出去的上游请求返回的 4xx 归类成"该退避"的错误。
      *
      * 429/402/401/403 都属于"等一会儿 / 换个号 / 去重登"，**不该当普通失败打进熔断**：
      * 一个健康账号被限流三次就被我们自己冷却，是纯粹的自我伤害；401 也要走 30 分钟
      * 鉴权退避而不是无限重试。其它 4xx 仍按普通异常抛出（那多半是请求本身的问题）。
+     *
+     * <p>退避时长按**归类**取，不按状态码（4.53.0）：这里原来是
+     * {@code defaultBackoffMs(code)}，而 402 → 1 小时。可 {@code kindOf()} 会把
+     * "挂着 402 的短窗口限流"判成 {@code rate}（实测 Pollinations 用 402 表达
+     * "30 秒一次"），归类对了、时长仍是 1 小时。
+     *
+     * <p>同时**上游明说的窗口比默认更近时也要用它**：原来只在
+     * {@code resetAt} 比默认**更远**时才采用（为了不让离谱的 Retry-After 钉死账号），
+     * 结果 "Retry after 26s" 被 1 小时的默认值盖掉。现在两侧都认，
+     * 只保留一个下限（{@code recordThrottled} 那边还有 1 秒~6 小时的总闸）。
      */
     static Exception upstreamError(int code, String body) {
         if (code == 429 || code == 402 || code == 401 || code == 403
                 || throttled(code) || quota(body) || channel(body)) {
+            String kind = kindOf(code, body);
             long resetAt = parseResetAtMs(body);
-            long backoff = defaultBackoffMs(code);
-            /* 上游明说了恢复时刻，就按它退避（前提是比默认退避更远）。
-               例子：某中转站回 429 并写明"将在 2026-10-16 01:24:11 重置"，
-               默认 5 分钟的退避会让网关在这两个半小时里每 5 分钟白撞一次。 */
-            if (resetAt > System.currentTimeMillis() + backoff) {
-                backoff = resetAt - System.currentTimeMillis();
+            long backoff = defaultBackoffMs(code, kind);
+            if (resetAt > 0L) {
+                long stated = resetAt - System.currentTimeMillis();
+                /* 例子：某中转站回 429 并写明"将在 2026-10-16 01:24:11 重置"，
+                   默认 5 分钟的退避会让网关在这两个半小时里每 5 分钟白撞一次。
+                   另一例：Pollinations 回 402 + "Retry after 26s"，
+                   按 402 的默认 1 小时会把一个 30 秒的窗口锁成 1 小时。 */
+                if (stated > 1000L) backoff = stated;
             }
-            return new Throttled(code, backoff, resetAt, kindOf(code, body),
+            return new Throttled(code, backoff, resetAt, kind,
                     "HTTP " + code + " " + shorten(body));
         }
         return new IllegalStateException("上游 HTTP " + code + " " + shorten(body));
@@ -549,8 +676,9 @@ public final class Http {
                 // 只看状态码会把它当普通失败记进熔断——而它本质是"现在别来"。
                 // upstreamError() 一直有这个检查，主路径漏了，这里补齐。
                 if (throttled(code) || code == 401 || code == 402 || code == 403 || quota(body)) {
-                    throw new Throttled(code, retryAfterMs(conn, defaultBackoffMs(code)),
-                            kindOf(code, body), "HTTP " + code + " " + shorten(body));
+                    String kind = kindOf(code, body);
+                    throw new Throttled(code, throttleBackoffMs(conn, code, kind, body),
+                            kind, "HTTP " + code + " " + shorten(body));
                 }
                 // 4xx（除上面几类）多半是客户端请求本身的问题：同一个坏请求换哪个账号都一样，
                 // 不该按"这个通道坏了"记失败。用 InvalidRequest 单独标记，让上层区别对待。
@@ -639,8 +767,9 @@ public final class Http {
                 clean = true;   // 错误体读完了，连接干净
                 if (throttled(code) || code == 401 || code == 402 || code == 403
                         || quota(errBody) || channel(errBody)) {
-                    throw new Throttled(code, retryAfterMs(conn, defaultBackoffMs(code)),
-                            kindOf(code, errBody), "upstream HTTP " + code + " " + shorten(errBody));
+                    String kind = kindOf(code, errBody);
+                    throw new Throttled(code, throttleBackoffMs(conn, code, kind, errBody),
+                            kind, "upstream HTTP " + code + " " + shorten(errBody));
                 }
                 if (code >= 400 && code < 500) {
                     throw new InvalidRequest(code, "upstream HTTP " + code + " " + shorten(errBody));

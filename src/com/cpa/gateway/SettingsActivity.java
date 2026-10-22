@@ -35,6 +35,8 @@ public class SettingsActivity extends Activity {
     private Switch autostartSwitch;
     private Switch keepAliveSwitch;
     private Switch updateSwitch;
+    /** 每天自动签到 / 领免费额度（4.53.0）。 */
+    private Switch checkinSwitch;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -205,6 +207,13 @@ public class SettingsActivity extends Activity {
 
         updateSwitch = Ui.toggle(this, "自动检查新版本（下载后提示安装）", cfg.autoUpdate);
         dataCard.addView(updateSwitch, Ui.lp(this, 10));
+
+        checkinSwitch = Ui.toggle(this, "每天自动签到 / 领免费额度", cfg.autoCheckin);
+        dataCard.addView(checkinSwitch, Ui.lp(this, 10));
+        dataCard.addView(Ui.label(this, "这类平台的免费额度按天发，当天不领就作废。"
+                + "网关常驻在后台，顺手替你领掉（签到、接任务）。"
+                + "这一步是幂等的：重复执行只会得到「今天已签到」，不会有任何副作用。"),
+                Ui.lp(this, 6));
         TextView updateBtn = Ui.outlineButton(this, "检查更新");
         updateBtn.setOnClickListener(v -> checkUpdate());
         dataCard.addView(updateBtn, Ui.lp(this, 8));
@@ -357,6 +366,7 @@ public class SettingsActivity extends Activity {
         cfg.autostart = autostartSwitch.isChecked();
         cfg.keepAlive = keepAliveSwitch.isChecked();
         cfg.autoUpdate = updateSwitch.isChecked();
+        cfg.autoCheckin = checkinSwitch.isChecked();
         if (keyCleared && cfg.lanAccess) {
             /* 局域网模式下没有 Key 会被 Server 直接 401 拒绝整个请求（那是有意的），
                这里先把话说清楚，不要让用户以为"保存成功了但客户端连不上"是 bug。 */
