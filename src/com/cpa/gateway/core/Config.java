@@ -1051,7 +1051,9 @@ public final class Config {
                     return;
                 }
                 writeAtomically(f, Secret.seal(toJson()).toString(2).getBytes("UTF-8"));
-                snapshotAccounts(f);
+                /* 快速保存都是自动触发的（token 刷新、探活回写），不是用户在改账号集合，
+                   所以快照走"保护模式"：账号看着变少时不动它。 */
+                snapshotAccounts(f, false);
             } catch (Exception e) {
                 Log.w("config saveQuick failed: " + e);
             }
@@ -1089,15 +1091,31 @@ public final class Config {
     /**
      * 账号快照：防"配置被清空 / 被覆盖"——这两种事故在真机上都发生过。
      *
-     * 规则很简单：保存成功后，把整份配置复制一份成 gateway.accounts.json，
-     * **只在账号数没有变少时更新**（免得一次空保存把快照也冲掉）。
+     * 规则：保存成功后，把整份配置复制一份成 gateway.accounts.json。
+     * 是否允许"缩小"取决于这次保存是不是**用户主动**改的账号集合：
+     *
+     * <ul>
+     *   <li><b>非用户意图</b>（{@code userIntent=false}，token 刷新、探活回写这类
+     *       自动保存）：只在账号没变少时更新。防的就是"一次意外写坏的配置
+     *       把救命快照也冲掉"——配置可能因为时序问题短暂变空/变少，
+     *       不能让它把快照一起抹了。</li>
+     *   <li><b>用户意图</b>（{@code userIntent=true}，只有删账号、导入备份、
+     *       恢复备份会传）：<b>快照跟着一起缩小</b>；配置被清空到 0 个时
+     *       直接删掉快照文件。</li>
+     * </ul>
+     *
+     * <p>为什么必须分这一叉（4.51.8 修的幽灵账号）：原实现不管哪种保存都"只增不减"。
+     * 于是用户删掉的账号会**永远留在快照里**，快照冻在"历史上账号最多的那一刻"。
+     * 而 {@link #recoverFromSnapshot} 在配置读空时会把整个快照捞回来、并写回磁盘——
+     * 结果被删的账号反复复活，账号页一进来就"蹦出不存在的账号"（真机反馈的原始症状）。
+     * 快照既然是"防意外清空"的兜底，就绝不能反过来变成"删不掉的复活源"：
+     * 用户明确删掉的账号，必须同时从快照里消失。
      */
-    private static void snapshotAccounts(java.io.File live) {
+    private static void snapshotAccounts(java.io.File live, boolean userIntent) {
         try {
             JSONObject cur = Secret.open(new JSONObject(new String(readAll(live), "UTF-8")));
             JSONArray arr = cur.optJSONArray("providers");
             int now = arr == null ? 0 : arr.length();
-            if (now <= 0) return;
             java.io.File snap = new java.io.File(live.getParentFile(), SNAPSHOT);
             int prev = 0;
             if (snap.isFile() && snap.length() > 0) {
@@ -1108,11 +1126,50 @@ public final class Config {
                 } catch (Throwable ignored) {
                 }
             }
-            if (now < prev) return;
-            writeAtomically(snap, readAll(live));
+            switch (snapshotAction(now, prev, userIntent)) {
+                case SNAP_DELETE:
+                    if (snap.isFile() && snap.length() > 0) {
+                        snap.delete();
+                        Log.i("账号已按用户操作清空，同步删除账号快照（避免旧账号复活）");
+                    }
+                    return;
+                case SNAP_SKIP:
+                    return;
+                default:
+                    writeAtomically(snap, readAll(live));
+            }
         } catch (Throwable t) {
             Log.w("账号快照失败：" + t);
         }
+    }
+
+    /** 快照该做什么。抽成纯函数是为了让自检能直接钉住它——见 {@code Selftest}。 */
+    static final int SNAP_WRITE = 0;
+    static final int SNAP_SKIP = 1;
+    static final int SNAP_DELETE = 2;
+
+    /**
+     * 账号快照的决策（纯函数，4.51.8）。
+     *
+     * <p>三个输入：现在几个账号、快照里几个、这次保存是不是用户主动改的账号集合。
+     *
+     * <p>规则与理由：
+     * <ul>
+     *   <li>用户主动清空（{@code userIntent && now==0}）→ <b>删快照</b>。
+     *       留着它就是留一个"配置一空就自动复活旧账号"的开关。</li>
+     *   <li>没有任何账号、又不是用户意图 → 跳过。配置短暂读空时不能把快照冲掉。</li>
+     *   <li>账号变少、不是用户意图 → 跳过（保护模式）。</li>
+     *   <li>其余（账号持平/变多，或用户主动改动）→ 写。</li>
+     * </ul>
+     *
+     * <p>抽成纯函数的原因很直接：这段判断错了**不会报错**，只会让删掉的账号复活，
+     * 而复活要等到"配置恰好读空"才会发生——靠手工点几下根本试不出来。
+     */
+    static int snapshotAction(int now, int prev, boolean userIntent) {
+        if (userIntent && now == 0) return SNAP_DELETE;
+        if (now <= 0) return SNAP_SKIP;
+        if (now < prev && !userIntent) return SNAP_SKIP;
+        return SNAP_WRITE;
     }
 
     /**
@@ -1228,6 +1285,11 @@ public final class Config {
      * Writes the configuration with two safety nets: the previous file is always copied aside first,
      * and an empty provider list never silently replaces a non-empty one (that is how accounts were
      * lost once already).
+     *
+     * <p>{@code allowEmptyProviders} 不只是"允许写空"——它同时是**"这次改动是用户主动做的"**
+     * 的信号：只有删账号（{@code ProviderEditor}）、导入备份、恢复备份会传 true，
+     * 其余（token 刷新、探活回写、标签固化）一律走 {@code save(ctx)} / {@code saveQuick}。
+     * 所以账号快照的"能不能缩小"直接跟着它走，见 {@link #snapshotAccounts}。
      */
     public void save(Context ctx, boolean allowEmptyProviders) {
         synchronized (saveLock) {
@@ -1246,7 +1308,7 @@ public final class Config {
                 copyFile(f, new java.io.File(parent, "gateway.json.bak"));
             }
             writeAtomically(f, Secret.seal(toJson()).toString(2).getBytes("UTF-8"));
-            snapshotAccounts(f);
+            snapshotAccounts(f, allowEmptyProviders);
         } catch (Exception e) {
             Log.w("config save failed: " + e);
         }

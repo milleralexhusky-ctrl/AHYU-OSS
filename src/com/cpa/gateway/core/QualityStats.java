@@ -37,6 +37,18 @@ public final class QualityStats {
         int nativeCall;     // 真吐了结构化调用
         int textCall;       // 把调用写在正文里（我们没接住）
         int hasHistory;     // 多轮工具历史
+        /**
+         * 这个渠道名现在还在不在配置里（4.51.8）。
+         *
+         * <p>为什么需要：{@code usage.tsv} 留 30 天，按渠道聚合时用的是**历史行里的名字**。
+         * 账号删掉之后，它的名字还会在"行为画像"里出现好几天 —— 用户看到的就是
+         * "我明明删了这个账号，它还在这里"（真机反馈的"蹦出不存在的账号"）。
+         *
+         * <p>刻意**不**直接过滤掉：那些样本是真实发生过的历史，删掉反而丢信息
+         * （"这个渠道以前靠不靠得住"仍然有参考价值）。正确做法是**标出来** ——
+         * 界面上加一句"（已删除）"，让人一眼看出这是历史而不是当前账号。
+         */
+        boolean retired;
         /** 每次请求的耗时（ms），用来算 p95；报告生成后随 Row 一起释放。 */
         final List<Integer> latencies = new ArrayList<>();
 
@@ -128,7 +140,48 @@ public final class QualityStats {
         } catch (Throwable t) {
             Log.w("行为画像统计失败：" + t);
         }
+        markRetired(out, byProvider);
         return out;
+    }
+
+    /**
+     * 标出"这个渠道/模型现在配置里已经没有了"（4.51.8）。
+     *
+     * <p>按渠道聚合时拿当前配置的**账号名**比对；按模型聚合时拿当前所有账号的
+     * **模型名**比对。比不上的就是历史遗留（账号被删、或模型名改过），
+     * 界面会给它加一句"（已删除）"。
+     *
+     * <p>为什么不直接把这些行从报告里去掉：它们是**真实发生过的调用记录** ——
+     * "这个渠道以前靠不靠得住"对判断"要不要重新加回来"是有用的。
+     * 用户真正困惑的是"我以为删干净了，怎么还有"，而不是"这里有历史数据"。
+     * 标出来既保留了信息，又消除了困惑。
+     *
+     * <p>配置读不到时（{@code Gateway.config()} 为 null）一律不标 —— 那属于"不知道"，
+     * 把所有渠道都打成"已删除"是更糟的谎。
+     */
+    /** 自检用：直接对一组构造出来的行做标记，不读 usage.tsv。 */
+    static void markRetiredForTest(Map<String, Row> out, boolean byProvider) {
+        markRetired(out, byProvider);
+    }
+
+    private static void markRetired(Map<String, Row> out, boolean byProvider) {
+        Config cfg = Gateway.config();
+        if (cfg == null || out.isEmpty()) return;
+        java.util.Set<String> known = new java.util.HashSet<>();
+        for (Config.Provider p : cfg.providers) {
+            if (p == null) continue;
+            if (byProvider) {
+                if (p.name != null) known.add(p.name);
+            } else {
+                for (String m : p.models) {
+                    if (m != null && !m.isEmpty()) known.add(m);
+                }
+            }
+        }
+        if (known.isEmpty()) return;      // 一个账号都没有：全是历史，别挨个标
+        for (Row r : out.values()) {
+            r.retired = !known.contains(r.key);
+        }
     }
 
     /** 排成一屏可读的文本。 */
@@ -146,7 +199,7 @@ public final class QualityStats {
         sb.append("按渠道（").append(days > 0 ? "最近 " + days + " 天" : "全部").append("）\n");
         sb.append("渠道          样本  p95    可用率  空回  截断  跑题  重发  工具失败\n");
         for (Row r : rows) {
-            sb.append(pad(r.key, 14))
+            sb.append(pad(r.key + (r.retired ? "（已删除）" : ""), 14))
               .append(pad(String.valueOf(r.total), 6))
               .append(pad(ms(r.p95()), 7))
               .append(pad(pct(r.usableRate()), 8))
@@ -165,7 +218,7 @@ public final class QualityStats {
             sb.append("\n按模型\n");
             for (int i = 0; i < mrows.size() && i < 12; i++) {
                 Row r = mrows.get(i);
-                sb.append(pad(r.key, 26))
+                sb.append(pad(r.key + (r.retired ? "（已删除）" : ""), 26))
                   .append(pad(String.valueOf(r.total), 6))
                   .append(pad(ms(r.p95()), 7))
                   .append(pad(pct(r.usableRate()), 8))
@@ -175,6 +228,15 @@ public final class QualityStats {
         }
         sb.append("\n说明：可用率 = ok / 有质量标记的样本；p95 = 该渠道/模型的 95 分位耗时；"
                 + "工具失败 = 给了工具但没吐结构化调用。");
+        /* 历史里有、当前配置里没有的渠道/模型单独说一句（4.51.8）。
+           用户看到"我明明删了这个账号，它还在这里"时，需要知道那是历史记录而不是
+           复活了 —— 否则会以为删除没生效。 */
+        boolean anyRetired = false;
+        for (Row r : rows) if (r.retired) anyRetired = true;
+        if (anyRetired) {
+            sb.append("\n标「已删除」的渠道/模型曾经用过，现在配置里已经没有了 —— "
+                    + "这几行是 30 天内的历史记录，不是当前账号。");
+        }
         return sb.toString();
     }
 

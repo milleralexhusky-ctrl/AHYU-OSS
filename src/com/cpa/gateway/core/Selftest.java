@@ -83,6 +83,8 @@ public final class Selftest {
         add(out, "额度未知（-1）不能被当成额度用尽", Selftest::checkCreditsUnknown);
         add(out, "截断率与内容率的信号口径", Selftest::checkContentSignalScope);
         add(out, "缓存命中率的分母只算带缓存列的行", Selftest::checkCacheRateDenominator);
+        add(out, "删除账号不会从快照复活（幽灵账号）", Selftest::checkSnapshotNoResurrect);
+        add(out, "历史渠道标记为「已删除」而不是当账号列出", Selftest::checkRetiredChannels);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -1585,6 +1587,108 @@ public final class Selftest {
         real0.tokInWithCacheInfo = 100;
         if (Math.abs(real0.cacheHitRate()) > 1e-9) {
             return "有缓存列但确实没命中时应为 0，实际 " + real0.cacheHitRate();
+        }
+        return null;
+    }
+
+    /**
+     * 删掉的账号不能被快照复活（4.51.8）。
+     *
+     * <p>真机症状："老是蹦出一些不存在的账号，明明已经删了"。成因是两个设计撞在一起：
+     * <ol>
+     *   <li>快照原先**只增不减**（防"一次写坏的配置把救命快照冲掉"），
+     *       于是删掉的账号永远留在快照里，快照冻在"历史上账号最多的那一刻"；</li>
+     *   <li>{@code Config.load} 一旦发现配置里一个账号都没有，就从快照整个恢复
+     *       **并写回磁盘**。</li>
+     * </ol>
+     * 于是"删 → 配置变空 → 从冻住的快照复活全部旧账号"循环起来。
+     *
+     * <p>这条断言钉的是 {@code Config.snapshotAction} 的决策表。抽成纯函数就是为了
+     * 能在自检里直接喂数字断言 —— 这个 bug **不会报错**，只在"配置恰好读空"时发作，
+     * 靠手工点几下试不出来。
+     *
+     * <p>最容易写错、也最要紧的一格是最后一条：**用户主动删除导致账号减少时，
+     * 快照必须跟着缩小**（而不是像自动保存那样被保护住）。这一格错了，
+     * 幽灵账号就会回来。
+     */
+    private static String checkSnapshotNoResurrect() {
+        /* 1. 用户主动删到 0 个 → 删快照（否则留着一个"复活开关"） */
+        if (Config.snapshotAction(0, 5, true) != Config.SNAP_DELETE) {
+            return "用户把账号清空后没有删除快照 —— 旧账号会在下次配置读空时整批复活";
+        }
+        /* 2. 配置读空但**不是**用户操作 → 跳过，别冲掉快照（保护模式） */
+        if (Config.snapshotAction(0, 5, false) != Config.SNAP_SKIP) {
+            return "非用户操作导致配置读空时动了快照，保护机制失效";
+        }
+        /* 3. 用户主动删除（还剩几个）→ 写，让快照跟着缩小。
+              这一格是幽灵账号的根因：旧行为是 now<prev 一律跳过，
+              于是删掉的账号在快照里留存。 */
+        if (Config.snapshotAction(2, 5, true) != Config.SNAP_WRITE) {
+            return "用户主动删账号后快照没有跟着缩小 —— 删掉的账号会留在快照里，"
+                    + "下次配置读空就被复活（幽灵账号）";
+        }
+        /* 4. 自动保存导致账号变少 → 跳过（保护，防意外写坏） */
+        if (Config.snapshotAction(2, 5, false) != Config.SNAP_SKIP) {
+            return "自动保存时账号变少却改了快照，保护机制失效";
+        }
+        /* 5. 账号变多或持平 → 写（两种意图都该更新） */
+        if (Config.snapshotAction(6, 5, false) != Config.SNAP_WRITE) {
+            return "账号变多时快照没更新";
+        }
+        if (Config.snapshotAction(5, 5, true) != Config.SNAP_WRITE) {
+            return "账号持平且是用户操作时快照没更新";
+        }
+        /* 6. 用户主动加账号（从 0 加到 1）→ 写。这条防的是把"now<=0 就删/跳过"
+              写成无条件的，那会让"清空后又加回来"这种正常操作丢了快照。 */
+        if (Config.snapshotAction(1, 0, true) != Config.SNAP_WRITE) {
+            return "用户从空配置添加第一个账号时快照没建立";
+        }
+        return null;
+    }
+
+    /**
+     * 历史渠道要被标成「已删除」，而不是当成账号列出来（4.51.8）。
+     *
+     * <p>这是用户报的"老是蹦出一些不存在的账号"的**第二个来源**（第一个是快照复活，
+     * 见 {@link #checkSnapshotNoResurrect}）：{@code usage.tsv} 留 30 天，
+     * "行为画像"按**历史行里的渠道名**聚合，账号删了名字还在报告里出现好几天。
+     *
+     * <p>处理方式是**标记而不是删除**：那些样本是真实发生过的调用记录，
+     * "这个渠道以前靠不靠得住"对"要不要重新加回来"仍有参考价值；
+     * 用户困惑的是"我以为删干净了"，而不是"这里有历史"。所以加一句「（已删除）」。
+     *
+     * <p>这条断言钉的是比对逻辑：拿当前配置的账号名去比，比不上的才算历史。
+     * 最容易写反的是"配置读不到时怎么办"——那时必须**一个都不标**：
+     * 把全部渠道打成"已删除"是比不标更糟的谎。
+     */
+    private static String checkRetiredChannels() {
+        Config cfg = Gateway.config();
+        if (cfg == null) return null;      // 没有配置可比对，跳过（不伪装成通过）
+
+        /* 借真实的 markRetired：构造两组 key，一组用当前第一个账号的名字，
+           一组用一个绝不会存在的名字。 */
+        java.util.Map<String, QualityStats.Row> rows = new java.util.LinkedHashMap<>();
+        String realName = null;
+        for (Config.Provider p : cfg.providers) {
+            if (p != null && p.name != null && !p.name.isEmpty()) {
+                realName = p.name;
+                break;
+            }
+        }
+        if (realName == null) return null;   // 没账号，跳过
+
+        QualityStats.Row live = new QualityStats.Row();
+        live.key = realName;
+        rows.put(live.key, live);
+        QualityStats.Row ghost = new QualityStats.Row();
+        ghost.key = "ZZ-绝不存在的老账号-zz";
+        rows.put(ghost.key, ghost);
+
+        QualityStats.markRetiredForTest(rows, true);
+        if (live.retired) return "当前还在的账号被误标成「已删除」：" + realName;
+        if (!ghost.retired) {
+            return "配置里已经没有的渠道没被标成「已删除」——"
+                    + "用户会在行为画像里看到不存在的账号";
         }
         return null;
     }
