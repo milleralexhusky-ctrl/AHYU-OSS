@@ -340,9 +340,58 @@ public final class Http {
         return t.startsWith("{\"error\"") || t.startsWith("[{\"error\"");
     }
 
-    /** 错误体里点名 insufficient_quota 的，是"额度用尽"，不是普通限流。 */
+    /**
+     * 错误体是不是"额度用尽"——是的话按 {@code quota} 而不是普通限流退避。
+     *
+     * <h4>为什么不能只认 insufficient_quota（4.52.2 修的真机 bug）</h4>
+     * 原来这里只匹配 OpenAI 那一句 {@code insufficient_quota}。而 WorkBuddy /
+     * CodeBuddy 的额度耗尽长这样（真机原文，HTTP 429）：
+     * <pre>
+     * {"error":{"data":{"code":14018,"msg":"额度已用尽，请访问以下链接，购买加量包以获取更多额度：…"}}}
+     * </pre>
+     * 里面**一个英文字面量都没有**，于是它落进 {@code rate}。后果不是"显示得不好看"，
+     * 而是三条链路同时走错（都是静默的）：
+     * <ol>
+     *   <li>退避时长：{@code rate} 走 429 默认 5 分钟，{@code quota} 是 30 分钟。
+     *       实测 22:40 那次，同一个账号的 deepseek-v4-pro / deepseek-v4.1-flash
+     *       在**同一秒**各记了一次"暂避 300 秒"——额度根本不会 5 分钟恢复，
+     *       于是每 5 分钟白撞一轮，永远撞不出一句成功。</li>
+     *   <li>账号级回避（{@link Router#accountScoped}）只认 {@code quota}/{@code auth}，
+     *       {@code rate} 不进表 —— 于是"这个账号没额度了"这件事**从来没被记成账号级事实**，
+     *       后面每个请求还是要先把它的模型逐个撞一遍。</li>
+     *   <li>界面文案：{@code rate} 显示"被上游限流（换账号/换模型可继续用）"，
+     *       而真实情况是"额度没了，换模型也救不了" —— 用户照着提示换模型，白换。</li>
+     * </ol>
+     *
+     * <h4>为什么是复制 Detect 的判据而不是引用它</h4>
+     * {@link Detect#CREDITS_OUT} 已经有一份更全的额度正则（含中文"额度/积分/余额不足"）。
+     * 但 Detect 是**诊断/展示**层（"一键检测"要给人看的那句话），Http 是**传输**层，
+     * 让它反向依赖诊断层会把依赖方向倒过来。所以这里只补齐**判定所必需**的那几条字面量，
+     * 并保持和 Detect 同一套措辞；两处要一起改（{@code checkCreditsUnknown} 之外的
+     * {@code checkQuotaKind} 会把它们钉在一起）。
+     *
+     * <p>刻意**不**收 "quota" 单独一个词：OpenAI 兼容中转站里 "quota exceeded" 常常
+     * 指的是**速率配额**（分钟级窗口），那确实会自己好，按 30 分钟回避反而误伤。
+     * 只认"用尽/耗尽/ exhausted"这类**不会自己恢复**的说法。
+     */
     static boolean quota(String body) {
-        return body != null && body.toLowerCase(java.util.Locale.US).contains("insufficient_quota");
+        if (body == null) return false;
+        String b = body.toLowerCase(java.util.Locale.US);
+        if (b.contains("insufficient_quota")) return true;
+        /* 英文："credits exhausted" / "out of credits" / "no credit left" /
+           "insufficient balance" / "exceeded your quota" / "quota used up" */
+        if (b.contains("credits exhausted") || b.contains("credit exhausted")
+                || b.contains("out of credits") || b.contains("no credits")
+                || b.contains("insufficient balance") || b.contains("insufficient credit")
+                || b.contains("exceeded your quota") || b.contains("quota used up")
+                || b.contains("quota exhausted")) {
+            return true;
+        }
+        /* 中文（CodeBuddy / WorkBuddy 国内版就是这个形态）：
+           "额度已用尽" / "余额不足" / "积分用完" */
+        return b.contains("额度已用尽") || b.contains("额度用尽")
+                || b.contains("余额不足") || b.contains("积分用完")
+                || b.contains("额度不足");
     }
 
     /** 429 / 503 / 529 是"上游忙"，不是"账号坏了"。 */

@@ -85,6 +85,9 @@ public final class Selftest {
         add(out, "缓存命中率的分母只算带缓存列的行", Selftest::checkCacheRateDenominator);
         add(out, "删除账号不会从快照复活（幽灵账号）", Selftest::checkSnapshotNoResurrect);
         add(out, "旧快照按磁盘校准（升级前删掉的账号不再复活）", Selftest::checkSnapshotReconcile);
+        add(out, "「启动网关」按钮不把自己写回旧文案", Selftest::checkLoadingTextRestore);
+        add(out, "额度耗尽归为 quota（WorkBuddy 14018 不能落进限流）", Selftest::checkQuotaKind);
+        add(out, "账号级回避（额度/凭证）只扣分、不硬挡", Selftest::checkAccountAvoid);
         add(out, "历史渠道标记为「已删除」而不是当账号列出", Selftest::checkRetiredChannels);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
@@ -627,8 +630,15 @@ public final class Selftest {
      */
     private static String checkCachedCost() {
         /* 绊线：带缓存价的条目数。当前表里是 1214 条。
-           阈值取 500：留足余量（源数据本身也在变），但"字段被整个丢掉"必红。 */
-        int cachePriced = Prices.countCachePriced();
+           阈值取 500：留足余量（源数据本身也在变），但"字段被整个丢掉"必红。
+
+           表还没加载完时 -1 = **未知**，跳过而不是报错（4.52.2）。
+           原来这里读 countCachePriced()，它在未加载完时返回 0，于是冷启动那一次
+           会报"cr 字段丢了、成本静默变贵"——一个纯竞态被说成严重缺陷。
+           实测：同一份包冷启动 51/52，紧接着重启就是 52/52。
+           假红会训练人忽略自检，那比漏报更糟。 */
+        int cachePriced = Prices.countCachePricedOrUnknown();
+        if (cachePriced < 0) return null;               // 表还没就绪：不伪装成通过，也不误报
         if (cachePriced < 500) {
             return "价格表里带缓存单价（cr）的条目只剩 " + cachePriced
                     + " 条 —— 重建 res/raw/model_prices.json 时很可能把 cr 字段丢了，"
@@ -1791,6 +1801,191 @@ public final class Selftest {
         } catch (Throwable t) {
             return null;                                  // 读不到就跳过，不假装通过
         }
+    }
+
+    /**
+     * 「启动网关」按钮不会把自己写回旧文案（4.52.2）。
+     *
+     * <p>用户报的是"启用之后它会自动关掉那个按钮"。真机机制是：
+     * {@code toggleGateway()} 把按钮改成「正在启动…」，700ms 后无条件把旧文案
+     * 「启动网关」写回去；而这段时间里状态轮询（2 秒一次）已经把它刷成了
+     * 「停止网关」—— 于是网关明明在跑，按钮却写回「启动网关」，
+     * 紧接着那句 {@code refreshStatus()} 又因为指纹没变而直接 return（不会纠正）。
+     * 用户再点一次，就真的走进停止分支把网关关掉了。
+     *
+     * <p>判据：只有按钮上现在显示的**仍是**我们写进去的那句进行中文案，
+     * 才说明期间没别人改过，才该还原。这里直接钉这个纯函数。
+     */
+    private static String checkLoadingTextRestore() {
+        /* 期间没人动过（还写着我们写的进行中文案）→ 该还原 */
+        if (!com.cpa.gateway.Ui.shouldRestoreLoadingText("正在启动…", "正在启动…")) {
+            return "按钮还显示我们写的「正在启动…」，却不还原原文案 —— "
+                    + "启动失败后按钮会永远卡在「正在启动…」";
+        }
+        /* 期间被状态轮询改成了新状态（"停止网关"）→ 不该还原，否则把真状态盖掉 */
+        if (com.cpa.gateway.Ui.shouldRestoreLoadingText("停止网关", "正在启动…")) {
+            return "按钮已被状态轮询刷成「停止网关」（网关确实起来了），"
+                    + "此时还原旧文案「启动网关」会把真状态盖掉 —— "
+                    + "这就是用户看到的「启动后按钮自己变回去」，再点一次就把网关关掉了";
+        }
+        if (com.cpa.gateway.Ui.shouldRestoreLoadingText("启动网关", "正在停止…")) {
+            return "停止过程中按钮被刷成「启动网关」，不该再还原（同上的反向情形）";
+        }
+        /* 没有记录进行中文案时保持旧行为（还原），不能因为新逻辑把它变成"什么都不做" */
+        if (!com.cpa.gateway.Ui.shouldRestoreLoadingText("随便什么", null)) {
+            return "没有进行中文案记录时应当照旧还原（保持旧行为）";
+        }
+        return checkQuotaKind();
+    }
+
+    /**
+     * 额度耗尽必须归到 {@code quota}，不能落进 {@code rate}（4.52.2）。
+     *
+     * <p>钉的是真机原文：WorkBuddy / CodeBuddy 额度用尽回 HTTP 429 +
+     * <pre>{"error":{"data":{"code":14018,"msg":"额度已用尽，请访问以下链接，购买加量包…"}}}</pre>
+     * 整条**没有一个英文字面量**。原来 {@code Http.quota()} 只认 {@code insufficient_quota}，
+     * 于是它落进 {@code rate}，三条链路同时走错且都不报错：
+     * 退避 5 分钟（额度不会 5 分钟恢复 → 永远白撞）、
+     * 不进账号级回避表（同账号换模型又要撞一遍 → 就是用户说的"特别慢"）、
+     * 界面说"换模型可继续用"（换模型救不了 → 误导）。
+     *
+     * <p>反方向也要钉：**不能**把一切带 "quota" 的都判成耗尽。OpenAI 兼容中转站的
+     * {@code "quota exceeded"} 往往指分钟级速率配额，会自己好；把它按 30 分钟回避是误伤。
+     */
+    private static String checkQuotaKind() {
+        /* 1. 真机原文（中文）：必须归 quota */
+        String wb = "upstream HTTP 429 {\"error\":{\"data\":{\"code\":14018,"
+                + "\"msg\":\"额度已用尽，请访问以下链接，购买加量包以获取更多额度："
+                + "https://www.codebuddy.cn/profile/usage\"}}}";
+        if (!"quota".equals(Http.kindOf(429, wb))) {
+            return "WorkBuddy 的 14018「额度已用尽」被判成了 "
+                    + Http.kindOf(429, wb) + " —— 它会按 5 分钟限流退避（额度不会 5 分钟恢复，"
+                    + "于是每 5 分钟白撞一轮），而且不进账号级回避表："
+                    + "同一个没额度的账号换个模型又要全撞一遍，这正是真机实测到的 10.6 秒慢";
+        }
+        /* WorkBuddy 流式路径用的是 HTTP 402 报 quota，也要确认这条仍然通 */
+        if (!"quota".equals(Http.kindOf(402, wb))) return "402 没有被归成额度";
+        if (Http.quota(wb) != true) return "Http.quota 没认出 WorkBuddy 的 14018 原文";
+
+        /* 2. 英文的几种"用尽"说法 */
+        String[] exhausted = {
+                "{\"error\":{\"message\":\"You exceeded your current quota\",\"code\":\"insufficient_quota\"}}",
+                "{\"error\":\"Credits exhausted. Please purchase add-on packs\"}",
+                "{\"error\":{\"message\":\"You are out of credits\"}}",
+                "{\"error\":{\"message\":\"Insufficient balance\"}}",
+                "{\"error\":{\"message\":\"额度不足\"}}",
+        };
+        for (String body : exhausted) {
+            if (!Http.quota(body)) return "额度耗尽没认出来：" + body;
+        }
+
+        /* 3. 反方向：分钟级速率配额**不该**被当成额度耗尽（会把账号无谓回避 30 分钟） */
+        String[] notQuota = {
+                "{\"error\":{\"message\":\"Rate limit reached, quota exceeded for this minute\"}}",
+                "{\"error\":{\"message\":\"Too many requests, please slow down\"}}",
+                "{\"error\":{\"message\":\"upstream temporarily overloaded\"}}",
+        };
+        for (String body : notQuota) {
+            if (Http.quota(body)) {
+                return "把会自己好的限流当成了额度耗尽（会被无谓回避 30 分钟）：" + body;
+            }
+        }
+
+        /* 4. 和展示层对齐：Detect 认为"额度不足"的，Http 也必须认为它是额度。
+           两处措辞一旦漂开，就会出现"界面说额度没了、退避按限流走"的分裂。 */
+        for (String body : exhausted) {
+            String cls = Detect.classify(body);
+            if (cls.contains("额度") && !Http.quota(body)) {
+                return "展示层说是额度、传输层却不认（两处措辞漂开了）：" + body + " → " + cls;
+            }
+        }
+        return checkAccountAvoid();
+    }
+
+    /**
+     * 账号级回避（4.52.1）：额度/凭证失败是**账号**属性，但要**扣分**而不是硬挡。
+     *
+     * <p>起因是真机实测到的那种慢：{@code auto} 的三个候选全来自同一个没额度的
+     * WorkBuddy 账号，每个请求都要先撞它一遍、等一次超时（实测 10.6 秒一条），
+     * 然后换下一个 —— 用户看到的就是"特别慢、老重连"。
+     * 根因是限流表按 {@code 账号/模型} 记账，同一个账号换个模型就又"干净"了。
+     *
+     * <p>为什么最终是扣分而不是拉黑：同一账号下实测有模型还能返回（502 空响应），
+     * 有模型报 14018 额度用尽 —— 额度至少部分是**按模型**计的。
+     * 硬挡会把还能用的模型一起误伤，极端情况下候选池清空变成 404。
+     * 所以这里钉住三件事：
+     * <ol>
+     *   <li>只认 {@code quota}/{@code auth} 两类是账号级 —— 限流和渠道校验不是，
+     *       换个模型可能就好了，按账号一刀切会误伤；</li>
+     *   <li>被回避的账号**仍然出现在候选池里**（不制造"没有可用候选"）；</li>
+     *   <li>分数下降幅度在合理区间：要低于"正常账号"，但不能低到盖过
+     *       "额度确认用尽"(-200) 这个断崖。</li>
+     * </ol>
+     */
+    private static String checkAccountAvoid() {
+        /* 1. 作用域：只有额度/凭证算账号级 */
+        if (!Router.accountScoped("quota")) return "额度用尽没有当成账号级失败";
+        if (!Router.accountScoped("auth")) return "凭证失效没有当成账号级失败";
+        if (Router.accountScoped("rate")) {
+            return "限流被当成了账号级失败 —— 限流通常只挂一个模型，"
+                    + "按账号一刀切会把同账号下还能用的模型一起误伤";
+        }
+        if (Router.accountScoped("channel") || Router.accountScoped("channel_soft")) {
+            return "渠道校验被当成了账号级失败（它本来就只是单次请求的问题）";
+        }
+        if (Router.accountScoped("empty") || Router.accountScoped(null)) {
+            return "空响应/null 被当成了账号级失败";
+        }
+
+        /* 2. 过期语义：到点自动失效，且清掉不留垃圾 */
+        String who = "avoid-selftest-" + System.nanoTime();
+        long now = System.currentTimeMillis();
+        if (Router.accountAvoided(who, now)) return "从没记过的账号被判成在回避中";
+        Router.recordAccountAvoid(who, now + 60_000L);
+        if (!Router.accountAvoided(who, now)) return "刚记下的账号级回避没有生效";
+        /* 边界：到点那一刻就该放行（用的是 <=，不是 <）—— 差一毫秒地卡着一个账号
+           会让"本来刚好恢复"的请求白等一轮，正是要治的那种慢。 */
+        if (Router.accountAvoided(who, now + 60_000L)) return "回避到期那一毫秒没有放行（边界应该是 <=）";
+        if (Router.accountAvoided(who, now + 60_001L)) return "回避过期后仍然生效";
+        /* 清掉之后不该再被算进计数 */
+        int before = Router.accountAvoidCount(now);
+        if (before < 0) return "账号级回避计数为负";
+        /* 坏输入不该污染这张表 */
+        Router.recordAccountAvoid(null, now + 60_000L);
+        Router.recordAccountAvoid("", now + 60_000L);
+        Router.recordAccountAvoid("avoid-selftest-bad", 0L);
+        if (Router.accountAvoided("avoid-selftest-bad", now)) return "untilMs=0 的坏记录被存进了回避表";
+
+        /* 3. 核心取舍：扣分、不硬挡 */
+        Config.Provider p = new Config.Provider();
+        p.name = who;
+        p.credits = 9999;                       // 有额度，排除 -200 那一档的干扰
+        String model = "avoid-selftest-model";
+        Router.Pick pick = Router.newPick(p, model);
+        double clean = Router.scorePublic(pick, false);
+        Router.recordAccountAvoid(who, System.currentTimeMillis() + 600_000L);
+        Router.Pick pick2 = Router.newPick(p, model);
+        double avoided = Router.scorePublic(pick2, false);
+        if (!(avoided < clean)) {
+            return "账号级回避没有改变得分（" + clean + " vs " + avoided
+                    + "）—— 同账号换模型又会排到前面，就是实测到的那个 10.6 秒慢";
+        }
+        double drop = clean - avoided;
+        if (drop < 40) {
+            return "账号级回避扣分太轻（只有 " + drop + " 分），压不住——"
+                    + "它必须能盖过随机波动，才轮得到别的账号";
+        }
+        if (drop > 150) {
+            return "账号级回避扣分太重（" + drop + " 分），快赶上「额度确认用尽」(-200) 了 ——"
+                    + "会把同账号下还能用的模型也一起沉底";
+        }
+        /* 候选池不能被清空（硬挡的退路）：newPick 出来的候选永远算"存在"，
+           所以这里只需要确认回避没有把它变成不可用。 */
+        if (!Router.available(model)) {
+            return "账号级回避把候选挡成不可用了 —— 池子清空会变成 404，"
+                    + "而实测同账号下确实还有能返回的模型";
+        }
+        return checkIntlFallback();
     }
 
     /** 国际版重发的开关与跳过条件。 */

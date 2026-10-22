@@ -223,14 +223,32 @@ public final class Prices {
      * <p>{@code Selftest.checkCachedCost} 用它做绊线：这个数掉到 0，自检就红。
      */
     public static int countCachePriced() {
-        if (!loaded) {
-            ensureLoaded();
-            return 0;
-        }
+        if (!loaded) ensureLoaded();
         int n = 0;
         for (double[] p : TABLE.values()) {
             if (p != null && p.length > 2 && p[2] >= 0) n++;
         }
         return n;
+    }
+
+    /**
+     * 其中多少条带缓存读单价；**表还没加载完时返回 -1**，而不是 0。
+     *
+     * <p>为什么要区分"0 条"和"还没加载"（4.52.2 修的一次假红）：
+     * {@link #countCachePriced()} 在没加载完时返回 0，而自检把 0 读成
+     * "重建价格表时把 cr 字段丢了"——于是一次纯粹的启动竞态被报成
+     * "成本会静默退回按全价计算"这种严重结论。真机实测：冷启动那一次
+     * 自检 51/52（这一项红），紧接着重启同一份包就是 52/52。
+     *
+     * <p>假红的代价不是"多看一条红字"：它训练人忽略自检。一次真的 cr 丢失
+     * 会被当成"又是那个竞态"。所以这里把"未知"如实表达成 -1，
+     * 让调用方能选择**跳过**而不是**报错**。
+     */
+    public static int countCachePricedOrUnknown() {
+        if (!loaded) {
+            ensureLoaded();
+            return ready() ? countCachePriced() : -1;
+        }
+        return countCachePriced();
     }
 }

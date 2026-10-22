@@ -2,6 +2,7 @@ package com.cpa.gateway.core;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -170,6 +171,63 @@ public final class Router {
     private static final Map<String, Stat> STATS =
             Collections.synchronizedMap(new LinkedHashMap<String, Stat>());
 
+    /**
+     * **账号级**回避：某些失败是"整个账号"的事实，而不是"这个模型"的事实。
+     *
+     * <p>最典型的是额度耗尽（WorkBuddy 的 14018 / OpenAI 的 insufficient_quota）：
+     * 额度是记在账号上的，跟模型名无关。但 {@link #recordThrottled} 只按
+     * {@code 账号/模型} 这个 key 记回避，于是同一个账号换个模型名就又是"新"的、
+     * 照样被选进来重试一遍 —— 真机实测（2026-10-22）就是这样：
+     *
+     * <pre>
+     * 22:06:38  虚拟模型 auto 选路：WorkBuddy 1/step-5-preview(153) → …/deepseek-v4-pro(157) → …/hy3(149)
+     * 22:06:50  上游限流：暂避 600 秒 → WorkBuddy 1/glm-5.2          ← 只记了 glm-5.2
+     * 22:06:59  第 1 个候选失败（WorkBuddy 1/step-5-preview）… 换下一个：Socket closed
+     * </pre>
+     *
+     * <p>三个候选全是同一个没额度的账号，每个请求都要撞一遍、等一遍超时；
+     * 而真正有额度的 Loomy 2/3 根本没进候选。表现就是用户说的"特别慢、老重连"。
+     *
+     * <p>所以额度/凭证这类**账号级**失败单独记一张表，按账号名挡掉它下面所有模型。
+     * 只放这两类（{@code quota} / {@code auth}）：它们确实是账号属性；
+     * 限流（rate）和渠道校验（channel）不是 —— 换个模型可能就好了，
+     * 按账号一刀切会把还能用的模型也误伤。
+     */
+    private static final Map<String, Long> ACCOUNT_AVOID =
+            Collections.synchronizedMap(new HashMap<String, Long>());
+
+    /** 账号级回避：这类失败属于整个账号，不是某个模型。 */
+    static boolean accountScoped(String kind) {
+        return "quota".equals(kind) || "auth".equals(kind);
+    }
+
+    /** 记一个账号级回避（毫秒时间戳）。 */
+    static void recordAccountAvoid(String provider, long untilMs) {
+        if (provider == null || provider.isEmpty() || untilMs <= 0L) return;
+        ACCOUNT_AVOID.put(provider, untilMs);
+    }
+
+    /** 这个账号当前是否处在账号级回避里。 */
+    static boolean accountAvoided(String provider, long nowMs) {
+        if (provider == null || provider.isEmpty()) return false;
+        Long until = ACCOUNT_AVOID.get(provider);
+        if (until == null) return false;
+        if (until.longValue() <= nowMs) {
+            ACCOUNT_AVOID.remove(provider);      // 到点自然过期，顺手清掉
+            return false;
+        }
+        return true;
+    }
+
+    /** 给界面/日志看：当前被账号级回避的账号还有几个。 */
+    static int accountAvoidCount(long nowMs) {
+        int n = 0;
+        for (Map.Entry<String, Long> e : ACCOUNT_AVOID.entrySet()) {
+            if (e.getValue() != null && e.getValue().longValue() > nowMs) n++;
+        }
+        return n;
+    }
+
     private static Stat stat(String key) {
         synchronized (STATS) {
             Stat s = STATS.get(key);
@@ -329,8 +387,9 @@ public final class Router {
         }
         // 字段读写必须在 STATS 锁里：stat() 只保证"取/建对象"原子，
         // 返回后光秃秃地改字段，多线程并发时会丢更新。
+        long until = System.currentTimeMillis() + ms;
         synchronized (STATS) {
-            s.throttleUntil = System.currentTimeMillis() + ms;
+            s.throttleUntil = until;
             s.throttleKind = kind;
             s.throttleResetAt = (fromUpstreamClock && resetAtMs > 0L) ? resetAtMs : 0L;
             if (fromUpstreamClock) {
@@ -340,6 +399,17 @@ public final class Router {
             }
             // 半开试探若遇到 429，放掉 probingAt 标记，等 throttleUntil 到点后还能继续试探
             if (s.probingAt > 0) s.probingAt = 0;
+        }
+        /* 额度/凭证是**账号级**事实，顺手把整个账号挡掉（见 ACCOUNT_AVOID 的注释）。
+           key 的形状是 "账号/模型"，取第一段就是账号名。 */
+        if (accountScoped(kind)) {
+            int slash = key == null ? -1 : key.indexOf('/');
+            String provider = slash > 0 ? key.substring(0, slash) : key;
+            recordAccountAvoid(provider, until);
+            if (slash > 0) {
+                Log.w("账号级回避（" + kind + "）：" + provider + " 名下所有模型暂避 "
+                        + (ms / 60000) + " 分钟 —— 换模型也救不了这个账号");
+            }
         }
     }
 
@@ -733,6 +803,16 @@ public final class Router {
          * 另外注意 -200 是**断崖式**的：它比"冷却中"(-100) 还重，也就是说
          * 一个确认耗尽的账号比一个刚熔断的账号更该被躲开——这是对的，保留。 */
         if (c.provider.credits == 0) v -= 200;                       /* 额度确认用尽 */
+        /* 账号级回避（额度/凭证，2026-10-22）：这个账号刚刚明确回过"额度用尽/凭证失效"。
+         *
+         * 为什么用扣分而不是硬挡：实测发现额度至少是**按模型**计的 —— 同一个
+         * WorkBuddy 账号下 step-5-preview 还能返回、deepseek-v4-pro 报 14018。
+         * 硬挡会把还能用的模型一起误伤；扣分（比"冷却中"轻、比"刚报过错"重）
+         * 只让它排到后面，池子里没别的可选时仍然能用它。
+         *
+         * 这一条解决的是真机实测到的那种慢：auto 的三个候选全来自同一个没额度的
+         * 账号，每个请求都要先撞它一遍再换，单个请求 10.6 秒、还不停重连。 */
+        if (accountAvoided(c.provider.name, now)) v -= 80;
         if (cooldownUntil > now) v -= 100;                           /* 冷却中 */
         if (lastFailAt > 0 && now - lastFailAt < 120_000) v -= 50;   /* 刚报过错 */
         /* 截断率（4.51.7）：回答被 max_tokens 切成一半就结束。
@@ -921,6 +1001,12 @@ public final class Router {
                 skippedContext++;
                 continue;
             }
+            /* 账号级回避不再在这里**硬挡**。
+               实测（2026-10-22）推翻了"额度是纯账号属性"的假设：同一个 WorkBuddy 账号
+               下 step-5-preview / hy3 还能返回，而 deepseek-v4-pro / glm-5.2 报 14018 ——
+               额度至少是**按模型**计的。硬挡会把还能用的模型一起误伤（那是后退）。
+               改成在 score() 里给账号级回避扣分：它会让整个账号排到后面，
+               但一个候选都不剩时仍然能用它（不制造"没有可用候选"的 404）。 */
             for (String m : p.models) {
                 if ("*".equals(m) || m.isEmpty()) continue;
                 if (isVirtual(m) || junk(m)) continue;

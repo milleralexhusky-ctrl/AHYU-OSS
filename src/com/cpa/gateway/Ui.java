@@ -15,7 +15,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 /** One small design system so every screen looks like it belongs to the same app. */
-final class Ui {
+public final class Ui {
 
     /* ----------------------------------------------------------- 层结构规范
      *
@@ -711,21 +711,74 @@ final class Ui {
     }
 
     /**
+     * 加载态的两个文案：加载前的原文案 + 我们写进去的进行中文案。
+     *
+     * <p>必须两个都留着才能判断"期间有没有别人改过按钮"（见 setLoading 的注释）。
+     * 原来只留了原文案，于是无法区分"按钮上还是我写的进行中"和"别人已经改成新状态了"。
+     */
+    static final class LoadingState {
+        final CharSequence restore;
+        final CharSequence busy;
+
+        LoadingState(CharSequence restore, CharSequence busy) {
+            this.restore = restore;
+            this.busy = busy;
+        }
+    }
+
+    /**
      * 加载状态：文案换成进行中，期间不响应点击，松手后状态如实描述。
      * 传 loading=false 会自动还原原来的文案（存在 tag 里）。
+     *
+     * <h4>还原前必须确认"文案还是我改的那句"（4.52.2 修的真机 bug）</h4>
+     * 原来这里无条件把 tag 里的旧文案写回去。而"启动网关"这条路径上，
+     * 文案**同时**被两处改：
+     * <pre>
+     *   toggleGateway():  setLoading(true, "正在启动…")   // tag 存下"启动网关"
+     *   refreshStatus():  setText("停止网关")             // 700ms 窗口内轮询跑到了
+     *   toggleGateway():  setLoading(false) → 写回"启动网关"   ✗ 把新状态盖掉了
+     * </pre>
+     * 于是网关明明起来了，按钮却写回「启动网关」。更糟的是下一句 `refreshStatus()`
+     * 因为**指纹没变**（running 早就是 true 了）直接 return，不会纠正它 ——
+     * 用户看到的就是"点了启动，按钮又自己变回启动/像被关掉了"，
+     * 再点一次才真的走进停止分支把网关关掉。这正是用户报的那个现象。
+     *
+     * <p>判据：只有当按钮上现在显示的**仍是**我们写进去的那句进行中文案时，
+     * 才说明期间没有别人改过它，还原才是对的；否则保留别人写的（那是更新的状态）。
      */
     static void setLoading(TextView b, boolean loading, String busyText) {
         if (b == null) return;
         if (loading) {
-            if (b.getTag() == null) b.setTag(b.getText());
-            b.setText(busyText == null ? "处理中…" : busyText);
+            String busy = busyText == null ? "处理中…" : busyText;
+            /* 已经是加载态就别再存一次 —— 否则会把进行中文案当成"原文案"存下来。 */
+            if (!(b.getTag() instanceof LoadingState)) {
+                b.setTag(new LoadingState(b.getText(), busy));
+            }
+            b.setText(busy);
         } else {
-            Object old = b.getTag();
-            if (old instanceof CharSequence) b.setText((CharSequence) old);
+            Object tag = b.getTag();
+            if (tag instanceof LoadingState) {
+                LoadingState st = (LoadingState) tag;
+                if (shouldRestoreLoadingText(b.getText(), st.busy)) {
+                    b.setText(st.restore);
+                }
+                b.setTag(null);
+            }
         }
         b.setEnabled(!loading);
         b.setClickable(!loading);
         b.setAlpha(loading ? 0.7f : 1f);
+    }
+
+    /**
+     * 该不该把加载前的旧文案写回去：现在显示的**还是**我们写的那句进行中文案，才该还原。
+     *
+     * <p>抽成纯函数是为了能被自检钉住 —— 这个 bug 的形态是"看起来只是文案不对"，
+     * 但它会让下一次点击走进相反的分支（把网关关掉），所以值得一条断言守门。
+     */
+    public static boolean shouldRestoreLoadingText(CharSequence current, CharSequence busy) {
+        if (busy == null || busy.length() == 0) return true;   // 没有记录：按旧行为还原
+        return busy.toString().contentEquals(current == null ? "" : current);
     }
 
     /** 危险操作：删除、清空、移除。独立红系，不跟主色混。 */
