@@ -84,6 +84,7 @@ public final class Selftest {
         add(out, "截断率与内容率的信号口径", Selftest::checkContentSignalScope);
         add(out, "缓存命中率的分母只算带缓存列的行", Selftest::checkCacheRateDenominator);
         add(out, "删除账号不会从快照复活（幽灵账号）", Selftest::checkSnapshotNoResurrect);
+        add(out, "旧快照按磁盘校准（升级前删掉的账号不再复活）", Selftest::checkSnapshotReconcile);
         add(out, "历史渠道标记为「已删除」而不是当账号列出", Selftest::checkRetiredChannels);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
@@ -1746,6 +1747,50 @@ public final class Selftest {
         String url = Updater.assetUrl("4.52.0");
         if (!url.endsWith("/v4.52.0/AHYU-4.52.0.apk")) return "资产地址形状不对：" + url;
         return null;
+    }
+
+    /**
+     * 快照按磁盘校准（4.52.1）。
+     *
+     * <p>钉的是真机上实测到的那个数：**磁盘 3 个账号、快照 6 个**。
+     * 多出来的 3 个是升级到 4.51.8 之前删掉的 —— 4.51.8 只保证"以后的删除会缩快照"，
+     * 管不了已经冻在文件里的旧数据。它们在"配置恰好读空"时会整批复活，
+     * 用户看到的就是"删了两次还在"。
+     *
+     * <p>这条断言直接读真机的两个文件比对，不是喂假数据：
+     * 如果哪天又出现"快照比磁盘多"，自检就会红，而不是等用户下次丢配置时才发现。
+     */
+    private static String checkSnapshotReconcile() {
+        /* 1. 决策表（纯函数，钉住真机实测到的那个数：磁盘 3 / 快照 6） */
+        if (!Config.shouldReconcile(3, 6)) {
+            return "磁盘 3 个、快照 6 个时没有校准 —— 升级前删掉的账号还冻在快照里，"
+                    + "配置一旦读空就整批复活（这正是真机上报「删两次还在」的原因）";
+        }
+        if (Config.shouldReconcile(3, 3)) return "快照与磁盘相平时不该校准（多余的写盘）";
+        if (Config.shouldReconcile(5, 3)) return "磁盘比快照多时不该按这条规则校准";
+        /* 磁盘为 0 时快照多几个是**正常**的 —— 那是 recoverFromSnapshot 该兜底的场合，
+           校准会把最后的救命快照冲掉，比幽灵账号更糟。 */
+        if (Config.shouldReconcile(0, 6)) return "磁盘读空时不该校准 —— 会把兜底快照冲掉";
+        if (Config.shouldReconcile(0, 0)) return "两个都为空时不该校准";
+
+        /* 2. 真机实况：load 时已经校准过，所以这里不该再出现"快照比磁盘多" */
+        android.content.Context ctx = Gateway.context();
+        if (ctx == null) return null;                     // 没有 context，跳过（不伪装成通过）
+        try {
+            java.io.File dir = ctx.getFilesDir();
+            java.io.File live = new java.io.File(dir, "gateway.json");
+            java.io.File snap = new java.io.File(dir, "gateway.accounts.json");
+            if (!live.isFile() || live.length() == 0) return null;   // 没配置可校准
+            int diskN = Config.countProvidersOnDisk(live);
+            int snapN = Config.countProvidersOnDisk(snap);
+            if (Config.shouldReconcile(diskN, snapN)) {
+                return "快照里有 " + snapN + " 个账号、磁盘只有 " + diskN
+                        + " 个 —— Config.load 的校准没生效（或校准后又被写旧了）";
+            }
+            return null;
+        } catch (Throwable t) {
+            return null;                                  // 读不到就跳过，不假装通过
+        }
     }
 
     /** 国际版重发的开关与跳过条件。 */

@@ -934,6 +934,15 @@ public final class Config {
             }
             if (loaded.providers.isEmpty()) {
                 loaded = recoverFromSnapshot(ctx, loaded);
+            } else {
+                /* 磁盘上有账号、而快照比磁盘多 → 快照是**旧的**，按磁盘校准（4.52.1）。
+                   4.51.8 修了"删除时不缩快照"，但那只对**升级后**的删除生效；
+                   升级前删掉的账号还冻在旧快照里，等哪天配置读空就整批复活
+                   （真机实测：磁盘 3 个、快照 6 个，多出的 3 个正是用户删掉的）。
+                   判断为什么安全：磁盘有账号且比快照多或少，都说明"最近一次成功的
+                   账号集合变更发生在磁盘上"；快照里多出来的那部分不可能比磁盘更新
+                   —— 快照唯一的恢复场景是"磁盘读空"，而磁盘非空时它永远不该说话。 */
+                reconcileSnapshot(ctx, f);
             }
             return loaded;
         } catch (Exception e) {
@@ -954,7 +963,7 @@ public final class Config {
         }
     }
 
-    private static int countProvidersOnDisk(File f) {
+    public static int countProvidersOnDisk(File f) {
         try {
             byte[] buf = readAll(f);
             if (buf.length == 0) return 0;
@@ -1240,6 +1249,51 @@ public final class Config {
             return Secret.isSealed(v) && Secret.open(v).isEmpty();
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /**
+     * 快照校准：磁盘有账号、快照却比磁盘多 → 快照是旧的，重写它（4.52.1）。
+     *
+     * <p>背景：4.51.8 修的是"删除时同步缩快照"，但存量安装里旧快照已经冻着
+     * 升级前删掉的账号（真机实测：磁盘 3 个、快照 6 个）。那些账号平时不出来，
+     * 一旦 gateway.json 意外读空就被整批复活 —— 用户看到的还是"删了又回来"。
+     *
+     * <p>为什么按磁盘为准是安全的：
+     * <ul>
+     *   <li>快照的唯一用途是"磁盘读空时兜底"。磁盘**非空**时快照永远不该说话，
+     *       所以它多出来的部分现在没有价值。</li>
+     *   <li>不存在"快照比磁盘新"的正常路径：每次成功的 save/saveQuick 都会
+     *       先写 gateway.json、再更新快照；快照只能落后或持平，不能领先。</li>
+     *   <li>磁盘更**多**（加过账号）→ 快照旧了，同样该重写。这条顺手把
+     *       "新加的账号不在快照里"的旧伤口也一起缝上。</li>
+     * </ul>
+     *
+     * <p>写法走的是普通 save 的快照路径（把当前磁盘内容复制过去），
+     * 不新建逻辑 —— 校准后的快照和"用户此刻手动保存一次"得到的完全一致。
+     */
+    /**
+     * 快照要不要按磁盘校准（纯函数，抽出来是为了自检能直接喂数字断言）。
+     *
+     * <p>规则：**磁盘有账号、且快照比磁盘多** → 校准。
+     * 磁盘为 0 时不校准（那种情形归 {@link #recoverFromSnapshot} 管，
+     * 正是它该从快照兜底的场合；此时快照多几个是**正常**的）。
+     */
+    static boolean shouldReconcile(int diskN, int snapN) {
+        return diskN > 0 && snapN > diskN;
+    }
+
+    private static void reconcileSnapshot(Context ctx, File live) {
+        try {
+            java.io.File snap = new java.io.File(live.getParentFile(), SNAPSHOT);
+            int diskN = countProvidersOnDisk(live);
+            int snapN = countProvidersOnDisk(snap);
+            if (!shouldReconcile(diskN, snapN)) return;
+            Log.w("快照校准：磁盘 " + diskN + " 个账号、快照却有 " + snapN
+                    + " 个（含升级前删掉的）——按磁盘重写快照，防止旧账号复活");
+            writeAtomically(snap, readAll(live));
+        } catch (Throwable t) {
+            Log.w("快照校准失败（不影响本次加载）：" + t);
         }
     }
 

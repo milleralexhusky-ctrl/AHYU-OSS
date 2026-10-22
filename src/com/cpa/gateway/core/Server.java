@@ -1883,6 +1883,71 @@ public final class Server {
             }
             return;
         }
+        if ("/v1/debug/ghosts".equals(path)) {
+            /* 调试包专用、**只读**：把"一个账号名可能在几个地方出现"逐处列出来。
+               用户报"删了两次还在"，而删除路径本身看起来是干净的
+               （ProviderEditor 移除 → save(userIntent=true) → 写盘 → 快照同步缩小）。
+               所以真凶多半在别处：内存副本、快照、usage 历史、模型目录前缀。
+               这个端点把这几处的真实内容摊开，不靠猜。 */
+            try {
+                JSONObject o = new JSONObject();
+                java.io.File files = Gateway.context().getFilesDir();
+                /* 1. 内存态（界面与选路看到的就是它） */
+                JSONArray mem = new JSONArray();
+                for (Config.Provider p : config.providers) {
+                    JSONObject row = new JSONObject();
+                    row.put("name", p.name);
+                    row.put("type", p.type);
+                    row.put("id", p.id == null ? "" : p.id);
+                    row.put("enabled", p.enabled);
+                    row.put("models", p.models.size());
+                    /* 客户端看到的模型前缀（"WB1/"）——它固化在 shortLabel 里，
+                       删账号后如果这里还在，用户就会觉得"没删干净"。 */
+                    row.put("label", ShortName.of(p));
+                    mem.put(row);
+                }
+                o.put("memory", mem);
+                o.put("memoryCount", config.providers.size());
+                /* 2. 磁盘 gateway.json */
+                o.put("diskCount", Config.countProvidersOnDisk(new java.io.File(files, "gateway.json")));
+                /* 3. 快照 gateway.accounts.json */
+                o.put("snapshotCount",
+                        Config.countProvidersOnDisk(new java.io.File(files, "gateway.accounts.json")));
+                /* 4. usage.tsv 里还留着的渠道名（历史记录留 30 天） */
+                JSONArray used = new JSONArray();
+                try {
+                    java.util.Set<String> names = new java.util.LinkedHashSet<>();
+                    java.io.File uf = new java.io.File(files, "usage.tsv");
+                    if (uf.isFile()) {
+                        java.io.BufferedReader br = new java.io.BufferedReader(
+                                new java.io.InputStreamReader(
+                                        new java.io.FileInputStream(uf), "UTF-8"));
+                        try {
+                            String line;
+                            while ((line = br.readLine()) != null) {
+                                String[] c = line.split("\t", -1);
+                                /* 列序（见 Usage 第 26 行的表头注释）：
+                                   0 时间戳 · 1 接口 · 2 模型 · **3 渠道** · 4 耗时 …
+                                   原先读的是 c[1]，那是"接口"，所以吐出来的全是
+                                   /v1/chat/completions 这类路径 —— 看着像 bug，
+                                   其实是这一列根本不含渠道名。 */
+                                if (c.length > 3 && !c[3].isEmpty()) names.add(c[3]);
+                            }
+                        } finally {
+                            try { br.close(); } catch (Exception ignored) { }
+                        }
+                    }
+                    for (String n : names) used.put(n);
+                } catch (Throwable t) {
+                    o.put("usageError", String.valueOf(t));
+                }
+                o.put("usageChannels", used);
+                writeJson(out, 200, o.toString(2));
+            } catch (Throwable t) {
+                writeError(out, path, 500, String.valueOf(t));
+            }
+            return;
+        }
         if ("/v1/debug/diagnostics".equals(path)) {
             /* 调试包专用：直接下载诊断 zip，方便用 curl 取回，也方便测试。 */
             byte[] zip = Diagnostics.build();
