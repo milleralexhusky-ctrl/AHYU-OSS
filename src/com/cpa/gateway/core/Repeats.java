@@ -65,6 +65,39 @@ public final class Repeats {
     }
 
     /**
+     * 当前这批候选里**有没有能用的** —— 有，才谈得上"客户端在白烧额度"。
+     *
+     * <h4>为什么这个判据是必需的（4.53.2 修的死循环）</h4>
+     * 原判据只有"内容指纹 + 次数"，于是出现这个循环：
+     * <pre>
+     *   账号额度耗尽 → 请求失败 → 客户端重试（内容当然一样）
+     *   → 被判成"卡死重试" → 返回 429 → 客户端更该重试 → 永远 429
+     * </pre>
+     * 真机实测：同一段内容从第 3 次一路被拒到第 25 次，客户端永远拿不到答案。
+     * **它把一个暂时性错误永久化成了硬错误** —— 额度恢复后也没机会再成功。
+     *
+     * <p>所以拦截的前置条件必须是"这次本来能成功"。候选池空 / 全在冷却与回避里，
+     * 说明失败原因是上游或账号，重复只是**重试的正常表现**，绝不能拦。
+     *
+     * @param cands 已算好的候选列表（可能为 null 或空）
+     * @return 是否存在至少一个当前没被冷却/回避的候选
+     */
+    public static boolean wouldSucceed(java.util.List<Router.Pick> cands) {
+        if (cands == null || cands.isEmpty()) return false;
+        long now = System.currentTimeMillis();
+        for (Router.Pick c : cands) {
+            if (c == null || c.provider == null) continue;
+            /* 额度确认用尽的账号不算"能成功"：那条路上的失败是账号侧的，
+               重试不是客户端的错。 */
+            if (c.provider.credits == 0) continue;
+            if (Router.accountAvoided(c.provider.name, now)) continue;
+            if (!Router.available(c.key())) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * 只记录、不拦截（4.37.0）。所有推理入口在 serve() 里各记一次，
      * 直连模型的质量标签才拿得到真实的"用户又发了一遍"信号。
      *

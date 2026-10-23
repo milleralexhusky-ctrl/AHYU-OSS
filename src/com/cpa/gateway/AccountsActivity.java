@@ -230,7 +230,29 @@ public class AccountsActivity extends Activity {
             if (p.credits >= 0) credits = (credits < 0 ? 0 : credits) + p.credits;
         }
         sub.append(" · ").append(models).append(" 个模型");
-        if (credits >= 0) sub.append(" · 积分 ").append((long) credits);
+        /* 积分这个数字**只说一半会误导**（4.53.2）。
+         *
+         * 真机实测：账号卡片写着"积分 500"，可每个模型发出去都回
+         * `14018 额度已用尽`。原因是余额读的是资源包的 `CapacityRemain`，
+         * 而真正决定能不能用的是同一个包的 `CycleCapacityRemain`（那个是 0）。
+         * 用户看到"还有 500"，第一反应是"网关坏了"，而不是"该换号了"。
+         *
+         * 所以：额度在**正被上游拒绝**时，不再单独显示那个数字，
+         * 而是说清"显示有、但实际被拒"。数字与事实不矛盾时才照常显示。 */
+        long nowSecC = System.currentTimeMillis() / 1000L;
+        boolean creditsRejected = false;
+        for (Config.Provider p : accounts) {
+            if (p.throttleUntil > nowSecC && p.throttleNote != null
+                    && p.throttleNote.contains("额度")) {
+                creditsRejected = true;
+                break;
+            }
+        }
+        if (credits >= 0 && creditsRejected) {
+            sub.append(" · 积分 ").append((long) credits).append("（上游仍判额度耗尽）");
+        } else if (credits >= 0) {
+            sub.append(" · 积分 ").append((long) credits);
+        }
         /* 限流提示：以前这里看不到任何原因，用户只知道"模型用不了"。
            只统计"还没到恢复时刻"的，过期的自然不计。 */
         long nowSec = System.currentTimeMillis() / 1000L;

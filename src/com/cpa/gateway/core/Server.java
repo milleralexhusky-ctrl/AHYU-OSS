@@ -5714,18 +5714,20 @@ public final class Server {
      * 流式走 DeferredWriter —— 首 token 之前失败就干净地换，客户端看不到换号。
      */
     private void serveVirtualOpenAi(Req r, OutputStream out, Proto.Req req) throws Exception {
-        // 卡死重试检测：同一段请求在短时间内被反复重发，直接停下并说明，
-        // 不要再转发（转发只会让模型把同样的答案再吐一遍，白烧额度）。
-        String repeated = Repeats.check(req);
-        if (repeated != null) {
-            Log.w("检测到重复请求（第 " + repeated + " 次，内容完全相同），已停止转发 → "
-                    + req.model);
-            writeError(out, r.path, 429,
-                    "检测到客户端在重复发送完全相同的请求（这是第 " + repeated
-                            + " 次）。网关已停止转发，以免白烧额度、并防止模型重复同一段回答。"
-                            + "请检查客户端是否卡在重试循环里。");
-            return;
-        }
+        /* 卡死重试检测**移到候选池判断之后**（4.53.2）。
+         *
+         * 原来它在最前面，而且判据只有"内容指纹 + 次数"。这造成一个死循环：
+         *   账号额度耗尽 → 请求失败 → 客户端重试（内容当然一样）
+         *   → 被判成"卡死重试" → 返 429 → 客户端更该重试 → 永远 429
+         * 也就是说：**它把一个暂时性错误永久化成了硬错误**，
+         * 客户端再也没有机会在额度恢复后再试成功。
+         * 真机实测（第 3 次起一路 429 到第 25 次）就是这个形态。
+         *
+         * 正确的判据是"**这次本来能成功，却还在重复问同一件事**"——
+         * 那才是客户端卡在重试循环、白烧额度的特征。
+         * 所以先看候选池：池子空说明是**上游/账号的原因**，
+         * 这时重复与否都不该拦，要如实把上游的原因报回去（那是客户端需要知道的）。
+         */
         Classifier.Kind kind = Classifier.of(req);
         Log.i("请求分类：" + kind.label() + "（" + kind.why + "）"
                 + (req.tools.isEmpty() ? "" : " · 带 " + req.tools.size() + " 个工具"));
@@ -5745,6 +5747,31 @@ public final class Server {
                     .append("(").append(Math.round(cands.get(i).score)).append(")");
         }
         Log.i("虚拟模型 " + req.model + " 选路：" + picked);
+
+        /* 候选池非空 = 这次**有成功的可能**。只有在这种前提下，"同一段内容被反复重发"
+         * 才说明客户端卡在重试循环里（见本方法开头的注释：额度耗尽时池子为空/全在回避，
+         * 那种情况绝不拦，要如实把上游原因报回去）。
+         *
+         * 另外**只在真的会白烧额度时才拦**：池子里有可用候选（可用 = 不在冷却/回避里），
+         * 说明转发出去大概率能拿到答案、而客户端还是不停重发 —— 那才是要治的形态。 */
+        if (Repeats.wouldSucceed(cands)) {
+            String repeated = Repeats.check(req);
+            if (repeated != null) {
+                Log.w("检测到重复请求（第 " + repeated + " 次，内容完全相同），"
+                        + "而当前有可用候选，已停止转发 → " + req.model);
+                writeError(out, r.path, 429,
+                        "检测到客户端在重复发送完全相同的请求（这是第 " + repeated
+                                + " 次），而当前账号是可用的 —— 网关已停止转发，"
+                                + "以免白烧额度、并防止模型重复同一段回答。"
+                                + "请检查客户端是否卡在重试循环里。");
+                return;
+            }
+        } else {
+            /* 池子不可用时的重复**不是客户端的错**（它在重试一个失败的服务）。
+               这里只记录计数，不拦 —— 把上游原因如实报回去，
+               并让次数继续累积，等池子恢复后如果还在重复才拦。 */
+            Repeats.note(req);
+        }
 
         if (!req.stream) {
             Exception last = null;
@@ -5909,7 +5936,16 @@ public final class Server {
             writeScopedFailure(out, r, last);
             return;
         }
-        /* 已经发过响应头/`: ready`：不能再写 HTTP 错误，只能按 SSE 发错误事件并收尾。 */
+        /* 已经发过响应头/`: ready`：不能再写 HTTP 错误，只能按 SSE 发错误事件并收尾。
+         *
+         * 实测（4.53.2）：这条路的**收尾本来就是对的** —— 每轮请求结束时会走
+         * `Conn.endStream()` 把 chunked 关掉（写 `0\r\n\r\n`），客户端能立刻知道流结束了。
+         * 我一度以为这里是"流不闭合导致客户端一直等"，为此加了一个 finishFailed()，
+         * 后来查出 endStream() 早就在做同一件事，于是把那半段删了 ——
+         * 不留"看起来在修 bug 其实是死代码"的东西。
+         *
+         * 真实的客户端现象见 serveVirtualOpenAi 开头那段：根因是**上游 11128/14018**，
+         * 以及重复请求被判死后形成的 429 死循环，不是这条收尾。 */
         if (dw.opened() && !dw.committed()) {
             try {
                 JSONObject err = new JSONObject();
@@ -5932,6 +5968,9 @@ public final class Server {
     private static final String FALLBACK_TEXT =
             "⚠️ 上游账号暂时都不通，这次没能拿到回答，请稍后重试。（网关提示，不是模型输出）";
 
+    /** 包级可见：自检要断言这段文案自述了「不是模型输出」，见 checkNoFakeAnswer。 */
+    static final String FALLBACK_TEXT_FOR_TEST = FALLBACK_TEXT;
+
     /**
      * 兜底：上游全挂了也返回一个合法回答，而不是让客户端报错。
      *
@@ -5950,10 +5989,19 @@ public final class Server {
                 s.finish("stop", null);
                 w.flush();
             } else {
-                Fronts.Collector c = new Fronts.Collector();
-                c.text(FALLBACK_TEXT);
-                c.finish("stop", null);
-                writeJson(out, 200, Fronts.OpenAiFront.render(req == null ? "auto" : req.model, c));
+                /* 非流式**可以**改状态码，所以不该再伪装成 200 回答（4.53.2）。
+                 *
+                 * 实测两条路径对同一个上游故障的说法完全相反：
+                 *   Anthropic 非流式 → 500 + "upstream HTTP 429 … 14018 额度已用尽"（真话）
+                 *   OpenAI   非流式 → 200 + "⚠️ 上游账号暂时都不通…"（占位文案，像正常回答）
+                 *
+                 * 后者会让用户和客户端都以为"模型答了这么一句"，从而看不出真正原因
+                 * （额度耗尽 / 渠道校验），也就不知道该换号。既然非流式还没写响应头，
+                 * 就按 Anthropic 那条的做法如实报错 —— 两条路径对同一个故障应当说法一致。
+                 *
+                 * 流式仍然只能返回占位文案：响应头与 `: ready` 在试第一个候选前就发出去了，
+                 * 状态码改不了。这是传输层的硬约束，不是取舍。 */
+                writeError(out, r == null ? "/v1/chat/completions" : r.path, 502, realError);
             }
         } catch (Exception e) {
             try {

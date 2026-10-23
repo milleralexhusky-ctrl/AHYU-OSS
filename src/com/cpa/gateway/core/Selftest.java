@@ -82,6 +82,9 @@ public final class Selftest {
         add(out, "下拉刷新手势（方向 / 阈值 / 不抢点击与滚动）", Selftest::checkPullGesture);
         add(out, "缓存价成本分段（缺价按全价 / 命中数不可超输入）", Selftest::checkCachedCost);
         add(out, "额度未知（-1）不能被当成额度用尽", Selftest::checkCreditsUnknown);
+        add(out, "额度取「按周期剩余」而不是总容量（防显示 500 却发不出去）",
+                Selftest::checkCreditFieldChoice);
+        add(out, "上游全挂时非流式必须如实报错，不伪装成回答", Selftest::checkNoFakeAnswer);
         add(out, "截断率与内容率的信号口径", Selftest::checkContentSignalScope);
         add(out, "缓存命中率的分母只算带缓存列的行", Selftest::checkCacheRateDenominator);
         add(out, "删除账号不会从快照复活（幽灵账号）", Selftest::checkSnapshotNoResurrect);
@@ -697,6 +700,97 @@ public final class Selftest {
         /* 5) 没收录的模型仍然返回 -1（未知 ≠ 免费） */
         if (Prices.costUsd("definitely-not-a-real-model-zz9", 1000, 500, 1000) != -1) {
             return "查不到价格的模型应返回 -1（未知），不能当成 0";
+        }
+        return null;
+    }
+
+    /**
+     * 额度必须取「按周期剩余」，不能取「总容量」（4.53.2）。
+     *
+     * <p>真机实测的原始包（同一个资源包，同一时刻）：
+     * <pre>
+     *   CapacityRemain       = 500      ← 总容量口径，原来读的是这个
+     *   CycleCapacityRemain  = 0        ← 按周期口径，真正决定能不能用
+     *   推理请求            = 14018 额度已用尽
+     * </pre>
+     * 读错字段的后果是双向的、而且互相矛盾：
+     * <ul>
+     *   <li>界面显示「积分 500」，用户以为网关坏了、而不是"该换号"；</li>
+     *   <li>同时 {@code p.credits=500} 又让它在选路里不被扣分，
+     *       于是每次都去撞一个注定 14018 的账号。</li>
+     * </ul>
+     *
+     * <p>这条自检钉**选择逻辑本身**：直接构造两种形态的回包，断言
+     * 「有周期字段且为 0」时算 0，而「完全没有周期字段」时才回落到总量字段。
+     * 两者必须分开 —— 把"为 0"和"字段缺失"混为一谈，会让一个用完的包
+     * 被总量字段救回来，等于没修。
+     */
+    /**
+     * 上游全挂时，**非流式**必须如实报错，不能伪装成一段回答（4.53.2）。
+     *
+     * <p>实测两条路径对同一个上游故障的说法完全相反：
+     * <pre>
+     *   Anthropic 非流式 → 500 + "upstream HTTP 429 … 14018 额度已用尽"   （真话）
+     *   OpenAI   非流式 → 200 + "⚠️ 上游账号暂时都不通…"                  （占位文案）
+     * </pre>
+     * 后者让用户以为"模型答了这么一句"，看不出真原因是额度耗尽还是渠道校验，
+     * 也就不知道该换号 —— 用户原话"说什么连接中就是不出来"正是从这里来的。
+     *
+     * <p>流式做不到：响应头与 `: ready` 在试第一个候选前就发出去了，状态码改不了。
+     * 所以这条断言只钉**非流式**这条路 —— 那里本来就能改状态码，没有理由不说真话。
+     *
+     * <p>这里能测的只有"兜底文案本身是否明确标注了它不是回答"（真正发不发由
+     * writeFallback 的分支决定，需要 IO 才能测）。所以钉两件事：
+     * 文案必须自带"不是模型输出"的自述，以及文案不能长得像正常回答。
+     */
+    private static String checkNoFakeAnswer() {
+        String t = Server.FALLBACK_TEXT_FOR_TEST;
+        if (t == null || t.isEmpty()) return "兜底文案是空的";
+        if (!t.contains("网关提示") && !t.contains("不是模型输出")) {
+            return "兜底文案没有说明它不是模型回答 —— 用户会把它当成内容："
+                    + t;
+        }
+        return null;
+    }
+
+    private static String checkCreditFieldChoice() {
+        try {
+            /* 形态一：周期字段存在且为 0（真机形态，逐字照抄实测回包）
+               → 必须算 0，**不能**回落到 CapacityRemain 的 500 */
+            org.json.JSONObject cycleZero = new org.json.JSONObject();
+            cycleZero.put("CycleCapacityRemain", 0);
+            cycleZero.put("CapacityRemain", 500);
+            Double got = WbTasks.cycleRemain(cycleZero);
+            if (got == null) {
+                return "带 CycleCapacityRemain 的回包被判成「字段缺失」—— 会回落到总量字段";
+            }
+            if (got.doubleValue() != 0) {
+                return "周期剩余为 0 时算出了 " + got + "（真机是 500/0 并存，"
+                        + "取错字段就会显示「还有 500」却发不出去）";
+            }
+            /* 形态二：只有总量字段（别的产品线）→ 才允许回落，否则兜底失效 */
+            org.json.JSONObject onlyTotal = new org.json.JSONObject();
+            onlyTotal.put("CapacityRemain", 300);
+            Double got2 = WbTasks.cycleRemain(onlyTotal);
+            if (got2 == null || got2.doubleValue() != 300) {
+                return "只有 CapacityRemain 的回包没回落到总量字段（兜底失效）：" + got2;
+            }
+            /* 形态三：两个字段都没有 → 必须是 null（"未知"），不能是 0。
+               返回 0 会让一个其实有额度的账号在选路里被扣 200 分。 */
+            if (WbTasks.cycleRemain(new org.json.JSONObject()) != null) {
+                return "两个字段都没有时该返回「未知」，却给了一个数 —— "
+                        + "会把读不到字段的好账号当成额度耗尽沉底";
+            }
+            /* 形态四：Precise 优先于普通字段（上游同时给两个时以精确值为准） */
+            org.json.JSONObject both = new org.json.JSONObject();
+            both.put("CycleCapacityRemain", 10);
+            both.put("CycleCapacityRemainPrecise", "42");
+            Double got4 = WbTasks.cycleRemain(both);
+            if (got4 == null || got4.doubleValue() != 42) {
+                return "同时有精确值与非精确值时应取精确值，现在取了 " + got4;
+            }
+        } catch (Throwable t) {
+            return "构造回包失败：" + t;
         }
         return null;
     }
@@ -2168,6 +2262,40 @@ public final class Selftest {
         Proto.Req c = repeatSample(nonce);
         if (Repeats.note(c) != 3) return "第三次应为 3";
         if (!"3".equals(Repeats.check(c))) return "第 3 次应返回次数 3";
+
+        /* ---- 4.53.2：拦截的**前置条件**是"这次本来能成功" ----
+         *
+         * 真机死循环（实测到第 25 次一路 429）：
+         *   账号额度耗尽 → 失败 → 客户端重试（内容当然一样）
+         *   → 被判成"卡死重试" → 429 → 客户端更该重试 → 永远 429
+         * 它把暂时性错误永久化成了硬错误。
+         *
+         * 所以钉住 wouldSucceed 这个闸门本身：池子空 / 全不可用时**不许拦**。 */
+        if (Repeats.wouldSucceed(null)) return "候选池为 null 时不该判定为「能成功」";
+        if (Repeats.wouldSucceed(new java.util.ArrayList<Router.Pick>())) {
+            return "空候选池不该判定为「能成功」—— 会把「上游没额度」的重复重试也拦掉，"
+                    + "客户端就永远等不到额度恢复后的那次成功";
+        }
+        /* 额度确认用尽的账号不算"能成功"：那条路的重复是重试，不是客户端卡死。 */
+        Config.Provider broke = new Config.Provider();
+        broke.name = "repeat-selftest-broke";
+        broke.credits = 0;
+        java.util.List<Router.Pick> drained = new java.util.ArrayList<>();
+        drained.add(Router.newPick(broke, "selftest-repeat-model"));
+        if (Repeats.wouldSucceed(drained)) {
+            return "额度用尽的账号被判成「能成功」—— 那正是真机上把客户端锁死在 429 的原因："
+                    + "额度没了本来就只能失败，重试是正常的，不该被当成「卡死重试」";
+        }
+        /* 反过来：有一个额度正常、不在回避里的候选 → 算能成功（这时才该拦重复） */
+        Config.Provider good = new Config.Provider();
+        good.name = "repeat-selftest-good";
+        good.credits = 12345;
+        java.util.List<Router.Pick> live = new java.util.ArrayList<>();
+        live.add(Router.newPick(good, "selftest-repeat-model"));
+        if (!Repeats.wouldSucceed(live)) {
+            return "有额度充足、不在回避的候选时却没判定为「能成功」—— "
+                    + "那样「客户端卡在重试循环里白烧额度」就再也拦不住了";
+        }
         return null;
     }
 

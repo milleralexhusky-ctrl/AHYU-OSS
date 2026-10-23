@@ -155,9 +155,21 @@ public final class WbTasks {
             if (a == null) continue;
             JSONObject row = new JSONObject();
             row.put("name", a.optString("PackageName", "资源包"));
-            row.put("remain", num(a, "CapacityRemainPrecise", "CapacityRemain"));
-            row.put("size", num(a, "CapacitySizePrecise", "CapacitySize"));
-            row.put("used", num(a, "CapacityUsedPrecise", "CapacityUsed"));
+            /* 用 **CycleCapacityRemain** 而不是 CapacityRemain（4.53.2 修正）。
+             *
+             * 真机实测：同一个资源包 `CapacityRemain = 500`、`CycleCapacityRemain = 0`，
+             * 而推理请求一律回 `14018 额度已用尽` —— 说明**真正决定能不能用的是按周期的那个**。
+             * 原来读 CapacityRemain，于是界面显示"还有 500"，用户以为网关坏了。
+             * 这不是显示口径问题：那个数字被写进 p.credits，
+             * 而 p.credits==0 会让这个账号在选路里被扣 200 分（见 Router.score）。
+             *
+             * 兜底顺序：周期字段优先，读不到再退回总量字段（别的产品线可能只有后者）。 */
+            Double cyc = cycleRemain(a);
+            row.put("remain", cyc == null ? 0 : cyc.doubleValue());
+            row.put("size", num(a, "CycleCapacitySizePrecise",
+                    a.has("CycleCapacitySize") ? "CycleCapacitySize" : "CapacitySize"));
+            row.put("used", num(a, "CycleCapacityUsedPrecise",
+                    a.has("CycleCapacityUsed") ? "CycleCapacityUsed" : "CapacityUsed"));
             row.put("end", a.optString("CycleEndTime", ""));
             out.put(row);
         }
@@ -298,18 +310,66 @@ public final class WbTasks {
 
     /* --------------------------------------------------------------- balance */
 
+    /**
+     * 这个账号现在**还能用多少**（写进 {@code p.credits}，选路会用）。
+     *
+     * <h4>口径在 4.53.2 改了：按周期剩余求和，不用 TotalDosage</h4>
+     * 原来直接返回上游的 {@code TotalDosage}。真机实测它是**总容量**口径：
+     * 回 500，而同一个响应里每个包按周期算的剩余是 0，推理请求也一律回
+     * {@code 14018 额度已用尽}。
+     *
+     * <p>这个数字不只是显示：{@code p.credits == 0} 会让账号在
+     * {@link Router#score} 里被扣 200 分（断崖式，比"冷却中"还重）。
+     * 所以口径错了会**同时**造成两件事：界面上写着"还有 500"骗用户，
+     * 而选路又因为真实失败把它沉底 —— 两边对不上，查的时候互相矛盾。
+     *
+     * <p>现在按周期剩余求和：全为 0 就返回 0，如实表达"现在用不了"。
+     * 一个包都读不到（字段改名等）才返回 -1（未知，不参与扣分）。
+     */
     public static double credits(Config.Provider p) throws Exception {
         JSONObject o = call(p, "/v2/billing/meter/get-user-resource", "POST", new JSONObject());
         JSONObject data = o.optJSONObject("data");
         JSONObject resp = data == null ? null : data.optJSONObject("Response");
         JSONObject inner = resp == null ? null : resp.optJSONObject("Data");
-        if (inner != null) {
-            Double total = Proto.optDouble(inner, "TotalDosage");
-            if (total != null) return total.doubleValue();
-            Double remain = Proto.optDouble(inner, "RemainingDosage");
-            if (remain != null) return remain.doubleValue();
+        if (inner == null) return -1;
+        JSONArray arr = inner.optJSONArray("Accounts");
+        if (arr != null && arr.length() > 0) {
+            double sum = 0;
+            int seen = 0;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject a = arr.optJSONObject(i);
+                if (a == null) continue;
+                Double v = cycleRemain(a);
+                if (v != null) {
+                    seen++;
+                    if (v.doubleValue() > 0) sum += v.doubleValue();
+                }
+            }
+            /* 至少读到过一个包才认这个结果；一个都读不到说明字段对不上，
+               返回 -1（未知）比返回 0（"用完了"）安全 —— 后者会把好账号也沉底。 */
+            if (seen > 0) return sum;
         }
+        Double remain = Proto.optDouble(inner, "RemainingDosage");
+        if (remain != null) return remain.doubleValue();
         return -1;
+    }
+
+    /**
+     * 一个资源包**按周期**的剩余额度；字段缺失返回 null（≠ 0）。
+     *
+     * <p>"缺失"和"为 0"必须分开：0 是"这个周期用完了"的明确事实，
+     * 缺失只是"这个产品线没这个字段"。混在一起会让回落到总量字段时
+     * 把一个已经用完的包算成还能用。
+     */
+    /** 包级可见：自检要直接验证「哪个字段优先」，见 Selftest.checkCreditFieldChoice。 */
+    static Double cycleRemain(JSONObject a) {
+        if (a.has("CycleCapacityRemainPrecise") || a.has("CycleCapacityRemain")) {
+            return num(a, "CycleCapacityRemainPrecise", "CycleCapacityRemain");
+        }
+        if (a.has("CapacityRemainPrecise") || a.has("CapacityRemain")) {
+            return num(a, "CapacityRemainPrecise", "CapacityRemain");
+        }
+        return null;
     }
 
     /**
@@ -363,9 +423,19 @@ public final class WbTasks {
                 if (a == null) continue;
                 JSONObject row = new JSONObject();
                 row.put("name", a.optString("PackageName", "资源包"));
-                row.put("size", num(a, "CapacitySizePrecise", "CapacitySize"));
-                row.put("used", num(a, "CapacityUsedPrecise", "CapacityUsed"));
-                double remain = num(a, "CapacityRemainPrecise", "CapacityRemain");
+                /* 与 packs() 同一口径：按周期字段判可用额度（见那里的注释）。
+                   两处必须一致，否则"额度构成"里某张包显示还剩 500、
+                   合计却是 0，用户会以为是两套数据打架。 */
+                boolean hasCycle = a.has("CycleCapacityRemain")
+                        || a.has("CycleCapacityRemainPrecise");
+                Double cyc = cycleRemain(a);
+                double remain = cyc == null ? 0 : cyc.doubleValue();
+                row.put("size", hasCycle
+                        ? num(a, "CycleCapacitySizePrecise", "CycleCapacitySize")
+                        : num(a, "CapacitySizePrecise", "CapacitySize"));
+                row.put("used", hasCycle
+                        ? num(a, "CycleCapacityUsedPrecise", "CycleCapacityUsed")
+                        : num(a, "CapacityUsedPrecise", "CapacityUsed"));
                 row.put("remain", remain);
                 row.put("end", a.optString("CycleEndTime", ""));
                 packs.put(row);
@@ -381,11 +451,20 @@ public final class WbTasks {
                 }
             }
             out.put("ok", true);
-            /* 上游给的 TotalDosage 是它自己算的可用总额（含还没被动用的包），
-               比"把每个包剩余加起来"更可信；拿不到才回落。 */
-            double shown = upstreamTotal != null && upstreamTotal.doubleValue() > 0
-                    ? upstreamTotal.doubleValue() : total;
-            out.put("total", Math.round(shown * 100) / 100.0);
+            /* 用**各包周期剩余之和**，不再用上游的 TotalDosage（4.53.2 修正）。
+             *
+             * 原来优先信 TotalDosage，理由是"上游自己算的更可信"。真机实测推翻了它：
+             * TotalDosage = 500，而同一个响应里每个包按周期算的剩余是 0，
+             * 推理请求也一律回 14018 额度已用尽 —— 那个 500 是**总容量**口径，
+             * 不是"现在还能用多少"。
+             *
+             * 界面拿这个数字当"还有多少额度"显示，于是出现"显示 500、实际发不出去"。
+             * 宁可显示"0"，也不要显示一个让人以为还能用的数字。
+             * 仍把上游原值放在 upstreamTotal 里，供排查时对照。 */
+            out.put("total", Math.round(total * 100) / 100.0);
+            if (upstreamTotal != null) {
+                out.put("upstreamTotal", upstreamTotal.doubleValue());
+            }
             out.put("packs", packs);
             if (soonest != null) out.put("soonest", soonest);
         } catch (Throwable t) {
