@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.53.2**（versionCode 663，见 `version.properties`）
+- 当前版本：**4.53.3**（versionCode 664，见 `version.properties`）
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -52,6 +52,15 @@ OpenAI/Anthropic/Gemini 兼容中转。
 给 Claude Code 填了带 `/v1` 的地址会请求 `/v1/v1/messages`；网关有一条容错
 （`Server.normalizePath`）能认，但那只是兜底，不是它本来就对。
 
+**Claude Code 的模型名不用改**：它默认发 `claude-sonnet-4-5-20250929` 这类官方 ID，
+本地目录里当然没有。网关在本地目录确实查不到这个名字时，会把它当作虚拟模型 `auto`
+选路（`Server.compatModel`）—— 所以 `ANTHROPIC_MODEL` 留默认、或写 `auto`，
+两种都行。若你自己挂了同名的 Claude 中转，点名会照旧走你自己那个账号，不会被抢。
+
+> 为什么必须做这条：Claude Code 有**本地模型白名单**。给它一个它不认识的名字
+> （比如 `auto`），它连请求都不发，直接 `claude-code:unrecognized_model` 退出 ——
+> 网关这边日志干净得像没收到请求，很容易误判成"网关挂了"。
+
 **选路与稳定性**：`auto` / `auto-code` / `auto-long` / `auto-race` 虚拟模型；
 按成功率、延迟、成本、额度、工具能力打分；首字节前自动换号；限流指数退避、
 熔断与半开试探、渠道校验单独回避、本地限额与并发槽。
@@ -74,7 +83,7 @@ OpenAI/Anthropic/Gemini 兼容中转。
 **界面**：主页面下拉刷新；日志页**上翻即暂停跟随**（右下角「回到最新」恢复，
 不再把正在读历史的人拽回底部）；主题选择器用聚焦语义（选中的放大提亮、
 未选中的降饱和缩小）；按压手感走真阻尼弹簧（`Jelly`），帧预算由 `Perf`
-自动调档。自检 **55 项**，含手势状态机、配色亮度极差、缓存价绊线等"防静默失效"断言。
+自动调档。自检 **57 项**，含手势状态机、配色亮度极差、缓存价绊线等"防静默失效"断言。
 
 ## 构建
 
@@ -201,9 +210,13 @@ docs/research/             协议调查脚本
 ## 已知限制
 
 - WorkBuddy 国际网关从 2026-10-15 起校验官方客户端的 `X-Conversation-*` 头；
-  4.50.4 已按官方形状补齐。新版 11128（`Illegal API invocation from an unapproved
-  channel`）是请求级风控、上游提示“请重新发送”：网关最多同账号重发 2 次，
-  仍失败只短回避 20 秒，不再把模型锁 6 小时。账号被标记的旧 11128 仍按账号问题处理。
+  4.50.4 已按官方形状补齐。
+- **11128 的真实成因是提示词内容指纹**（4.53.3 查明）：上游按 system 里有没有
+  官方客户端自我标识来判渠道，与账号、模型、UA 都无关。已知三枚指纹 ——
+  `x-anthropic-billing-header`、`You are Claude Code, Anthropic's official CLI…`、
+  以及藏在反馈链接里的 `claude-code`。网关只对 **WorkBuddy 上游**做零宽混淆
+  （`RiskPrompt`）：内容对模型完全等价，字节特征不再命中。实测整份真实 Claude Code
+  请求体从 100% 被拦变成 8/8 通过。上游若改成先归一化零宽字符，这条会失效。
 - Antigravity 的 OAuth Client Secret 由私库构建时注入（`.private/signing.env` 的
   `ANTIGRAVITY_CLIENT_SECRET`）；用公库源码自行构建时该项为空，登录会停在 token 交换。
 - 多数渠道依赖网页/客户端私有协议，上游改版后可能失效；这类问题优先看

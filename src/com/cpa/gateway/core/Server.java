@@ -2480,6 +2480,7 @@ public final class Server {
                 try {
                     JSONObject body = new JSONObject(r.body.isEmpty() ? "{}" : r.body);
                     Proto.Req req = Fronts.GeminiFront.parse(model, body);
+        req.model = compatModel(req.model);
                     JSONObject o = new JSONObject();
                     o.put("totalTokens", Classifier.estimateTokens(req));
                     writeJson(out, 200, o.toString());
@@ -3518,6 +3519,65 @@ public final class Server {
     }
 
     /**
+     * 客户端自带的 Anthropic 模型名 → 本机虚拟模型的兼容映射。
+     *
+     * <h2>为什么必须有这一条</h2>
+     *
+     * Claude Code 有**自己的模型白名单**，在本地就把名字校验一遍：
+     * 实测给它 {@code ANTHROPIC_MODEL=auto} 时，它连一个请求都不发，
+     * 直接在本地报 {@code claude-code:unrecognized_model} 退出 ——
+     * 网关这边日志干干净净，看起来像"网关挂了"，其实是客户端没开口。
+     *
+     * <p>它默认发的是 {@code claude-sonnet-4-5-20250929} 这类官方 ID，
+     * 而本机模型目录里是 {@code hy3} / {@code glm-5.3} / {@code deepseek-*},
+     * 于是 404「没有账号提供模型 claude-…」。两头都过不去。
+     *
+     * <h2>为什么映射到 auto 而不是某个具体模型</h2>
+     *
+     * 映射到具体模型等于替用户挑模型，而且那个模型一坏就整条路断。
+     * 映射到 {@code auto} 才是本机的正确语义：**由网关按成功率/延迟/成本自己选**，
+     * 并且能自动换号、自动换模型 —— 这正是网关存在的意义。
+     *
+     * <h2>边界（很重要）</h2>
+     *
+     * <ul>
+     *   <li>只在**本地目录确实没有**这个名字时才映射。用户自己配了同名账号/模型
+     *       （比如真的挂了一个 Claude 中转），点名就照点名走，绝不抢。</li>
+     *   <li>只认 {@code claude-*} / {@code anthropic.claude-*} 前缀 ——
+     *       这是 Anthropic 官方的模型 ID 形状，不会误伤 {@code glm-5.3} 之类。</li>
+     *   <li>命中会打一条可见日志，并回报给客户端的是它要的名字，不是 auto。</li>
+     * </ul>
+     *
+     * @return 映射后的模型名；不需要映射时返回原值
+     */
+    static String compatModel(String model) {
+        if (model == null || model.isEmpty()) return model;
+        String m = model.trim();
+        int slash = m.indexOf('/');
+        /* 带前缀的点名（账号/模型）不碰：那是用户明确指定的路由。 */
+        if (slash > 0) return model;
+        if (Router.isVirtual(m)) return model;
+        String low = m.toLowerCase(java.util.Locale.US);
+        boolean looksAnthropic = low.startsWith("claude-")
+                || low.startsWith("anthropic.claude-")
+                /* Anthropic 在 Vertex/Bedrock 上的名字。 */
+                || low.startsWith("anthropic/claude-")
+                || low.startsWith("claude.");
+        if (!looksAnthropic) return model;
+        /* 本地目录里真有这个名字（用户自己挂了 Claude 中转）就照旧。 */
+        for (Config.Provider p : Gateway.config().providers) {
+            if (!p.dispatchable()) continue;
+            for (String pm : p.models) {
+                if (pm != null && pm.equalsIgnoreCase(m)) return model;
+            }
+        }
+        Log.i("客户端发来 Anthropic 模型名 " + m + "，本地目录没有它，"
+                + "已按虚拟模型 auto 选路（Claude Code 有本地模型白名单，"
+                + "直接报 404 会让它连请求都不发）");
+        return Router.AUTO;
+    }
+
+    /**
      * 点名了一个账号，但同名模型在别的账号上也有：把点名的排第一，其余按分数跟在后面。
      *
      * 排序与虚拟模型、裸名路径用的是同一套打分（{@link Router#scorePublic}），
@@ -4404,6 +4464,7 @@ public final class Server {
             if (body.has("options")) chatBody.put("options", body.opt("options"));
         }
         Proto.Req req = Fronts.OllamaFront.parse(chatBody);
+        req.model = compatModel(req.model);
         RequestCheck.check(req);
         if (Router.isVirtual(req.model)) {
             String real = resolveVirtual(req.model, req);
@@ -5325,6 +5386,7 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.OpenAiFront.parse(body);
+        req.model = compatModel(req.model);
         RequestCheck.check(req);
         req.ephemeral = body.optBoolean("_ephemeral", false);
         /* 响应保真（4.50.0）：只有"canonical 表达不了"的请求才走原样透传。
@@ -6066,6 +6128,7 @@ public final class Server {
         int tokens;
         try {
             Proto.Req req = Fronts.AnthropicFront.parse(body);
+        req.model = compatModel(req.model);
             RequestCheck.check(req);
             tokens = Classifier.estimateTokens(req);
         } catch (Throwable t) {
@@ -6096,6 +6159,7 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.AnthropicFront.parse(body);
+        req.model = compatModel(req.model);
         /* Claude Code 把 1M 上下文、细粒度工具流、interleaved thinking 这些能力
            都写在 anthropic-beta 里。网关出站也是 Anthropic 时原样带上，
            否则同一个地址、同一个 Key，走网关会比直连少能力。 */
@@ -6270,6 +6334,7 @@ public final class Server {
             return;
         }
         Proto.Req req = Fronts.GeminiFront.parse(model, body);
+        req.model = compatModel(req.model);
         RequestCheck.check(req);
         // 与 Anthropic / Responses 对齐：虚拟模型先解析成具体候选，别让 auto 在 Gemini 面上 404
         String effective = model;
@@ -6547,6 +6612,7 @@ public final class Server {
             if (converted.length() > 0) chat.put("tools", converted);
         }
         Proto.Req req = Fronts.OpenAiFront.parse(chat);
+        req.model = compatModel(req.model);
         RequestCheck.check(req);
         if (Router.isVirtual(req.model)) {
             String real = resolveVirtual(req.model, req);

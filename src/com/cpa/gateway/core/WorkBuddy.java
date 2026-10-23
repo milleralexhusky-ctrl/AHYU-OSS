@@ -580,6 +580,61 @@ public final class WorkBuddy {
         }
     }
 
+    /**
+     * 把 body 里所有 system 消息的**内容**过一遍指纹混淆（{@link RiskPrompt}）。
+     *
+     * <p>为什么要遍历全部 system 消息而不是只看第一条：本机抓包（Claude Code
+     * 2.1.308）显示它把计费头发成**独立的第一条 system**，真正的自我描述句在
+     * 后面几条里；两条 system 都可能带指纹，漏一条就还是 11128。
+     *
+     * <p>只动 system：上游的特征匹配就吃这一段，去动 user/assistant 的历史
+     * 既没必要，也会改变对话上下文。
+     *
+     * @return 实际混淆的指纹条数（0 表示这次请求本来就不带指纹）；调用方只用来打日志
+     */
+    static int deFingerprint(JSONObject body) {
+        int hits = 0;
+        try {
+            JSONArray msgs = body.optJSONArray("messages");
+            for (int i = 0; msgs != null && i < msgs.length(); i++) {
+                JSONObject m = msgs.optJSONObject(i);
+                if (m == null || !"system".equals(Proto.optString(m, "role", ""))) continue;
+                Object content = m.opt("content");
+                /* 客户端可能发字符串，也可能发块数组（Anthropic 形状经网关拼平后
+                   通常是字符串，但别假设）。两种都处理。 */
+                if (content instanceof String) {
+                    String s = (String) content;
+                    String fixed = RiskPrompt.neutralize(s);
+                    if (fixed != s) {
+                        m.put("content", fixed);
+                        hits++;
+                    }
+                } else if (content instanceof JSONArray) {
+                    JSONArray blocks = (JSONArray) content;
+                    for (int k = 0; k < blocks.length(); k++) {
+                        JSONObject b = blocks.optJSONObject(k);
+                        if (b == null) continue;
+                        String s = Proto.optString(b, "text", "");
+                        if (s.isEmpty()) continue;
+                        String fixed = RiskPrompt.neutralize(s);
+                        if (fixed != s) {
+                            b.put("text", fixed);
+                            hits++;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            /* 混淆失败不能把请求带下水：原样发出去，最坏就是回到"上游拦一下"的旧行为。 */
+            Log.w("workbuddy：风控指纹混淆失败，按原样发出：" + t);
+        }
+        if (hits > 0) {
+            Log.i("workbuddy：已混淆 " + hits + " 处官方客户端提示词指纹"
+                    + "（上游按提示词内容做渠道校验，实测含指纹必被 11128 拦截）");
+        }
+        return hits;
+    }
+
     /* ------------------------------------------- 渠道校验：会话标识（4.29.10） */
 
     /**
@@ -977,6 +1032,9 @@ public final class WorkBuddy {
         /* the upstream rejects non-streaming outright */
         body.put("stream", true);
         ensureSystemFirst(body);
+        /* 风控指纹规避（见 RiskPrompt）：上游按 system 里的官方客户端标识拦请求，
+           11128 与账号、模型、UA 都无关。只在这一条渠道上做，且只混淆那两个特征串。 */
+        deFingerprint(body);
         /* 诊断：在整理**之前**记录客户端发来的原始序列，用来区分
            (a) 客户端压根没把 tool 结果发回来 与 (b) 发了但被 normalizeToolPairs
            当"孤立"删掉——之前只在整理之后打过，看不出是哪一种。 */

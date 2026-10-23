@@ -93,6 +93,9 @@ public final class Selftest {
         add(out, "额度耗尽归为 quota（WorkBuddy 14018 不能落进限流）", Selftest::checkQuotaKind);
         add(out, "账号级回避（额度/凭证）只扣分、不硬挡", Selftest::checkAccountAvoid);
         add(out, "历史渠道标记为「已删除」而不是当账号列出", Selftest::checkRetiredChannels);
+        add(out, "风控指纹混淆：内容等价、指纹失效、不误伤", Selftest::checkRiskPrompt);
+        add(out, "Claude 模型名兼容（claude-* → auto，别抢用户的同名账号）",
+                Selftest::checkModelCompat);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -753,8 +756,121 @@ public final class Selftest {
         return null;
     }
 
-    private static String checkCreditFieldChoice() {
-        try {
+    /**
+     * 风控指纹混淆（{@link RiskPrompt}）。
+     *
+     * 这里要同时钉住三件事，少一件这套东西就是错的：
+     *   · 指纹**确实失效**（上游那套字节匹配不再命中）；
+     *   · 内容**等价**（大小写、空格一个不少，模型看到的是同一句话）——
+     *     这是"混淆"而不是"改写"的全部意义；
+     *   · **不误伤**（别的渠道 / 别的客户端提示词原样透传）。
+     *
+     * 真机实测（2026-10-23）：两个特征串各自 8/8 触发 11128，混淆后 8/8 通过。
+     */
+    private static String checkRiskPrompt() {
+        String preamble = "You are Claude Code, Anthropic's official CLI for Claude.";
+        String fixed = RiskPrompt.neutralize(preamble);
+        if (fixed == preamble) return "自我描述句没有被混淆（指纹仍在，必然被 11128 拦）";
+        String z = RiskPrompt.zwnj();
+        /* 断言要盯的是"上游那串字节还在不在"，而不是零宽字符插在哪一侧 ——
+           neutralize 在空格两侧各插一个，`ClaudeCode` 这个字面量本来就不该出现。 */
+        if (fixed.contains("Claude Code")) {
+            return "指纹串原样还在（上游是字节级匹配，这样仍会被 11128 拦）：" + fixed;
+        }
+        if (!fixed.contains(z)) return "没有插入零宽字符：" + fixed;
+        /* 内容等价：把零宽字符去掉必须逐字还原，且一个空格都没少。 */
+        String back = fixed.replace(z, "");
+        if (!back.equals(preamble)) {
+            return "混淆改变了内容（去掉零宽后不等于原文）：" + back;
+        }
+        /* 空格有没有被吃掉，上面那句已经全包了（逐字相等 ⇒ 空格与大小写都在）。
+           不要再单独断言 " Code," 这种字面量：零宽字符正好插在空格两侧，
+           这种断言会假失败 —— 第一版就是这么被自己的自检抓住的。 */
+        /* 大小写必须原样保留：用 replaceAll 配字面量会把 CLAUDE CODE 悄悄改小写。 */
+        String upper = "You are CLAUDE CODE, Anthropic's official CLI.";
+        String fixedUpper = RiskPrompt.neutralize(upper);
+        if (!fixedUpper.replace(z, "").equals(upper)) {
+            return "全大写形态被改了大小写：" + fixedUpper;
+        }
+        if (fixedUpper == upper) return "全大写形态没被混淆（指纹漏网）";
+        if (fixedUpper.contains("CLAUDE CODE")) return "全大写指纹原样还在：" + fixedUpper;
+        /* 连字符 / 下划线形态的 slug —— 最隐蔽的一枚：它藏在系统提示末尾的
+           github.com/anthropics/claude-code/issues 里，只修带空格的写法时
+           整份真实请求体仍然被拦（二分定位到的就是它）。 */
+        for (String slug : new String[]{"claude-code", "claude_code", "CLAUDE-CODE"}) {
+            String fixedSlug = RiskPrompt.neutralize(slug);
+            if (fixedSlug == slug) return "slug 形态 " + slug + " 没有被混淆（真实请求体会被拦）";
+            if (fixedSlug.replace(z, "").equals(slug) == false) {
+                return "slug 形态 " + slug + " 混淆改变了内容：" + fixedSlug;
+            }
+            if (fixedSlug.toLowerCase().contains(slug.toLowerCase().replace("-", "-"))
+                    && !fixedSlug.contains(z)) {
+                return "slug 形态 " + slug + " 未失效：" + fixedSlug;
+            }
+        }
+        /* 带连字符的写法必须仍然"人看着一样"：连字符还在。 */
+        String slugLine = "report the issue at https://github.com/anthropics/claude-code/issues";
+        String fixedLine = RiskPrompt.neutralize(slugLine);
+        if (fixedLine == slugLine) return "反馈链接里的 claude-code 没被混淆";
+        if (!fixedLine.replace(z, "").equals(slugLine)) {
+            return "反馈链接混淆改变了内容：" + fixedLine;
+        }
+        if (fixedLine.contains("claude-code")) return "反馈链接里的指纹仍然完好：" + fixedLine;
+        /* 计费头（Claude Code 2.1.308 会把它当第一个 system 块发出来）。 */
+        String bill = "x-anthropic-billing-header: cc_version=2.1.308.7f2; cc_entrypoint=sdk-cli;";
+        String fixedBill = RiskPrompt.neutralize(bill);
+        if (fixedBill == bill) return "计费头没有被混淆（真机实测它单独就能触发 11128）";
+        if (!fixedBill.replace(z, "").equals(bill)) {
+            return "计费头混淆改变了内容：" + fixedBill;
+        }
+        /* 不误伤：普通提示词必须原对象返回（调用方靠 == 判断有没有改动）。 */
+        String plain = "You are a helpful assistant. Write clean code.";
+        if (RiskPrompt.neutralize(plain) != plain) {
+            return "普通提示词被改动了 —— 会污染所有渠道的对话内容";
+        }
+        if (RiskPrompt.wouldChange(plain)) return "普通提示词被判定为有指纹";
+        /* 单独出现的词不该被当成指纹（"claude" 后面没有 "code"）。 */
+        String single = "The model claude is made by Anthropic.";
+        if (RiskPrompt.neutralize(single) != single) {
+            return "只出现 claude、没有 code 也被改了：" + RiskPrompt.neutralize(single);
+        }
+        return null;
+    }
+
+    /**
+     * Claude 模型名兼容（{@link Server#compatModel}）。
+     *
+     * 关键不是"能映射"，而是**该映射的才映射**：
+     * 用户自己挂了同名 Claude 中转时，点名必须照点名走 ——
+     * 抢走它等于把用户配好的账号废掉。
+     */
+    private static String checkModelCompat() {
+        /* Claude Code 默认发出来的官方 ID → 必须落到 auto。 */
+        for (String m : new String[]{"claude-sonnet-4-5-20250929", "claude-haiku-4-5",
+                "claude-opus-5-5", "CLAUDE-SONNET-4-5"}) {
+            String got = Server.compatModel(m);
+            if (!Router.isVirtual(got)) {
+                return "客户端模型名 " + m + " 没有被映射到虚拟模型（Claude Code 会"
+                        + "在本地报 unrecognized_model，连请求都不发）：" + got;
+            }
+        }
+        /* 本机自己的模型名一个都不能被改。 */
+        for (String m : new String[]{"auto", "auto-code", "hy3", "glm-5.3",
+                "deepseek-v4-pro", "gpt-5", "gemini-2.5-pro"}) {
+            String got = Server.compatModel(m);
+            if (!m.equalsIgnoreCase(got)) {
+                return "本机模型名 " + m + " 被误映射成 " + got;
+            }
+        }
+        /* 带账号前缀的点名是用户明确的路由意图，绝不改写。 */
+        String pinned = "WorkBuddy 1/claude-sonnet-4-5";
+        if (!pinned.equals(Server.compatModel(pinned))) {
+            return "带前缀的点名被改写成了 " + Server.compatModel(pinned);
+        }
+        return null;
+    }
+
+    private static String checkCreditFieldChoice() {        try {
             /* 形态一：周期字段存在且为 0（真机形态，逐字照抄实测回包）
                → 必须算 0，**不能**回落到 CapacityRemain 的 500 */
             org.json.JSONObject cycleZero = new org.json.JSONObject();

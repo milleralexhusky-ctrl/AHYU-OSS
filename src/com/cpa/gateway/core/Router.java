@@ -553,6 +553,15 @@ public final class Router {
         public final Config.Provider provider;
         public final String model;      // 上游真实模型名
         public double score;
+        /**
+         * 这个候选现在处在冷却 / 限流 / 半开试探里，应当排在池尾。
+         *
+         * <p>为什么不直接从池里剔除：剔除会让"全部候选都被挡"变成整池为空，
+         * 上层只能回 503「暂时没有可用候选」，而 agent 客户端会一直重试 ——
+         * 用户看到的是"卡住不出字"，且永远等不到恢复。
+         * 沉底则保留"实在没人时还能试一次"这条退路。
+         */
+        public boolean sink;
 
         Pick(Config.Provider provider, String model) {
             this.provider = provider;
@@ -1016,14 +1025,25 @@ public final class Router {
                 // 避免枚举列表时把未选中的半开候选全部自锁 90 秒。
                 Stat st = stat(p.name + "/" + m);
                 long nowMs = System.currentTimeMillis();
+                boolean bad = false;
                 synchronized (STATS) {
-                    if (st.cooldownUntil > nowMs) continue;
-                    if (st.throttleUntil > nowMs) continue;     // 上游刚说过"限流"，本轮别去撞
-                    if (st.openCount > 0 && st.probingAt > 0 && nowMs - st.probingAt < PROBE_GRACE_MS) {
-                        continue;
+                    if (st.cooldownUntil > nowMs) bad = true;
+                    else if (st.throttleUntil > nowMs) bad = true;   // 上游刚说过"限流"
+                    else if (st.openCount > 0 && st.probingAt > 0 && nowMs - st.probingAt < PROBE_GRACE_MS) {
+                        bad = true;
                     }
                 }
-                all.add(new Pick(p, m));
+                /* 冷却/限流/半开试探中的候选**沉底而不是剔除**。
+                   为什么不能硬剔除：上游的额度与限流判定会变（实测同一个 WorkBuddy 账号
+                   下 hy3 通了、wb-lite 报 14018），"此刻被挡"不代表"这一轮注定失败"。
+                   硬剔除的后果是**整池变空 → 503「暂时没有可用候选」**，
+                   而客户端（Claude Code 这类 agent）会一直重试，用户看到的就是"卡住不出字"。
+                   沉底则保住两条既有语义：正常时它排最后（等于回避），
+                   别的候选都失败时它仍有机会被试到（不会凭空变成 404/503）。
+                   这条与 pickAll（点名模型）的行为对齐 —— 那边一直是"不可用沉底、不丢弃"。 */
+                Pick pick = new Pick(p, m);
+                pick.sink = bad;
+                all.add(pick);
             }
         }
 
@@ -1046,7 +1066,14 @@ public final class Router {
                 out = okVision;
             }
         }
-        for (Pick c : out) c.score = score(c, needsTools);
+        for (Pick c : out) {
+            c.score = score(c, needsTools);
+            /* 冷却/限流/试探中的沉底：给一个**低于任何正常候选**的分数，
+               而不是靠"排序时特判" —— 后面的同分轮转与会话亲和都按 score 走，
+               要是这里不写进分数，它们会把沉底候选又转回队首。
+               用 -1e6 这种量级：账号级回避最低也就 -280 左右，撞不上。 */
+            if (c.sink) c.score -= 1_000_000d;
+        }
 
         if (skippedVision > 0) {
             Log.i("能力过滤：带图请求跳过 " + skippedVision + " 个不支持图片的通道（账号级 "
