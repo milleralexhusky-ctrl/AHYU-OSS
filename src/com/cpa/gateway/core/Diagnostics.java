@@ -141,6 +141,9 @@ public final class Diagnostics {
         } catch (Throwable ignored) {
         }
         sb.append("线程数：").append(Thread.activeCount()).append('\n');
+        /* 指纹对抗的健康度：出站尝试 / 混淆次数 / 拦截次数，以及最要紧的
+           "已混淆却仍被拦"。最后一项非 0 就是对抗失效的确证（见 FingerprintWatch）。 */
+        sb.append(FingerprintWatch.summary()).append('\n');
         return sb.toString();
     }
 

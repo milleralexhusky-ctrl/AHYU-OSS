@@ -96,6 +96,8 @@ public final class Selftest {
         add(out, "风控指纹混淆：内容等价、指纹失效、不误伤", Selftest::checkRiskPrompt);
         add(out, "Claude 模型名兼容（claude-* → auto，别抢用户的同名账号）",
                 Selftest::checkModelCompat);
+        add(out, "指纹对抗失效监测（已混淆仍被拦才报警，账号级不误报）",
+                Selftest::checkFingerprintWatch);
         add(out, "国际版身份重发与开关", Selftest::checkIntlFallback);
         add(out, "图片 URL 拒绝回环/内网（SSRF）", Selftest::checkImageUrlGuard);
         add(out, "重复请求只按客户端请求计一次", Selftest::checkRepeatCount);
@@ -868,6 +870,152 @@ public final class Selftest {
             return "带前缀的点名被改写成了 " + Server.compatModel(pinned);
         }
         return null;
+    }
+
+    /**
+     * 指纹对抗的**失效监测**（{@link FingerprintWatch}）。
+     *
+     * <p>重点不是"能不能报警"，而是**该不该报**。11128 有两种成因：
+     * 内容指纹（混淆能治）与账号被标记（混淆治不了）。
+     * 把后者也报成"对抗失效"就是假警报 —— 而假警报的代价是真失效时没人信。
+     * 区分手段只有一条：这份 body 里到底有没有我们插进去的零宽字符。
+     */
+    private static String checkFingerprintWatch() throws Exception {
+        /* 自检是**只读**的：先快照（含账号对照表），跑完还原
+           （见 FingerprintWatch.snapshotFullForTest 的注释——诊断包先写 summary 后跑自检，
+           清零会让取证时证据没了）。
+           期间静音告警：这里造的是刻意的失效对照，不能冒充真故障。 */
+        Object snap = FingerprintWatch.snapshotFullForTest();
+        FingerprintWatch.muteAlerts();
+        try {
+            return checkFingerprintWatchBody();
+        } finally {
+            FingerprintWatch.restore(snap);
+        }
+    }
+
+    /** 计数一律按**相对增量**断言：进程里可能已有真实流量，绝对值不可预测。 */
+    private static String checkFingerprintWatchBody() throws Exception {
+        String z = RiskPrompt.zwnj();
+        String acct = "selftest-fp-" + System.nanoTime();
+
+        /* 造两份 body：一份带官方客户端指纹（会被混淆），一份中性（不会）。 */
+        org.json.JSONObject flagged = new org.json.JSONObject();
+        org.json.JSONArray m1 = new org.json.JSONArray();
+        m1.put(new org.json.JSONObject().put("role", "system")
+                .put("content", "You are Claude Code, Anthropic's official CLI for Claude."));
+        m1.put(new org.json.JSONObject().put("role", "user").put("content", "hi"));
+        flagged.put("messages", m1);
+
+        org.json.JSONObject neutral = new org.json.JSONObject();
+        org.json.JSONArray m2 = new org.json.JSONArray();
+        m2.put(new org.json.JSONObject().put("role", "system")
+                .put("content", WorkBuddy.DEFAULT_SYSTEM));
+        m2.put(new org.json.JSONObject().put("role", "user").put("content", "hi"));
+        neutral.put("messages", m2);
+
+        /* 混淆后必须能被查出来，混淆前不能被查出来。 */
+        if (FingerprintWatch.carriesNeutralization(flagged)) {
+            return "还没混淆就被判定为已混淆 —— 证据链不成立";
+        }
+        int hits = WorkBuddy.deFingerprint(flagged);
+        if (hits <= 0) return "deFingerprint 没有命中任何指纹";
+        if (!FingerprintWatch.carriesNeutralization(flagged)) {
+            return "混淆过的 body 没被查出来 —— 对抗失效时永远凑不齐证据";
+        }
+        if (FingerprintWatch.carriesNeutralization(neutral)) {
+            return "中性 body 被误判为已混淆 —— 会制造假警报";
+        }
+
+        /* 只认 system：user/assistant 里出现的零宽字符不是我们的手笔，不能当证据。 */
+        org.json.JSONObject userOnly = new org.json.JSONObject();
+        org.json.JSONArray m3 = new org.json.JSONArray();
+        m3.put(new org.json.JSONObject().put("role", "system").put("content", "plain"));
+        m3.put(new org.json.JSONObject().put("role", "user")
+                .put("content", "客户" + z + "端自己打的零宽字符"));
+        userOnly.put("messages", m3);
+        if (FingerprintWatch.carriesNeutralization(userOnly)) {
+            return "user 消息里的零宽字符被当成我们的混淆证据 —— 会制造假警报";
+        }
+
+        /* 出站计数：混淆过的那笔要单独记数（中性那笔只进总数、不进混淆数）。 */
+        long sent0 = counter(FingerprintWatch.summary(), "出站尝试 ");
+        long neut0 = counter(FingerprintWatch.summary(), "已混淆 ");
+        FingerprintWatch.noteSent(hits);
+        FingerprintWatch.noteSent(0);
+        long sent1 = counter(FingerprintWatch.summary(), "出站尝试 ");
+        long neut1 = counter(FingerprintWatch.summary(), "已混淆 ");
+        if (sent1 - sent0 != 2) {
+            return "出站计数增量应为 2，实际 " + (sent1 - sent0);
+        }
+        if (neut1 - neut0 != 1) {
+            return "混淆计数增量应为 1（hits=" + hits + " 与 0 各一笔），实际 " + (neut1 - neut0);
+        }
+
+        /* 核心用例一（假警报防护，真机实测抓到过）：
+           账号连中性请求都没过过（被上游整体标记的形态），
+           混淆请求被拦**不能**归因成对抗失效。 */
+        long bad0 = FingerprintWatch.blockedWhileNeutralized();
+        FingerprintWatch.noteBlocked(acct + "-neverok", flagged);
+        if (FingerprintWatch.blockedWhileNeutralized() != bad0) {
+            return "从没成功过的账号被拦，却记成了失效确证 —— "
+                    + "这正是被上游标记的账号（国内号常年 11128）会制造的假警报";
+        }
+
+        /* 核心用例二：中性内容被拦同样不能算失效确证。 */
+        FingerprintWatch.noteOk(acct, neutral);
+        FingerprintWatch.noteBlocked(acct, neutral);
+        if (FingerprintWatch.blockedWhileNeutralized() != bad0) {
+            return "中性请求被拦被记成失效确证：判据里没校验混淆痕迹，会全线误报";
+        }
+
+        /* 核心用例三：同账号对照成立 → 必须确证。
+           中性能过 + 之后混淆请求被拦 → 拦的原因只剩内容。 */
+        FingerprintWatch.noteBlocked(acct, flagged);
+        if (FingerprintWatch.blockedWhileNeutralized() != bad0 + 1) {
+            return "同账号对照成立却没有确证：对抗失效将永远不会被报告";
+        }
+        if (!FingerprintWatch.summary().contains("失效确证")) {
+            return "摘要没给出失效计数：" + FingerprintWatch.summary();
+        }
+        if (!FingerprintWatch.summary().contains("对抗可能已失效")) {
+            return "摘要里没有失效警示，等于白记：" + FingerprintWatch.summary();
+        }
+
+        /* 核心用例四（真机实测抓到过）：中性通过**之后**混淆请求又通过了，
+           再被拦一次只是抖动 —— 对抗此刻是有效的，不许报警。
+           13:44 的假警报就是这种形状：整条 curl 最终 200，
+           告警却来自第一个候选账号。 */
+        String acct2 = "selftest-fp2-" + System.nanoTime();
+        FingerprintWatch.noteOk(acct2, neutral);
+        FingerprintWatch.noteOk(acct2, flagged);
+        long bad1 = FingerprintWatch.blockedWhileNeutralized();
+        FingerprintWatch.noteBlocked(acct2, flagged);
+        if (FingerprintWatch.blockedWhileNeutralized() != bad1) {
+            return "混淆请求刚通过过却又被记成失效 —— 抖动误报，真失效时没人信";
+        }
+
+        /* 计数要能从摘要里读回来：前面三个用例一共确证了 1 次，
+           断言读得到 —— 读不到说明摘要格式与界面对不上，等于白记。 */
+        if (counter(FingerprintWatch.summary(), "失效确证 ") < 1) {
+            return "前面已经确证过一次，摘要里却看不到计数";
+        }
+        return null;
+    }
+
+    /** 从 summary 那行人话里取某个计数。取不到返回 -1（断言会因此失败，不会静默放过）。 */
+    private static long counter(String summary, String label) {
+        int i = summary.indexOf(label);
+        if (i < 0) return -1;
+        int j = i + label.length();
+        int k = j;
+        while (k < summary.length() && Character.isDigit(summary.charAt(k))) k++;
+        if (k == j) return -1;
+        try {
+            return Long.parseLong(summary.substring(j, k));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     private static String checkCreditFieldChoice() {        try {

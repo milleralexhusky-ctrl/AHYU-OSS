@@ -83,9 +83,14 @@ OAuth 客户端凭据。它按 Google 的定义不属于机密（native app 的 
 
 - **带工具的 logprobs 保真**：仍不开启。工具参数是分片到达的，要修复/换模型就得
   先缓存重写，和"原样透传"冲突；需要单独设计两段式路径。
-- **非 OpenAI 协议的 `auto`**：目前仍是"先解析成一个具体模型，再在同模型的账号间
-  failover"，不会在失败后换模型。OpenAI 入口的 `auto` 已经是完整轮换。
-  这条要做需要把 Anthropic / Gemini / Responses 的非流式选路也换成
-  `Router.Pick` 列表，属于下一轮。
+- ~~**非 OpenAI 协议的 `auto`**：目前仍是"先解析成一个具体模型，再在同模型的账号间
+  failover"，不会在失败后换模型。~~ **这条已过时，分两次追平（此处如实记录现状）**：
+  - **Anthropic（`/v1/messages`，即 Claude Code 走的那条）已是完整跨模型轮换** ——
+    4.51.1 起 `Server.handleAnthropic` 的虚拟分支直接取 `Router.candidates()`，
+    流式也能从回空候选换到有内容的模型（`Server.java:6179`）。
+  - **Gemini / Responses** 仍是"先解析成一个具体模型"，但已不再是 404：
+    两者都改走 `resolveVirtual()`，`auto` 至少能落到一个具体候选上
+    （`Server.java:6361`、`Server.java:6620`）。要变成完整轮换仍需换成
+    `Router.Pick` 列表。这三个入口里，实际用得最多的是 Anthropic 那条。
 - Realtime 音频、vector stores、file search、code interpreter：上游没有对应能力，
   不做空壳。

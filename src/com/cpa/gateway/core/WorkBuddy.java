@@ -1033,8 +1033,12 @@ public final class WorkBuddy {
         body.put("stream", true);
         ensureSystemFirst(body);
         /* 风控指纹规避（见 RiskPrompt）：上游按 system 里的官方客户端标识拦请求，
-           11128 与账号、模型、UA 都无关。只在这一条渠道上做，且只混淆那两个特征串。 */
-        deFingerprint(body);
+           11128 与账号、模型、UA 都无关。只在这一条渠道上做，且只混淆那几个特征串。 */
+        int fpHits = deFingerprint(body);
+        /* 对抗失效监测（见 FingerprintWatch）：混淆本身不报错、不改变行为，
+           所以"上游改了判据导致混淆失效"这件事必须靠计数才能发现。
+           这里只记一笔，判定留在收到 channel_soft 时做（那一刻才有确证）。 */
+        FingerprintWatch.noteSent(fpHits);
         /* 诊断：在整理**之前**记录客户端发来的原始序列，用来区分
            (a) 客户端压根没把 tool 结果发回来 与 (b) 发了但被 normalizeToolPairs
            当"孤立"删掉——之前只在整理之后打过，看不出是哪一种。 */
@@ -1102,6 +1106,9 @@ public final class WorkBuddy {
                     applyConversationHeaders(hh, body);
                     try {
                         send(endpoint, hh, body, sink, model, req, acc);
+                        /* 交付成功要记账：这是"同账号对照"的另一半
+                           （中性请求能过 = 这个账号没被整体标记，见 FingerprintWatch）。 */
+                        FingerprintWatch.noteOk(p.name, body);
                         if (shape > 0 || cross) {
                             noteConv(p, req, shape, cross ? "通过（国际版身份）" : "通过", null);
                         }
@@ -1133,6 +1140,7 @@ public final class WorkBuddy {
                                 if (shape > 0) applyConvShape(shape, body2, hh2, convId, acc);
                                 applyConversationHeaders(hh2, body2);
                                 send(endpoint, hh2, body2, sink, model, req, acc);
+                                FingerprintWatch.noteOk(p.name, body2);
                                 noteConv(p, req, shape, cross ? "重发通过（国际版身份）" : "重发通过", null);
                                 return;
                             } catch (Throttled t2) {
@@ -1148,6 +1156,13 @@ public final class WorkBuddy {
                         if ("channel_soft".equals(err.kind)) {
                             /* 请求级风控：账号本身没问题，不写"试到底"标记，也别 6 小时回避。
                                交给 Router 短暂避，下一个请求照常尝试。 */
+                            /* 走到这里说明重发已经用尽、这一份确实放行不了，
+                               才记一次拦截（每次重发都记会把比例记歪）。
+                               传 body 是为了现查"这份到底混淆过没有" ——
+                               只有混淆过还被拦，才是对抗失效的确证（见 FingerprintWatch）。
+                               重发用的是 body2，但两者都由同一个 buildBody 构造，
+                               混淆痕迹必然一致，所以查 body 与查 body2 等价。 */
+                            FingerprintWatch.noteBlocked(p.name, body);
                             channelFail = err;
                             noteConv(p, req, shape, "请求级风控仍未放行", err);
                             throw err;
