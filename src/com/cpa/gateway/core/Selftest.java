@@ -80,6 +80,7 @@ public final class Selftest {
         add(out, "导航玻璃 tint：各配色背景亮度确实接近（自适应无必要）",
                 Selftest::checkGlassTintRange);
         add(out, "下拉刷新手势（方向 / 阈值 / 不抢点击与滚动）", Selftest::checkPullGesture);
+        add(out, "预置服务商分组（国内/国外判据与预置清单逐个对得上）", Selftest::checkRegionClassify);
         add(out, "缓存价成本分段（缺价按全价 / 命中数不可超输入）", Selftest::checkCachedCost);
         add(out, "额度未知（-1）不能被当成额度用尽", Selftest::checkCreditsUnknown);
         add(out, "额度取「按周期剩余」而不是总容量（防显示 500 却发不出去）",
@@ -1712,6 +1713,63 @@ public final class Selftest {
         Router.noteSession(turn1, "");
         if (!"acc/model-x".equals(Router.sessionPinForTest(turn1))) {
             return "空候选名把亲和表写坏了";
+        }
+        return null;
+    }
+
+    /**
+     * 预置服务商的国内/国外分组（4.55.0）。
+     *
+     * <p>这条锁住的是一次真实踩到的静默缺陷：判据内联在 UI 包里、关键词表漏了
+     * 一半国内厂商，"智谱 GLM""讯飞星火""小米 MiMo""百度千帆"全被判成国外，
+     * 在「选择服务商」里被归到错误的分组下。而自检够不着 UI 包，所以一直没人发现。
+     *
+     * <p>现在判据在 {@link Region}（core 包），这里逐个断言两件事：
+     * <ol>
+     *   <li>每一家**知名厂商的归属**都判对（名单直接写在断言里，判据改坏会红）；</li>
+     *   <li>「国际版」例外成立 —— 同一家厂商的海外站点必须归国外
+     *       （否则"MiniMax 国际版"会因名字里的 minimax 被误判成国内）。</li>
+     * </ol>
+     *
+     * <p>刻意**不**断言 MainActivity.choosePreset 里的数组顺序 —— 那是 UI 包的代码，
+     * core 的自检够不着。顺序错误的表现是"表头插错位置"，不改变任何请求行为；
+     * 判据错误的表现是"厂商归错组"，两者危害不同，这里锁的是后者。
+     */
+    private static String checkRegionClassify() {
+        /* 类型直判的那几种（不依赖名字）。 */
+        if (!Region.isDomestic(Config.TYPE_WORKBUDDY, "")) return "WorkBuddy 应判国内";
+        if (!Region.isDomestic(Config.TYPE_TRAE, "")) return "Trae 应判国内";
+        if (!Region.isDomestic(Config.TYPE_LOOMY, "")) return "Loomy 应判国内";
+        /* 「应判国外」的断言不能写成 !isDomestic —— 那等于"只要不是国内就报错"，
+           对国外项恒真。第一次写这条自检时就踩了（三条同时红）。 */
+        if (Region.isDomestic(Config.TYPE_CLAUDE, "")) return "Claude 应判国外";
+        if (Region.isDomestic(Config.TYPE_CODEX, "")) return "Codex 应判国外";
+        if (Region.isDomestic(Config.TYPE_ANTIGRAVITY, "")) return "Antigravity 应判国外";
+
+        /* 名字判据：4.55.0 之前全错的那些 + 代表性的国内外对照。 */
+        String[][] cases = {
+                {"智谱 GLM", "国内"}, {"讯飞星火", "国内"}, {"小米 MiMo", "国内"},
+                {"百度千帆", "国内"}, {"火山方舟 Doubao（控制台 API Key）", "国内"},
+                {"DeepSeek", "国内"}, {"硅基流动 SiliconFlow", "国内"},
+                {"商汤日日新 SenseNova", "国内"}, {"阶跃星辰 StepFun", "国内"},
+                {"美团 LongCat", "国内"}, {"魔搭 ModelScope", "国内"},
+                {"通义千问 DashScope", "国内"}, {"月之暗面 Kimi", "国内"},
+                {"MiniMax", "国内"},
+                {"OpenRouter", "国外"}, {"xAI Grok", "国外"}, {"Groq", "国外"},
+                {"Google AI Studio", "国外"}, {"Cohere", "国外"},
+                {"HuggingFace", "国外"}, {"自建 / 其它中转", "国外"},
+        };
+        for (String[] c : cases) {
+            boolean want = "国内".equals(c[1]);
+            if (Region.isDomestic(Config.TYPE_OPENAI, c[0]) != want) {
+                return "「" + c[0] + "」应判" + c[1] + "，实际判了" + (want ? "国外" : "国内");
+            }
+        }
+
+        /* 「国际版」例外：必须在关键词匹配之前短路，否则厂商名会把它拉回国内。 */
+        if (Region.isDomestic(Config.TYPE_OPENAI, "MiniMax 国际版（M2 免费期）")) {
+            return "「MiniMax 国际版」应判国外（走境外出口），却被判成国内 —— "
+                    + "「国际」短路规则可能被挪到了关键词匹配之后";
         }
         return null;
     }

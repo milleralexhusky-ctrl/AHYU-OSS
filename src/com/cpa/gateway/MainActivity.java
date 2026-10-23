@@ -852,21 +852,15 @@ public class MainActivity extends Activity {
         return V_OPENAI;
     }
 
-    /** Domestic (needs no VPN) vs overseas: shown as separate groups everywhere. */
+    /**
+     * Domestic (needs no VPN) vs overseas: shown as separate groups everywhere.
+     *
+     * <p>判据已下沉到 core（{@link com.cpa.gateway.core.Region}），这样自检能跑它 ——
+     * 放在 UI 包里的纯字符串匹配出过错（关键词漏项把"智谱 GLM"归进国外），
+     * 而自检够不着 UI 包，错误就一直没人发现。
+     */
     static boolean isDomestic(String type, String name) {
-        String t = type == null ? "" : type;
-        String n = name == null ? "" : name.toLowerCase();
-        if (Config.TYPE_WORKBUDDY.equals(t) || Config.TYPE_TRAE.equals(t)
-                || Config.TYPE_LOOMY.equals(t) || Config.TYPE_KIMI.equals(t)
-                || Config.TYPE_DEEPSEEK.equals(t) || Config.TYPE_DOUBAO.equals(t)) return true;
-        if (Config.TYPE_ANTIGRAVITY.equals(t) || Config.TYPE_CLAUDE.equals(t)
-                || Config.TYPE_CODEX.equals(t)) return false;
-        for (String key : new String[]{"siliconflow", "moonshot", "bigmodel", "dashscope", "volces", "xiaomimimo",
-                "minimax", "spark", "qianfan", "sensenova", "longcat", "modelscope",
-                "silicon", "zhipu", "kimi", "qwen", "tencent", "baidu", "aliyun"}) {
-            if (n.contains(key)) return true;
-        }
-        return false;
+        return com.cpa.gateway.core.Region.isDomestic(type, name);
     }
 
     /** Small muted group heading used inside the pickers. */
@@ -1546,14 +1540,14 @@ public class MainActivity extends Activity {
     /** Level two: API-key providers. */
     private void showApiKeys() {
         LinearLayout list = Ui.column(this);
-        choiceRow(list, "openai", "OpenAI 兼容中转", "OpenRouter / DeepSeek / 硅基流动 等 16 家预置",
+        choiceRow(list, "openai", "OpenAI 兼容中转", "OpenRouter / DeepSeek / 硅基流动 等 33 家预置",
                 this::addOpenAiCompatible);
-        choiceRow(list, "anthropic", "Claude（API Key）", "Anthropic 官方或中转的 Key", () -> {
+        choiceRow(list, "anthropic", "Claude（API Key）", "Anthropic 官方，或智谱 / 百炼 / DeepSeek / Kimi 的 Anthropic 端点", () -> {
             Config.Provider p = new Config.Provider();
             p.type = Config.TYPE_ANTHROPIC;
             p.name = "Claude";
             p.baseUrl = "https://api.anthropic.com";
-            ProviderEditor.show(this, p, true, this::refreshStatus);
+            chooseAnthropicPreset(p);
         });
         choiceRow(list, "gemini", "Google Gemini（API Key）", "Google AI Studio 的 Key", () -> {
             Config.Provider p = new Config.Provider();
@@ -1671,39 +1665,49 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    /**
+     * 预置服务商清单。
+     *
+     * <p><b>顺序必须是「先全部国内、再全部国外」</b>，因为下面的表头逻辑
+     * （{@code domesticHeaderDone} / {@code overseasHeaderDone}）各只插入一次。
+     * 混合顺序会让两个表头挤在中间、后面的条目全归错组 —— 这是 4.55.0 修掉的
+     * 既有缺陷（当时表头第二项就翻车，"智谱 GLM"往后全挂到"国外"下）。
+     * 增删条目时保持这个顺序，或把表头逻辑改成按分组切分。
+     */
     private void choosePreset(final Config.Provider p) {
         final String[] names = {
-                "OpenRouter", "DeepSeek", "硅基流动 SiliconFlow", "月之暗面 Kimi",
-                "智谱 GLM", "通义千问 DashScope", "火山方舟 Doubao（控制台 API Key）", "MiniMax",
-                "小米 MiMo",
-                "xAI Grok", "Groq", "Mistral", "Cerebras", "Together",
-                "讯飞星火", "百度千帆", "Google AI Studio", "Cloudflare Workers AI",
-                "NVIDIA NIM", "Cohere", "HuggingFace",
-                "SambaNova", "Fireworks", "DeepInfra", "Nebius AI Studio",
-                "商汤日日新 SenseNova", "美团 LongCat", "魔搭 ModelScope",
-                "阶跃星辰 StepFun", "Pollinations（免注册）", "Venice AI",
-                "MiniMax 国际版（M2 免费期）",
+                /* ── 国内（14 家，无需梯子） ── */
+                "DeepSeek", "智谱 GLM", "月之暗面 Kimi", "通义千问 DashScope",
+                "火山方舟 Doubao（控制台 API Key）", "讯飞星火", "百度千帆",
+                "硅基流动 SiliconFlow", "MiniMax", "小米 MiMo",
+                "商汤日日新 SenseNova", "美团 LongCat", "魔搭 ModelScope", "阶跃星辰 StepFun",
+                /* ── 国外（19 家） ── */
+                "OpenRouter", "xAI Grok", "Groq", "Mistral", "Cerebras", "Together",
+                "Google AI Studio", "Cloudflare Workers AI", "NVIDIA NIM", "Cohere",
+                "HuggingFace", "SambaNova", "Fireworks", "DeepInfra", "Nebius AI Studio",
+                "Pollinations（免注册）", "Venice AI", "MiniMax 国际版（M2 免费期）",
                 "自建 / 其它中转"};
         final String[] bases = {
-                "https://openrouter.ai/api/v1", "https://api.deepseek.com/v1",
-                "https://api.siliconflow.cn/v1", "https://api.moonshot.cn/v1",
-                "https://open.bigmodel.cn/api/paas/v4", "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "https://ark.cn-beijing.volces.com/api/v3", "https://api.minimax.chat/v1",
-                "https://api.xiaomimimo.com/v1",
-                "https://api.x.ai/v1", "https://api.groq.com/openai/v1",
-                "https://api.mistral.ai/v1", "https://api.cerebras.ai/v1",
-                "https://api.together.xyz/v1", "https://spark-api-open.xf-yun.com/v1",
+                "https://api.deepseek.com/v1", "https://open.bigmodel.cn/api/paas/v4",
+                "https://api.moonshot.cn/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://ark.cn-beijing.volces.com/api/v3", "https://spark-api-open.xf-yun.com/v1",
                 "https://qianfan.baidubce.com/v2",
+                "https://api.siliconflow.cn/v1", "https://api.minimax.chat/v1",
+                "https://api.xiaomimimo.com/v1",
+                "https://api.sensenova.cn/compatible-mode/v1",
+                "https://api.longcat.chat/openai/v1",
+                "https://api-inference.modelscope.cn/v1",
+                "https://api.stepfun.com/v1",
+                "https://openrouter.ai/api/v1", "https://api.x.ai/v1",
+                "https://api.groq.com/openai/v1",
+                "https://api.mistral.ai/v1", "https://api.cerebras.ai/v1",
+                "https://api.together.xyz/v1",
                 "https://generativelanguage.googleapis.com/v1beta/openai",
                 "https://api.cloudflare.com/client/v4/accounts/<账号ID>/ai/v1",
                 "https://integrate.api.nvidia.com/v1", "https://api.cohere.ai/compatibility/v1",
                 "https://router.huggingface.co/v1",
                 "https://api.sambanova.ai/v1", "https://api.fireworks.ai/inference/v1",
                 "https://api.deepinfra.com/v1/openai", "https://api.studio.nebius.ai/v1",
-                "https://api.sensenova.cn/compatible-mode/v1",
-                "https://api.longcat.chat/openai/v1",
-                "https://api-inference.modelscope.cn/v1",
-                "https://api.stepfun.com/v1",
                 "https://text.pollinations.ai/openai",
                 "https://api.venice.ai/api/v1",
                 "https://api.minimax.io/v1",
@@ -1731,6 +1735,78 @@ public class MainActivity extends Activity {
             list.addView(row, Ui.lp(this, 8));
         }
         currentDialog = Ui.dialog(this, "选择服务商", Ui.scroller(this, list), "取消", null, null, null);
+    }
+
+    /**
+     * Anthropic 兼容端点预置（4.55.0）。
+     *
+     * <p>为什么单独一张表：上面 {@link #choosePreset} 那 30 多家给的都是
+     * **OpenAI 兼容**端点。而国产厂商近几年陆续给编程订阅配了 **Anthropic 兼容**端点，
+     * 专门喂 Claude Code / Claude Agent SDK —— 智谱、阿里百炼、DeepSeek、Kimi 都有。
+     * 直连这些端点的好处很实际：Claude Code 不用任何转接层，
+     * 订阅费直接当 API 额度用（见 docs 里那份渠道清单）。
+     *
+     * <p>以前这里只硬编码了 Anthropic 官方一个地址，用户想用国产订阅得自己去翻各家文档、
+     * 自己判断地址该不该带 `/v1` —— 4.53.1 那个"Claude Code 地址带不带 /v1"的坑
+     * 就是这么踩出来的。这些端点已经全部实测过（空 POST 返回 401 = 存在且要鉴权），
+     * 并且 {@code Upstreams.anthropicUrl} 能正确处理它们的各种写法
+     * （带 /v1、带 /api/anthropic 后缀、直接给完整端点都能认）。
+     *
+     * <p>增删条目时注意：地址填的是**文档给的 Base URL 原文**，不要自己补 `/v1/messages` ——
+     * 拼接规则由 Upstreams 负责，重复补会拼出 `/v1/v1/messages`。
+     */
+    private void chooseAnthropicPreset(final Config.Provider p) {
+        final String[] names = {
+                /* ── 国内 ── */
+                "智谱 GLM（Coding Plan）", "阿里百炼（Coding Plan）",
+                "DeepSeek", "月之暗面 Kimi",
+                /* ── 国外 ── */
+                "Anthropic 官方", "自建 / 其它中转"};
+        final String[] bases = {
+                "https://open.bigmodel.cn/api/anthropic",
+                "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+                "https://api.deepseek.com/anthropic",
+                "https://api.moonshot.cn/anthropic",
+                "https://api.anthropic.com",
+                ""};
+        final String[] notes = {
+                "Coding Plan 专用端点；通用按量 Key 请用 open.bigmodel.cn/api/paas/v4",
+                "Key 形如 sk-sp-…；官方限定交互式编程工具使用",
+                "Claude Code 直填这一组",
+                "开放平台 platform.moonshot.cn 领 Key",
+                "官方 Key，需要海外出口",
+                "自己填服务地址（Anthropic 兼容）"};
+        LinearLayout list = Ui.column(this);
+        boolean domesticHeaderDone = false;
+        boolean overseasHeaderDone = false;
+        for (int i = 0; i < names.length; i++) {
+            final int which = i;
+            /* 复用同一套国内/国外判据（含"国际版"例外），分组口径与上面那张表保持一致。 */
+            boolean domestic = isDomestic(Config.TYPE_ANTHROPIC, names[i]);
+            if (domestic && !domesticHeaderDone) {
+                subHeader(list, "国内");
+                domesticHeaderDone = true;
+            } else if (!domestic && !overseasHeaderDone) {
+                subHeader(list, "国外");
+                overseasHeaderDone = true;
+            }
+            LinearLayout row = Ui.listRow(this, names[i],
+                    bases[i].isEmpty() ? "自己填服务地址" : bases[i]);
+            row.setOnClickListener(v -> {
+                if (currentDialog != null) currentDialog.dismiss();
+                p.name = names[which];
+                p.baseUrl = bases[which];
+                ProviderEditor.show(this, p, true, this::refreshStatus);
+            });
+            list.addView(row, Ui.lp(this, 8));
+            LinearLayout hint = Ui.column(this);
+            hint.addView(Ui.label(this, notes[i]));
+            LinearLayout.LayoutParams hlp = Ui.lp(this, 4);
+            hlp.leftMargin = Ui.dp(this, 12);
+            list.addView(hint, hlp);
+        }
+        currentDialog = Ui.dialog(this, "选择 Anthropic 兼容端点", Ui.scroller(this, list),
+                "取消", null, null, null);
     }
 
     private void loginWorkBuddy(final Config.Provider p) {
