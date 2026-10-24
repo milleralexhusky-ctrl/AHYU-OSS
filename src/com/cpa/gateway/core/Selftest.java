@@ -902,6 +902,42 @@ public final class Selftest {
         if (!pinned.equals(Server.compatModel(pinned))) {
             return "带前缀的点名被改写成了 " + Server.compatModel(pinned);
         }
+        /* Dsh 实弹形状（4.55.2 的病根）：厂商命名空间 + [1m] 上下文后缀。
+           本地没有叫 anthropic 的账号时，它是命名空间不是点名 ——
+           照原样路由会 404（"没有账号提供 anthropic/claude-opus-4-6[1m]"），
+           必须落到虚拟模型。 */
+        String dsh = "anthropic/claude-opus-4-6[1m]";
+        boolean hasAnthropicAcct = false;
+        for (Config.Provider p : Gateway.config().providers) {
+            if (p.dispatchable() && (p.name.equalsIgnoreCase("anthropic")
+                    || p.id.equalsIgnoreCase("anthropic")
+                    || Server.shortLabelOf(p).equalsIgnoreCase("anthropic"))) {
+                hasAnthropicAcct = true;
+            }
+        }
+        if (Gateway.config().providers.isEmpty()) {
+            /* 冷启动窗口：账号表还没加载完，「本地有没有 anthropic 账号」不可知，
+               isVendorNamespace 按红线保守当点名 → Dsh 形状此时不落虚拟模型是**预期**的。
+               跳过而不是报错（4.52.2 同一课：竞态报成缺陷 = 假红训练人忽略自检）。
+               点名红线与 [1m] 无斜杠两条不受影响，照常断言。 */
+            if (!Router.isVirtual(Server.compatModel("claude-opus-4-6[1m]"))) {
+                return "claude-*[1m] 形态没被映射（后缀遮蔽了 Anthropic 形状判断）";
+            }
+            return null;
+        }
+        if (!hasAnthropicAcct) {
+            String got = Server.compatModel(dsh);
+            if (!Router.isVirtual(got)) {
+                return "Dsh 默认模型名 " + dsh + " 没落到虚拟模型（Anthropic 入口整条 404）：" + got;
+            }
+            if (!Server.isVendorNamespace(dsh)) {
+                return "anthropic/ 前缀没被识别为厂商命名空间";
+            }
+        }
+        /* [1m] 后缀单独出现（无斜杠）也要能映射。 */
+        if (!Router.isVirtual(Server.compatModel("claude-opus-4-6[1m]"))) {
+            return "claude-*[1m] 形态没被映射（后缀遮蔽了 Anthropic 形状判断）";
+        }
         return null;
     }
 

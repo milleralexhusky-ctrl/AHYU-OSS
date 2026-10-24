@@ -3554,8 +3554,21 @@ public final class Server {
         if (model == null || model.isEmpty()) return model;
         String m = model.trim();
         int slash = m.indexOf('/');
-        /* 带前缀的点名（账号/模型）不碰：那是用户明确指定的路由。 */
-        if (slash > 0) return model;
+        /* 带前缀的点名（账号/模型）不碰：那是用户明确指定的路由。
+           但 slash > 0 有两种完全不同的形状，4.55.2 之前混为一谈了：
+           "WB1/claude-x"（真的点名了一个本地账号）vs
+           "anthropic/claude-opus-4-6[1m]"（聚合器厂商前缀，本地并没有
+           叫 anthropic 的账号）。判据用现成的 byShortLabel：前缀对得上
+           某个可派发渠道才算点名。实测 Dsh 默认就会发
+           anthropic/claude-opus-4-6[1m]，旧逻辑照原样点名 → 没有渠道
+           提供它 → 404，Anthropic 入口对 Dsh 用户整条不可用。 */
+        if (slash > 0 && !isVendorNamespace(m)) return model;
+        if (slash > 0) m = m.substring(slash + 1);
+        /* 上下文变体后缀（Claude Code 的 [1m] = 1M 上下文模式）。
+           它不是模型名的一部分，带着它查本地目录永远查不到。
+           剥掉后再走下面的 Anthropic 形状判断。 */
+        int br = m.indexOf('[');
+        if (br > 0) m = m.substring(0, br);
         if (Router.isVirtual(m)) return model;
         String low = m.toLowerCase(java.util.Locale.US);
         boolean looksAnthropic = low.startsWith("claude-")
@@ -3575,6 +3588,40 @@ public final class Server {
                 + "已按虚拟模型 auto 选路（Claude Code 有本地模型白名单，"
                 + "直接报 404 会让它连请求都不发）");
         return Router.AUTO;
+    }
+
+    /**
+     * "厂商/模型" 里的前缀到底是**本地账号点名**，还是**聚合器的厂商命名空间**？
+     *
+     * <p>判据不猜关键词，用现成的点名口径（与 {@code pick} / {@code byShortLabel}
+     * 一致）：前缀对得上短标签、渠道名或渠道 id，就是用户真的在点名；
+     * 对不上（{@code anthropic}、{@code openrouter}、{@code google} 这类
+     * 厂商命名空间）就不是点名，放行给 compatModel 继续处理。
+     *
+     * <p>误判两个方向都不致命但不对称：把点名当成命名空间 = 抢走用户配好的
+     * 同名账号（4.53.3 立过红线，不能）；把命名空间当成点名 = 这次的 404
+     * 整条不可用（也坏）。所以判据必须用「本地有没有这个账号」这种事实核查，
+     * 不能列厂商前缀名单 —— 名单永远缺新面孔。
+     */
+    static boolean isVendorNamespace(String model) {
+        int slash = model.indexOf('/');
+        if (slash <= 0) return false;
+        java.util.List<Config.Provider> ps = Gateway.config().providers;
+        /* 配置还没加载完（冷启动窗口）：账号表是空的，「本地有没有这个账号」
+           这个事实**不可知**。此时按红线保守处理 —— 当它是指名，不改写。
+           这是 4.52.2「竞态不能报成缺陷」的同一课：真机自检首跑就是这么红的
+           （WorkBuddy 1/claude-* 被判成命名空间剥掉了），第二次跑（配置就绪）才绿。
+           代价不对称：把点名当命名空间 = 抢用户账号（4.53.3 红线）；
+           把命名空间当点名 = 顶多这次 404，下次请求配置就绪就正常了。 */
+        if (ps == null || ps.isEmpty()) return false;
+        String prefix = model.substring(0, slash);
+        for (Config.Provider p : ps) {
+            if (!p.dispatchable()) continue;
+            if (ShortName.of(ps, p).equalsIgnoreCase(prefix)
+                    || p.name.equalsIgnoreCase(prefix)
+                    || p.id.equalsIgnoreCase(prefix)) return false;
+        }
+        return true;
     }
 
     /**
