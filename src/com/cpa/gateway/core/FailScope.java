@@ -78,6 +78,19 @@ enum FailScope {
             return ACCOUNT;
         }
 
+        /* WorkBuddy 11133 / ext 1210 "rejected by the model provider"：
+           上游的**模型侧**故障话术（zh 原文「模型提供方错误」），不是我们的请求不合法。
+           真机实证（2026-10-25）：同一份最小请求体 glm-5.1 必回 11133、
+           hy3 正常 —— 换模型能过、换号没用（两个号背靠背都 11133）。
+           旧版它落到下面的 InvalidRequest 分支变成 REQUEST：点名时不换号直接死、
+           轮换时 stopRotation 中止整轮 —— 一个上游坏模型把整个池子陪葬。
+           必须排在 InvalidRequest 之前：它就是以 HTTP 400 InvalidRequest 的形状进来的。 */
+        if (msg.contains("rejected by the model provider")
+                || msg.contains("模型提供方错误") || msg.contains("模型无法处理")
+                || (msg.contains("11133") && msg.contains("model"))) {
+            return MODEL_BAD;
+        }
+
         /* InvalidRequest 必须先于网络关键词判断：HTTP 400 "request body is not json"
            是请求问题，不是断流；以前会被 "not json" 误判成 TRANSIENT 然后换号重试。 */
         if (t instanceof InvalidRequest) return REQUEST;

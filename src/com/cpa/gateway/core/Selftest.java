@@ -3241,6 +3241,21 @@ public final class Selftest {
                     "this model does not support tool_choice"));
             if (unsupported != FailScope.REQUEST) return "模型不支持某参数被误判成模型接入问题";
 
+            /* WorkBuddy 11133「模型提供方错误」（真机 2026-10-25）：上游模型侧故障话术，
+               换模型能过、换号没用。曾被下面的 InvalidRequest 吞成 REQUEST ——
+               点名第一个号就死、轮换中止整轮，一个坏 glm-5.1 陪葬整个池。 */
+            String err1133 = "upstream HTTP 400 {\"code\":11133,\"msg\":\"the request parameters"
+                    + " were rejected by the model provider\",\"extError\":{\"code\":\"1210\","
+                    + "\"message\":\"the request parameters were rejected by the model provider\","
+                    + "\"type\":\"invalid_request_error\",\"StatusCode\":400},"
+                    + "\"displayMsg\":{\"zh\":\"模型提供方错误，请稍后重试\"}}";
+            FailScope provider = FailScope.of(new InvalidRequest(400, err1133));
+            if (provider != FailScope.MODEL_BAD) {
+                return "11133 模型提供方错误没归到模型侧（会被当请求不合法，中止整轮换模型）";
+            }
+            if (!provider.skipModelInRotation()) return "11133 在轮换时没跳过该模型";
+            if (provider.stopRotation()) return "11133 不该中止整轮（换个模型就能过）";
+
             FailScope req = FailScope.of(new InvalidRequest(400,
                     "请求不合规（我们自己这侧，不是渠道问题）：tool_call 缺少 id"));
             if (req != FailScope.REQUEST) return "请求不合规没归到请求问题";
