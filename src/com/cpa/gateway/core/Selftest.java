@@ -769,6 +769,8 @@ public final class Selftest {
      *   · **不误伤**（别的渠道 / 别的客户端提示词原样透传）。
      *
      * 真机实测（2026-10-23）：两个特征串各自 8/8 触发 11128，混淆后 8/8 通过。
+     * 第三枚（DeepSeek Harness，2026-10-24）没有上游可实测，钉的是混淆生效、
+     * 内容等价、预筛不漏词、不误伤这四件我们能自己验证的事。
      */
     private static String checkRiskPrompt() {
         String preamble = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -825,6 +827,36 @@ public final class Selftest {
         if (fixedBill == bill) return "计费头没有被混淆（真机实测它单独就能触发 11128）";
         if (!fixedBill.replace(z, "").equals(bill)) {
             return "计费头混淆改变了内容：" + fixedBill;
+        }
+        /* DeepSeek Harness（第三枚，2026-10-24 照 Dsh 社区方案加的，本机无实测）。
+           没有上游可验证命中与否，所以这里钉的是**我们能钉住的部分**：
+           混淆生效、内容逐字等价、以及最容易做错的一件事 ——
+           预筛。system 里只有这枚指纹、一个 "claude" 都没有时，
+           若预筛没加 deepseek，整条会被放过，混淆形同虚设且无声无息。 */
+        String dsh = "You are DeepSeek Harness, an interactive agent for AI-powered software engineering.";
+        String fixedDsh = RiskPrompt.neutralize(dsh);
+        if (fixedDsh == dsh) return "DeepSeek Harness 身份句没有被混淆（预筛漏了 deepseek？）";
+        if (fixedDsh.contains("DeepSeek Harness")) return "Dsh 指纹串原样还在：" + fixedDsh;
+        if (!fixedDsh.replace(z, "").equals(dsh)) {
+            return "Dsh 混淆改变了内容（去零宽后不等于原文）：" + fixedDsh;
+        }
+        /* 预筛回归的直接断言：完全没有 claude / x-anthropic 字样，只靠 deepseek 进正则分支。 */
+        String dshOnly = "Identity: deepseek harness v2";
+        if (RiskPrompt.neutralize(dshOnly) == dshOnly) return "小写且无 claude 的 Dsh 句没被混淆（预筛回归）";
+        for (String slug : new String[]{"deepseek-harness", "deepseek_harness", "DEEPSEEK-HARNESS"}) {
+            String fixedDslug = RiskPrompt.neutralize(slug);
+            if (fixedDslug == slug) return "Dsh slug 形态 " + slug + " 没有被混淆";
+            if (!fixedDslug.replace(z, "").equals(slug)) {
+                return "Dsh slug 形态 " + slug + " 混淆改变了内容：" + fixedDslug;
+            }
+            if (fixedDslug.contains(slug)) return "Dsh slug 形态 " + slug + " 指纹仍然完好：" + fixedDslug;
+        }
+        /* 不误伤（与前两枚同样的克制）：单独出现的词不算指纹。
+           "deepseek" 单独出现是极常见的（用户就在聊 DeepSeek 模型），
+           动它等于污染正常对话内容。 */
+        String dshBare = "The deepseek model is cheap. Buckle up your harness.";
+        if (RiskPrompt.neutralize(dshBare) != dshBare) {
+            return "deepseek 与 harness 分开出现也被改了：" + RiskPrompt.neutralize(dshBare);
         }
         /* 不误伤：普通提示词必须原对象返回（调用方靠 == 判断有没有改动）。 */
         String plain = "You are a helpful assistant. Write clean code.";
