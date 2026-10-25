@@ -1367,7 +1367,9 @@ public final class Upstreams {
         h.put("anthropic-version", "2023-06-01");
         h.put("content-type", "application/json");
         h.put("accept", "text/event-stream");
-        h.put("user-agent", "claude-cli/2.1.280 (external, cli)");
+        /* 与 Claude 渠道共用同一份常量：两处各写一遍字面量，改一处漏一处就会让
+           同一个网关的两个 Anthropic 出站路径报不同的客户端版本。 */
+        h.put("user-agent", Claude.USER_AGENT);
         h.put("x-app", "cli");
         if (beta != null && !beta.trim().isEmpty()) h.put("anthropic-beta", beta.trim());
         return h;

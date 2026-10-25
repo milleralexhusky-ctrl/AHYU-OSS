@@ -24,7 +24,18 @@ public final class Ovh {
 
     public static final String TYPE = "ovh";
     public static final String BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1";
-    private static final String UA = "AHYU/4.21.0";
+    /**
+     * 自报身份的 UA：`AHYU/<真实版本>`。
+     *
+     * <p>以前写死 `AHYU/4.21.0`，到 4.59.0 已经落后 38 个版本 —— 上游日志里
+     * 我们一直自称一个不存在的旧版本。这里改成读运行时版本，取不到就退回 `AHYU`。
+     * 这不是冒充官方客户端（OVH 是零凭证公开池，没有官方客户端可冒充），
+     * 只是如实说明"谁在调用"。
+     */
+    private static String ua() {
+        String v = Backup.versionTag();
+        return v == null || v.isEmpty() ? "AHYU" : "AHYU/" + v;
+    }
 
     private Ovh() {
     }
@@ -35,7 +46,7 @@ public final class Ovh {
         try {
             Map<String, String> h = new HashMap<>();
             h.put("Accept", "application/json");
-            h.put("User-Agent", UA);
+            h.put("User-Agent", ua());
             Http.Resp r = Http.call("GET", BASE + "/models", h, null, "application/json",
                     8000, 20000, false);
             if (r.code >= 400) {
@@ -74,7 +85,7 @@ public final class Ovh {
         Map<String, String> h = new HashMap<>();
         h.put("Content-Type", "application/json");
         h.put("Accept", "text/event-stream");
-        h.put("User-Agent", UA);
+        h.put("User-Agent", ua());
         return h;
     }
 

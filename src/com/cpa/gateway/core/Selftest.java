@@ -1618,6 +1618,10 @@ public final class Selftest {
         if (!"cli".equals(h.get("x-app"))) return "缺少 Claude Code 的 x-app: cli";
         String ua = h.get("user-agent");
         if (ua == null || !ua.startsWith("claude-cli/")) return "User-Agent 不是 Claude Code 形状：" + ua;
+        /* 两个 Anthropic 出站路径必须报同一个客户端版本（以前各写一遍字面量）。 */
+        if (!Claude.USER_AGENT.equals(ua)) {
+            return "Anthropic 中转与 Claude 渠道的 UA 不一致：" + ua + " vs " + Claude.USER_AGENT;
+        }
         if (!"context-1m-2025-08-07".equals(h.get("anthropic-beta"))) return "客户端 beta 没转发";
         java.util.Map<String, String> h2 = Upstreams.anthropicHeaders(p, "");
         if (h2.containsKey("anthropic-beta")) return "没有 beta 时不该凭空发明 anthropic-beta";

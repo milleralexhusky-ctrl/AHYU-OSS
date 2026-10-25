@@ -27,7 +27,20 @@ public final class Claude {
     public static final int CALLBACK_PORT = 54545;
     public static final String SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
     public static final String DEFAULT_BASE = "https://api.anthropic.com";
-    private static final String USER_AGENT = "claude-cli/2.1.280 (external, cli)";
+    /**
+     * 冒充 Claude Code 客户端时用的 UA。
+     *
+     * <p>只有**一份**：`Upstreams.anthropicHeaders()`（Anthropic 中转出站）和这里的
+     * OAuth 上游都用它。以前两处各写一遍字面量，改一处漏一处就会让"同一个网关、
+     * 两个 Anthropic 出站路径报不同的客户端版本"——上游看这是两台机器。
+     *
+     * <p>版本号是**照客户端形状写的身份标识**，不是"我们支持到哪个版本"。
+     * 4.59.0 起统一到 2.1.310（npm `@anthropic-ai/claude-code` 的 latest，
+     * 2026-10-23 发布）。改它之前先确认上游没有按版本做门禁 —— 目前没有证据表明
+     * Anthropic 会按 UA 版本拒绝，但**也没有证据表明不会**，所以只做"两处一致"，
+     * 不做"跟着 npm 自动追"。
+     */
+    public static final String USER_AGENT = "claude-cli/2.1.310 (external, cli)";
 
     public static final class Account {
         public String accessToken = "";
