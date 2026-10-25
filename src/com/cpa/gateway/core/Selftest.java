@@ -105,6 +105,8 @@ public final class Selftest {
         add(out, "流式解析回放（OpenAI/Anthropic/Gemini）", Selftest::checkStreamReplay);
         add(out, "HTTP 请求回放（chunked 中文/多请求对齐）", Selftest::checkHttpRequestReplay);
         add(out, "入口解析保留工具结果 id（OpenAI/Anthropic/Gemini）", Selftest::checkFrontToolResults);
+        add(out, "工具结果跨协议出站：Anthropic/Gemini 的 user 消息要变成 role:tool",
+                Selftest::checkToolResultOutbound);
         add(out, "Ollama 请求翻译与响应形状", Selftest::checkOllamaProtocol);
         add(out, "同协议未知参数透传（top_k/service_tier/metadata）", Selftest::checkExtraBody);
         add(out, "响应保真透传（logprobs / 多 choice / 正文不被改写）", Selftest::checkRawFidelity);
@@ -2899,6 +2901,88 @@ public final class Selftest {
             return null;
         } catch (Throwable t) {
             return "入口解析回放异常：" + t;
+        }
+    }
+
+    /**
+     * 出站 body 里必须有一条带该 id 的 role:tool 消息。返回 null 表示没问题。
+     */
+    private static String toolResultOutboundProblem(JSONObject body, String wantId, String wantText) {
+        JSONArray outMsgs = body == null ? null : body.optJSONArray("messages");
+        for (int i = 0; outMsgs != null && i < outMsgs.length(); i++) {
+            JSONObject m = outMsgs.optJSONObject(i);
+            if (m == null) continue;
+            if (!"tool".equals(Proto.optString(m, "role", ""))) continue;
+            if (!wantId.equals(Proto.optString(m, "tool_call_id", ""))) continue;
+            if (!Proto.optString(m, "content", "").contains(wantText)) continue;
+            return null;
+        }
+        return "工具结果出站没变成 role:tool（上游会报 11148 / 模型以为工具没执行）";
+    }
+
+    /**
+     * 工具结果跨协议出站：Anthropic / Gemini 把它们放在 **user** 消息里
+     * （`tool_result` / `functionResponse` 块），而 OpenAI 家族要求它是一条独立的
+     * `role:"tool"` 消息、且必须紧跟在带 `tool_calls` 的 assistant 之后。
+     *
+     * <p>为什么必须钉住：只要这一步没转，上游看到的就是"assistant 声明调了工具，
+     * 后面却没有任何工具结果"，要么回 400 {@code 11148 tool calls and tool results
+     * do not match}，要么模型以为工具没执行、一遍遍重发同样的调用（就是"降智/死循环"
+     * 那种表现）。日志里两种症状都真实出现过。
+     *
+     * <p>这条断言只测纯函数：入口解析 → 出站 body，不需要网络与账号。
+     */
+    private static String checkToolResultOutbound() {
+        try {
+            JSONObject an = new JSONObject();
+            an.put("model", "m");
+            an.put("max_tokens", 64);
+            JSONArray msgs = new JSONArray();
+            msgs.put(new JSONObject().put("role", "assistant").put("content", new JSONArray()
+                    .put(new JSONObject().put("type", "tool_use").put("id", "toolu_1")
+                            .put("name", "bash").put("input", new JSONObject()))));
+            msgs.put(new JSONObject().put("role", "user").put("content", new JSONArray()
+                    .put(new JSONObject().put("type", "tool_result")
+                            .put("tool_use_id", "toolu_1").put("content", "工具输出"))));
+            an.put("messages", msgs);
+            Proto.Req req = Fronts.AnthropicFront.parse(an);
+            String why = toolResultOutboundProblem(Upstreams.openAiBody("m", req, true), "toolu_1", "工具输出");
+            if (why != null) return "Anthropic：" + why;
+
+            /* Gemini 也是同一个形态：functionResponse 放在 user 的 parts 里。 */
+            JSONObject gm = new JSONObject();
+            JSONArray contents = new JSONArray();
+            contents.put(new JSONObject().put("role", "model").put("parts", new JSONArray()
+                    .put(new JSONObject().put("functionCall", new JSONObject()
+                            .put("name", "bash").put("id", "fc_1")
+                            .put("args", new JSONObject())))));
+            contents.put(new JSONObject().put("role", "user").put("parts", new JSONArray()
+                    .put(new JSONObject().put("functionResponse", new JSONObject()
+                            .put("name", "bash").put("id", "fc_1")
+                            .put("response", new JSONObject().put("result", "工具输出"))))));
+            gm.put("contents", contents);
+            String gw = toolResultOutboundProblem(
+                    Upstreams.openAiBody("m", Fronts.GeminiFront.parse("m", gm), true),
+                    "fc_1", "工具输出");
+            if (gw != null) return "Gemini：" + gw;
+
+            /* 反向回归：OpenAI 入口本来就是 role:tool，不能被改坏。 */
+            JSONObject oa = new JSONObject();
+            oa.put("model", "m");
+            JSONArray omsgs = new JSONArray();
+            omsgs.put(new JSONObject().put("role", "assistant").put("content", JSONObject.NULL)
+                    .put("tool_calls", new JSONArray().put(new JSONObject().put("id", "call_1")
+                            .put("type", "function").put("function", new JSONObject()
+                                    .put("name", "bash").put("arguments", "{}")))));
+            omsgs.put(new JSONObject().put("role", "tool").put("tool_call_id", "call_1")
+                    .put("content", "工具输出"));
+            oa.put("messages", omsgs);
+            String ow = toolResultOutboundProblem(
+                    Upstreams.openAiBody("m", Fronts.OpenAiFront.parse(oa), true), "call_1", "工具输出");
+            if (ow != null) return "OpenAI 入口回归：" + ow;
+            return null;
+        } catch (Throwable t) {
+            return "工具结果出站回放异常：" + t;
         }
     }
 

@@ -894,6 +894,37 @@ public final class Upstreams {
 
     /** One canonical message can hold several tool results; each must become its own tool message. */
     static void appendMessages(JSONArray msgs, Proto.Msg m) throws Exception {
+        /* Anthropic / Gemini 把工具结果放在 **user** 消息里（tool_result / functionResponse 块），
+           而 OpenAI 家族要求它是独立的 role:"tool" 消息并带 tool_call_id。
+           这一步不做，上游看到的就是"assistant 声明调了工具、后面却没有任何工具结果"：
+           WorkBuddy 回 400 {"code":11148,"tool calls and tool results do not match"}，
+           别的模型则以为工具没执行、一遍遍重发同样的调用（"降智 / 死循环"）。
+           顺序不能反：tool 消息必须紧跟在声明 tool_calls 的那条 assistant 之后。 */
+        boolean hasResult = false;
+        for (Proto.Part part : m.parts) {
+            if (Proto.Part.TOOL_RESULT.equals(part.type)) {
+                hasResult = true;
+                break;
+            }
+        }
+        if (hasResult && !"tool".equals(m.role)) {
+            for (Proto.Part part : m.parts) {
+                if (!Proto.Part.TOOL_RESULT.equals(part.type)) continue;
+                Proto.Msg single = new Proto.Msg("tool");
+                single.add(part);
+                msgs.put(openAiMessage(single));
+            }
+            /* 同一条消息里除结果之外还有正文/图片：作为一条普通消息跟在结果后面，
+               否则那些内容会被吞掉（比如"结果 + 继续"写在同一轮的客户端）。 */
+            Proto.Msg rest = new Proto.Msg(m.role);
+            for (Proto.Part part : m.parts) {
+                if (Proto.Part.TOOL_RESULT.equals(part.type)) continue;
+                if (Proto.Part.TEXT.equals(part.type) && (part.text == null || part.text.isEmpty())) continue;
+                rest.add(part);
+            }
+            if (!rest.parts.isEmpty()) msgs.put(openAiMessage(rest));
+            return;
+        }
         if ("tool".equals(m.role)) {
             JSONArray results = new JSONArray();
             for (Proto.Part part : m.parts) {
