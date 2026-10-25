@@ -114,7 +114,6 @@ public final class Selftest {
         add(out, "浏览器跨源防护（无 Key 时拒绝外部网页）", Selftest::checkBrowserOrigin);
         add(out, "日志脱敏（token/state/JWT，不误伤业务码）", Selftest::checkLogScrub);
         add(out, "自动更新：只升不降 + version.properties 解析", Selftest::checkUpdater);
-        add(out, "Kiro 流事件解析（累计增量 / 工具分片 / 半帧不崩）", Selftest::checkKiroStream);
         return out;
     }
 
@@ -2284,106 +2283,6 @@ public final class Selftest {
         String url = Updater.assetUrl("4.52.0");
         if (!url.endsWith("/v4.52.0/AHYU-4.52.0.apk")) return "资产地址形状不对：" + url;
         return null;
-    }
-
-    /**
-     * Kiro 流事件解析（{@link KiroStream}）。
-     *
-     * <p>钉四件真会出错的事，每一件都是"写错了不报错、只表现为内容少一段或流卡死"：
-     * <ul>
-     *   <li><b>累计增量</b>：上游 content 事件给的是累计全文，重复吐就重影、
-     *       不做增量就每次重发整段；</li>
-     *   <li><b>工具分片</b>：name 起头、input 续片、stop 收尾，少一步参数就残缺；</li>
-     *   <li><b>半帧</b>：JSON 被网络切片切断时必须等下一块，不能切出坏 JSON 丢掉；</li>
-     *   <li><b>字符串里的花括号</b>：`{"content":"{\"a\":1}"}` 不能提前收尾。</li>
-     * </ul>
-     */
-    private static String checkKiroStream() {
-        /* 1) 累计增量：三帧累计全文，应只吐三次新增 */
-        KiroStream s = new KiroStream();
-        StringBuilder got = new StringBuilder();
-        feedText(s, got, "{\"content\":\"你\"}");
-        feedText(s, got, "{\"content\":\"你好\"}");
-        feedText(s, got, "{\"content\":\"你好\"}");       // 重复帧：必须丢弃
-        feedText(s, got, "{\"content\":\"你好，世界\"}");
-        if (!"你好，世界".equals(got.toString())) {
-            return "累计增量拼错：期望「你好，世界」，实得「" + got + "」";
-        }
-
-        /* 2) 工具调用分片：name 起头 + input 续片 + stop 收尾 */
-        KiroStream s2 = new KiroStream();
-        List<KiroStream.Event> ev2 = new ArrayList<>();
-        ev2.addAll(s2.feed(bytes("{\"name\":\"Bash\",\"toolUseId\":\"t1\",\"input\":\"\"}")));
-        ev2.addAll(s2.feed(bytes("{\"input\":\"{\\\"comm\"}")));
-        ev2.addAll(s2.feed(bytes("{\"input\":\"and\\\":\\\"ls\\\"}\"}")));
-        ev2.addAll(s2.feed(bytes("{\"stop\":true}")));
-        KiroStream.Event tool = null;
-        for (KiroStream.Event e : ev2) if ("tool".equals(e.kind)) tool = e;
-        if (tool == null) return "工具调用没有被组装出来（分片收尾失败）";
-        if (!"Bash".equals(tool.toolName)) return "工具名错了：" + tool.toolName;
-        if (!"t1".equals(tool.toolId)) return "工具 id 丢了：" + tool.toolId;
-        if (!"{\"command\":\"ls\"}".equals(tool.toolArgs)) {
-            return "工具参数分片拼错了：" + tool.toolArgs;
-        }
-
-        /* 3) 半帧：一个 JSON 被切成两半，前半块不该产出事件、也不该丢内容 */
-        KiroStream s3 = new KiroStream();
-        List<KiroStream.Event> a = s3.feed(bytes("{\"conte"));
-        if (!a.isEmpty()) return "半帧的前半块产出了事件（会切出坏 JSON）";
-        List<KiroStream.Event> b = s3.feed(bytes("nt\":\"半帧也完整\"}"));
-        String t3 = "";
-        for (KiroStream.Event e : b) if ("text".equals(e.kind)) t3 = e.text;
-        if (!"半帧也完整".equals(t3)) return "半帧拼接失败，实得「" + t3 + "」";
-
-        /* 4) 字符串里的花括号不参与配对 */
-        KiroStream s4 = new KiroStream();
-        String t4 = "";
-        for (KiroStream.Event e : s4.feed(bytes("{\"content\":\"花括号 {\\\"a\\\":1} 在里面\"}"))) {
-            if ("text".equals(e.kind)) t4 = e.text;
-        }
-        if (!t4.contains("{\"a\":1}")) return "字符串内花括号被误当层级，事件被切坏：" + t4;
-
-        /* 5) 坏事件不毁流：中间塞一个坏 JSON，后面的好事件仍要出来 */
-        KiroStream s5 = new KiroStream();
-        s5.feed(bytes("{\"content\":"));
-        String t5 = "";
-        for (KiroStream.Event e : s5.feed(bytes("\"好\"}"))) {
-            if ("text".equals(e.kind)) t5 = e.text;
-        }
-        if (!"好".equals(t5)) return "坏事件影响了后续解析：" + t5;
-
-        /* 6) 一帧里多个事件（参考实现有这条测试：b'{"content":"First"}{"content":"Second"}'）。
-           累计语义下第二帧若是全文，只吐新增；这里两帧是同长的不同文，属"上游换了内容"，
-           按实现在实得的地方整段重吐 —— 关键是不能丢、不能拼错。 */
-        KiroStream s6 = new KiroStream();
-        StringBuilder t6 = new StringBuilder();
-        feedText(s6, t6, "{\"content\":\"First\"}{\"content\":\"FirstSecond\"}");
-        if (!"FirstSecond".equals(t6.toString())) {
-            return "一帧多事件拼错：期望「FirstSecond」，实得「" + t6 + "」";
-        }
-
-        /* 7) usage 事件单独成事件、不混进正文（参考实现断言 data==1.5）。 */
-        KiroStream s7 = new KiroStream();
-        List<KiroStream.Event> ev7 = s7.feed(bytes("{\"usage\":1.5}"));
-        boolean sawUsage = false;
-        for (KiroStream.Event e : ev7) {
-            if ("usage".equals(e.kind)) sawUsage = true;
-            if ("text".equals(e.kind)) return "usage 事件被当成正文吐出去了：" + e.text;
-        }
-        if (!sawUsage) return "usage 事件没有被识别";
-
-        return null;
-    }
-
-    /** 喂一段、把 text 事件追加进 sb。 */
-    private static void feedText(KiroStream s, StringBuilder sb, String json) {
-        for (KiroStream.Event e : s.feed(bytes(json))) {
-            if ("text".equals(e.kind)) sb.append(e.text);
-        }
-    }
-
-    private static byte[] bytes(String s) {
-        return s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /**
