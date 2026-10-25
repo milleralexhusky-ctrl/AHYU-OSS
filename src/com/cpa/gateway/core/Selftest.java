@@ -71,6 +71,7 @@ public final class Selftest {
         add(out, "检测采样跳过非聊天模型", Selftest::checkDetectSampling);
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
         add(out, "原样重发熔断（连续无效就停，成功即恢复）", Selftest::checkResendBreaker);
+        add(out, "工具探活失败退避（坏模型不再每 30 秒重探）", Selftest::checkProbeBackoff);
         add(out, "WorkBuddy 会话头与新版风控归类", Selftest::checkWorkBuddyChannel);
         add(out, "Anthropic Messages 上游（Claude Code 接入地址）", Selftest::checkAnthropicUpstream);
         add(out, "给客户端的两种根地址（Claude Code 那条不带 /v1）", Selftest::checkClientBaseUrls);
@@ -1341,6 +1342,32 @@ public final class Selftest {
             }
         }
         return null;
+    }
+
+    /**
+     * 工具探活失败的退避：坏模型不能每 30 秒重探一次。
+     *
+     * <p>真机看到 `WorkBuddy 1/glm-5.1` 被探了 114 次（106 次 HTTP 500），
+     * 因为探活失败不写结论，`state` 仍是 UNKNOWN，下一个带工具的请求又重探。
+     * 这里钉住"失败后要退避、退避要翻倍、成功要清零"。
+     */
+    private static String checkProbeBackoff() {
+        String key = "自检/探活退避-" + System.nanoTime();
+        try {
+            if (ToolAbility.probeBackoffRemainingMs(key) != 0L) return "初始状态就有退避";
+            ToolAbility.noteProbeFailedForTest(key);
+            long first = ToolAbility.probeBackoffRemainingMs(key);
+            if (first <= 0L) return "第一次失败后没有退避";
+            /* 第二次失败必须比第一次等得更久（翻倍）。测试里两次调用几乎同时，
+               所以直接比较剩余时间：第二次应约为第一次的两倍。 */
+            ToolAbility.noteProbeFailedForTest(key);
+            long second = ToolAbility.probeBackoffRemainingMs(key);
+            if (second <= first) return "失败退避没有增长：" + first + " → " + second;
+            if (second > 31L * 60_000L) return "退避超过封顶：" + second;
+            return null;
+        } finally {
+            ToolAbility.forgetProbeBackoff(key);
+        }
     }
 
     /**

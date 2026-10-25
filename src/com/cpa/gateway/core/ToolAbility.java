@@ -115,13 +115,78 @@ final class ToolAbility {
     private static final java.util.Map<String, Long> LAST_PROBE =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * 探活**失败**后的退避（4.58.0）。
+     *
+     * <p>为什么必须有：探活失败时不写任何结论（`state` 仍是 UNKNOWN），
+     * 于是下一个带工具的请求又会对**同一个坏模型**重探一次 —— 30 秒一次，永不停止。
+     * 真机日志里 `WorkBuddy 1/glm-5.1` 一个坏模型被探了 **114 次**（其中 106 次 HTTP 500），
+     * 每次都是一次真实上游调用，全部落空。
+     *
+     * <p>失败次数翻倍退避（1 → 2 → 4 → 8 … 分钟，封顶 30 分钟），
+     * 探活**成功**（无论最后结论是 native / bad / 没下结论）就清零 ——
+     * 那时模型是可用的，没有理由继续躲着它。
+     *
+     * <p>值：{失败次数, 下次允许探活的时刻}。
+     */
+    private static final java.util.Map<String, long[]> PROBE_BACKOFF =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long PROBE_BACKOFF_BASE_MS = 60_000L;
+    private static final long PROBE_BACKOFF_MAX_MS = 30 * 60_000L;
+
+    /** 这次探活失败：翻倍退避。 */
+    private static void noteProbeFailed(String key) {
+        long[] st = PROBE_BACKOFF.computeIfAbsent(key, k -> new long[]{0, 0});
+        synchronized (st) {
+            st[0]++;
+            long wait = PROBE_BACKOFF_BASE_MS << Math.min(st[0] - 1, 5);   // 1,2,4,8,16,32 分钟
+            if (wait > PROBE_BACKOFF_MAX_MS) wait = PROBE_BACKOFF_MAX_MS;
+            st[1] = System.currentTimeMillis() + wait;
+        }
+    }
+
+    /** 这次探活拿到了可用响应：清零退避。 */
+    private static void noteProbeReachable(String key) {
+        PROBE_BACKOFF.remove(key);
+    }
+
+    /** 包可见：自检用，看这个 key 还要多久才允许再探（0 = 现在就可以）。 */
+    static long probeBackoffRemainingMs(String key) {
+        long[] st = PROBE_BACKOFF.get(key);
+        if (st == null) return 0L;
+        synchronized (st) {
+            long left = st[1] - System.currentTimeMillis();
+            return left > 0 ? left : 0L;
+        }
+    }
+
+    /** 包可见：自检用，直接记一次失败（不真的发请求）。 */
+    static void noteProbeFailedForTest(String key) {
+        noteProbeFailed(key);
+    }
+
+    /** 包可见：自检用，清掉一个 key 的退避。 */
+    static void forgetProbeBackoff(String key) {
+        PROBE_BACKOFF.remove(key);
+    }
+
     /** 还没记录过就后台探一次；不阻塞当前请求。 */
     static void probeAsync(final Config.Provider p, final String model) {
         if (state(p, model) != UNKNOWN) return;
         long now = System.currentTimeMillis();
         Long last = LAST_PROBE.get(p.name);
         if (last != null && now - last < 30_000L) return;
-        if (!PROBING.add(p.name + "/" + model)) return;
+        /* 账号正在额度/凭证回避里：探活也只会再撞一次同样的墙，
+           而且这次调用本身还算在用户账号上。等回避过去再说。 */
+        if (Router.accountAvoided(p.name, now)) return;
+        String key = p.name + "/" + model;
+        long[] backoff = PROBE_BACKOFF.get(key);
+        if (backoff != null) {
+            synchronized (backoff) {
+                if (backoff[1] > now) return;
+            }
+        }
+        if (!PROBING.add(key)) return;
         LAST_PROBE.put(p.name, now);
         Threads.io(() -> {
             try {
@@ -156,9 +221,11 @@ final class ToolAbility {
                         "http://127.0.0.1:" + cfg.port + "/v1/chat/completions",
                         headers, payload, "application/json", 8000, 90000, false);
                 if (resp.code != 200) {
+                    noteProbeFailed(key);
                     Log.w("工具探活失败（" + p.name + "/" + model + "）：HTTP " + resp.code);
                     return;
                 }
+                noteProbeReachable(key);
                 JSONObject o = new JSONObject(resp.body);
                 JSONArray choices = o.optJSONArray("choices");
                 JSONObject msg = choices == null || choices.length() == 0 ? null
@@ -176,9 +243,10 @@ final class ToolAbility {
                 }
                 note(p, model, nativeOk);
             } catch (Exception e) {
+                noteProbeFailed(key);
                 Log.w("工具探活异常（" + model + "）：" + e);
             } finally {
-                PROBING.remove(p.name + "/" + model);
+                PROBING.remove(key);
             }
         });
     }
