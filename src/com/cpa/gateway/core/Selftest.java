@@ -70,6 +70,7 @@ public final class Selftest {
         add(out, "检测失败归类（业务码里的数字不算 HTTP 状态码）", Selftest::checkDetectClassify);
         add(out, "检测采样跳过非聊天模型", Selftest::checkDetectSampling);
         add(out, "渠道校验重试只认会话标识类错误", Selftest::checkConvRetry);
+        add(out, "原样重发熔断（连续无效就停，成功即恢复）", Selftest::checkResendBreaker);
         add(out, "WorkBuddy 会话头与新版风控归类", Selftest::checkWorkBuddyChannel);
         add(out, "Anthropic Messages 上游（Claude Code 接入地址）", Selftest::checkAnthropicUpstream);
         add(out, "给客户端的两种根地址（Claude Code 那条不带 /v1）", Selftest::checkClientBaseUrls);
@@ -1340,6 +1341,33 @@ public final class Selftest {
             }
         }
         return null;
+    }
+
+    /**
+     * "原样重发"的熔断：连续无效就停，一次成功就恢复。
+     *
+     * <p>为什么值得钉住：2026-10-25 真机日志里 51 次请求级风控、重发 102 回、
+     * `重发通过` 计数为 **0**，而每轮要付 2 个上游往返 + 2 秒 sleep（阻塞请求线程）。
+     * 熔断错了任一方向都不好：该开不开是纯浪费，该关不关则会把"偶发拦截能救回来"
+     * 这条真实存在的路永久掐死。用独立的测试账号名，不污染真实账号状态。
+     */
+    private static String checkResendBreaker() {
+        String who = "自检-重发熔断-" + System.nanoTime();
+        try {
+            if (!WorkBuddy.resendAllowed(who)) return "初始状态就不允许重发";
+            /* 前两次失败还允许（阈值是 3），第三次才熔断。 */
+            WorkBuddy.noteResendFailed(who, false);
+            WorkBuddy.noteResendFailed(who, false);
+            if (!WorkBuddy.resendAllowed(who)) return "没到阈值就熔断（偶发拦截会被一并放弃）";
+            WorkBuddy.noteResendFailed(who, false);
+            if (WorkBuddy.resendAllowed(who)) return "连续 3 次无效之后还没熔断";
+            /* 一次成功必须立刻恢复，并清掉计数。 */
+            WorkBuddy.noteResendWorked(who);
+            if (!WorkBuddy.resendAllowed(who)) return "重发成功之后没恢复";
+            return null;
+        } finally {
+            WorkBuddy.forgetResendState(who);
+        }
     }
 
     private static String checkConvRetry() {

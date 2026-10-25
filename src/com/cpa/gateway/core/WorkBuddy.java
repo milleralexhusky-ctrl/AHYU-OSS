@@ -702,6 +702,68 @@ public final class WorkBuddy {
             java.util.Collections.newSetFromMap(
                     new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
 
+    /* ---------------------------------------- "原样重发"的熔断（4.57.0）
+     *
+     * 4.50.4 加这条的依据是"上游说请重新发送，等一两秒原样重发就可能过"，
+     * 当时的验证是一次真实请求重放。但 2026-10-25 的真机日志里，这个前提**不成立**：
+     * 51 次请求级风控，每次重发 2 回，全部未放行，`重发通过` 计数为 0。
+     * 代价却是实打实的：每轮多 2 个上游往返 + 500ms/1500ms 两次 sleep（阻塞在请求线程上）。
+     *
+     * 不能直接删掉 —— 4.53.3 之前它确实救回过请求，删了等于连同"偶发拦截"那条路一起放弃。
+     * 所以做成熔断：连续 N 次重发都没放行，这个账号 10 分钟内不再重发，
+     * 冷却结束自动再试。有效时行为完全不变，无效时不再白付往返和等待。
+     */
+    private static final int RESEND_TRIP_AFTER = 3;
+    private static final long RESEND_COOLDOWN_MS = 10 * 60_000L;
+
+    /** 账号名 → {连续失败轮数, 熔断截止时刻}。 */
+    private static final java.util.Map<String, long[]> RESEND_STATE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 这个账号现在还要不要做"原样重发"（熔断期内跳过）。 */
+    static boolean resendAllowed(String name) {
+        long[] st = RESEND_STATE.get(name);
+        if (st == null) return true;
+        synchronized (st) {
+            return st[1] <= System.currentTimeMillis();
+        }
+    }
+
+    /** 忘掉一个账号的熔断状态（自检演练结束后清掉，别在 map 里越攒越多）。 */
+    static void forgetResendState(String name) {
+        RESEND_STATE.remove(name);
+    }
+
+    /** 重发放行了一次：说明这条路还通，清掉计数与熔断。 */
+    static void noteResendWorked(String name) {
+        long[] st = RESEND_STATE.get(name);
+        if (st == null) return;
+        synchronized (st) {
+            st[0] = 0;
+            st[1] = 0;
+        }
+    }
+
+    /** 一轮重发用尽仍未放行：累计到阈值就熔断一段时间。 */
+    static void noteResendFailed(String name) {
+        noteResendFailed(name, true);
+    }
+
+    /** @param log 自检用假账号演练时传 false，别把演练记录当成真事写进应用日志 */
+    static void noteResendFailed(String name, boolean log) {
+        long[] st = RESEND_STATE.computeIfAbsent(name, k -> new long[]{0, 0});
+        synchronized (st) {
+            st[0]++;
+            if (st[0] < RESEND_TRIP_AFTER) return;
+            st[0] = 0;
+            st[1] = System.currentTimeMillis() + RESEND_COOLDOWN_MS;
+            if (log) {
+                Log.i("workbuddy：" + name + " 原样重发连续 " + RESEND_TRIP_AFTER
+                        + " 次都没放行，10 分钟内不再重发（省往返与 2 秒等待）");
+            }
+        }
+    }
+
     /**
      * "试到底"标记的统一查询：内存 Set + 落盘的 Provider.hopeless 都要看。
      *
@@ -1092,6 +1154,8 @@ public final class WorkBuddy {
                整个 chat() 有上限，避免把偶发拦截变成重试风暴。 */
             final int[] resent = {0};
             final int RESEND_MAX = 2;
+            /* 熔断打开时直接不重发：连"偶发拦截"都救不回，就别付那 2 个往返 + 2 秒。 */
+            final boolean mayResend = resendAllowed(p.name);
             for (int pass = 0; pass < passes; pass++) {
                 String realm = pass == 0 ? acc.realm : REALM_GLOBAL;
                 boolean cross = pass > 0;
@@ -1125,7 +1189,7 @@ public final class WorkBuddy {
                            “请重新发送”：同一账号最多重发 2 次（间隔 500ms / 1.5s）；
                            账号被标记的旧 11128（conversation id missing / request illegal）
                            不在此列，不要浪费往返。 */
-                        while (resendableChannel(err) && resent[0] < RESEND_MAX) {
+                        while (mayResend && resendableChannel(err) && resent[0] < RESEND_MAX) {
                             resent[0]++;
                             noteConv(p, req, shape, "风控拦截，第 " + resent[0] + " 次重发", err);
                             try {
@@ -1141,6 +1205,7 @@ public final class WorkBuddy {
                                 applyConversationHeaders(hh2, body2);
                                 send(endpoint, hh2, body2, sink, model, req, acc);
                                 FingerprintWatch.noteOk(p.name, body2);
+                                noteResendWorked(p.name);
                                 noteConv(p, req, shape, cross ? "重发通过（国际版身份）" : "重发通过", null);
                                 return;
                             } catch (Throttled t2) {
@@ -1163,6 +1228,9 @@ public final class WorkBuddy {
                                重发用的是 body2，但两者都由同一个 buildBody 构造，
                                混淆痕迹必然一致，所以查 body 与查 body2 等价。 */
                             FingerprintWatch.noteBlocked(p.name, body);
+                            /* 只有"真的重发过"才算一轮失败：熔断打开时 resent[0]==0，
+                               那一次没付代价，不该把计数继续往上推。 */
+                            if (resent[0] > 0) noteResendFailed(p.name);
                             channelFail = err;
                             noteConv(p, req, shape, "请求级风控仍未放行", err);
                             throw err;
