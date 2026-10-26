@@ -197,6 +197,18 @@ public final class Config {
         public boolean catalogOnly = false;
 
         /**
+         * 慢渠道：首 token 的等待预算从 45 秒放宽到 120 秒（4.63.0）。
+         *
+         * <p>为什么需要：有些免费/实验渠道的模型确实很慢。实测云知声 `u2-flash`
+         * 对一个"你好"的请求，首 token 超过 45 秒才出来 —— 被网关的超时切掉，
+         * 表现成 `Socket closed`，看着像上游拒绝，其实是**我们自己等不及**。
+         *
+         * <p>默认关闭：放宽超时意味着"上游真挂住"时要多等 75 秒才换候选。
+         * 只给明确知道自己慢的渠道开。
+         */
+        public boolean slow = false;
+
+        /**
          * 凭据在**本次运行内解不开**（Keystore 重建 / 换机导入 / 密文损坏）。
          *
          * 为什么不落盘：这是"当前这台机器的 Keystore 打不开这个密文"，不是账号自身的
@@ -529,6 +541,7 @@ public final class Config {
             o.put("apiKeyAliases", aliases);
                 o.put("enabled", enabled);
             o.put("catalogOnly", catalogOnly);
+            o.put("slow", slow);
                 /* 账号级开关（目前只有 intl_fallback）。空对象不写，保持老配置形状不变。 */
                 if (options.length() > 0) o.put("options", options);
                 o.put("credentials", credentials);
@@ -620,6 +633,7 @@ public final class Config {
             p.apiKey = Proto.optString(o, "apiKey", "");
             p.enabled = o.optBoolean("enabled", true);
         p.catalogOnly = o.optBoolean("catalogOnly", false);
+        p.slow = o.optBoolean("slow", false);
             JSONObject opts = o.optJSONObject("options");
             if (opts != null) {
                 java.util.Iterator<String> oit = opts.keys();

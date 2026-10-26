@@ -4,7 +4,7 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.62.0**（versionCode 676）。**唯一来源是 `version.properties`**，
+- 当前版本：**4.63.0**（versionCode 677）。**唯一来源是 `version.properties`**，
   这一行只是方便一眼看到；发版时同步更新，若两处对不上以 `version.properties` 为准。
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35

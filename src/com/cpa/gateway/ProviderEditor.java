@@ -148,6 +148,10 @@ final class ProviderEditor {
         final EditText ctx = numField(a, box, "上下文 token 上限（超过就不发给它）", p.contextLimit);
         final Switch vision = Ui.toggle(a, "支持图片输入", p.vision);
         box.addView(vision, Ui.lp(a, 12));
+        /* 慢渠道：有些免费模型首 token 就要 45 秒以上，默认预算会把它切掉，
+           表现成 Socket closed（看着像上游拒绝，其实是我们等不及）。 */
+        final Switch slow = Ui.toggle(a, "慢渠道（首 token 等到 120 秒）", p.slow);
+        box.addView(slow, Ui.lp(a, 12));
 
         android.widget.TextView fetch = Ui.outlineButton(a, "自动获取模型列表");
         fetch.setOnClickListener(v -> {
@@ -298,6 +302,7 @@ final class ProviderEditor {
             p.tpd = intOf(tpd);
             p.contextLimit = intOf(ctx);
             p.vision = vision.isChecked();
+            p.slow = slow.isChecked();
             Log.i("账号 \"" + p.name + "\" 限额：rpm=" + p.rpm + " rpd=" + p.rpd
                     + " 并发=" + p.maxConcurrent + " tpm=" + p.tpm + " tpd=" + p.tpd
                     + " 上下文=" + p.contextLimit + " 图片=" + p.vision);

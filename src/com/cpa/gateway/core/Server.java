@@ -4139,7 +4139,10 @@ public final class Server {
      */
     private void serveWithBudget(String requested, Config.Provider p, String upstreamModel,
                                  Proto.Req req, Proto.Sink sink, int i, int tries) throws Exception {
-        long ft = (i + 1 < tries) ? 10_000L : 45_000L;
+        /* 慢渠道（4.63.0）：首 token 预算放宽到 120 秒。实测云知声 u2-flash
+           对一个"你好"要 45 秒以上才吐第一个字，默认预算会把它切成 Socket closed，
+           看着像上游拒绝，其实是我们自己等不及。 */
+        long ft = p != null && p.slow ? 120_000L : ((i + 1 < tries) ? 10_000L : 45_000L);
         Upstreams.firstTokenOverride(ft);
         try {
             serve(requested, p, upstreamModel, req, sink);
