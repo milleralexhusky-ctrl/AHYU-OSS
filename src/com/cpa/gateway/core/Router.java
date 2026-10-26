@@ -188,17 +188,36 @@ public final class Router {
      * <p>三个候选全是同一个没额度的账号，每个请求都要撞一遍、等一遍超时；
      * 而真正有额度的 Loomy 2/3 根本没进候选。表现就是用户说的"特别慢、老重连"。
      *
-     * <p>所以额度/凭证这类**账号级**失败单独记一张表，按账号名挡掉它下面所有模型。
-     * 只放这两类（{@code quota} / {@code auth}）：它们确实是账号属性；
-     * 限流（rate）和渠道校验（channel）不是 —— 换个模型可能就好了，
-     * 按账号一刀切会把还能用的模型也误伤。
+     * <p>所以凭证（{@code auth}）这类**账号级**失败单独记一张表，按账号名挡掉它下面所有模型。
+     *
+     * <p><b>2026-10-26 起 quota 不再进这张表</b>：实测同一个 WorkBuddy 账号，
+     * 付费模型（glm-5.3 / deepseek / kimi）报 14018「额度已用尽」时，
+     * 免费模型 hy3 仍然能正常跑（连 131KB / 45 工具 / 22k token 的请求都过）。
+     * 额度是按**模型**计的，当成账号级会把还能用的模型一起误伤 ——
+     * 这正是用户报告"账号好像被封了"的直接原因。见 {@link #accountScoped}。
+     *
+     * <p>限流（rate）和渠道校验（channel）同样不是账号级：换个模型可能就好了。
      */
     private static final Map<String, Long> ACCOUNT_AVOID =
             Collections.synchronizedMap(new HashMap<String, Long>());
 
     /** 账号级回避：这类失败属于整个账号，不是某个模型。 */
     static boolean accountScoped(String kind) {
-        return "quota".equals(kind) || "auth".equals(kind);
+        /* 2026-10-26 修正：**额度不再是账号级**。
+         *
+         * 真机证据（同一天、同一个 WorkBuddy 1 账号）：
+         *   glm-5.3 / deepseek-v4.1-flash / kimi-k3-1 → 429 + 14018「额度已用尽」
+         *   hy3                                        → 200，连 131KB / 45 工具 / 22k token 都正常
+         * 也就是说额度**按模型计**：付费模型没额度，不等于这个账号废了。
+         *
+         * 旧判据把 quota 当账号级，后果很重：一次 14018 就给整个账号 -80 分，
+         * 并且 {@code Repeats.wouldSucceed} 会直接跳过它 —— 免费模型 hy3 明明能用，
+         * 却被一起废掉 30 分钟。用户看到的就是"账号好像被封了"。
+         *
+         * 现在只留 auth（凭证失效确实是整个账号的事：换模型也过不了鉴权）。
+         * 额度改由 {@code 账号/模型} 的 throttle 单独记，换模型就该能过。
+         * 代价是"整个账号真的一点额度都没有"时会多撞几个模型；有 tries 上限兜着。 */
+        return "auth".equals(kind);
     }
 
     /** 记一个账号级回避（毫秒时间戳）。 */

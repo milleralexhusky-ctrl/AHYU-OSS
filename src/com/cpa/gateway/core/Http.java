@@ -483,9 +483,10 @@ public final class Http {
      *       实测 22:40 那次，同一个账号的 deepseek-v4-pro / deepseek-v4.1-flash
      *       在**同一秒**各记了一次"暂避 300 秒"——额度根本不会 5 分钟恢复，
      *       于是每 5 分钟白撞一轮，永远撞不出一句成功。</li>
-     *   <li>账号级回避（{@link Router#accountScoped}）只认 {@code quota}/{@code auth}，
+     *   <li>账号级回避（{@link Router#accountScoped}）当时只认 {@code quota}/{@code auth}，
      *       {@code rate} 不进表 —— 于是"这个账号没额度了"这件事**从来没被记成账号级事实**，
-     *       后面每个请求还是要先把它的模型逐个撞一遍。</li>
+     *       后面每个请求还是要先把它的模型逐个撞一遍。
+     *       （4.56.0 反过来修正了：按模型计的额度不该升级成账号级，见 Router#accountScoped。）</li>
      *   <li>界面文案：{@code rate} 显示"被上游限流（换账号/换模型可继续用）"，
      *       而真实情况是"额度没了，换模型也救不了" —— 用户照着提示换模型，白换。</li>
      * </ol>

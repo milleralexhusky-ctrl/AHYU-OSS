@@ -2549,9 +2549,13 @@ public final class Selftest {
      * <p>为什么最终是扣分而不是拉黑：同一账号下实测有模型还能返回（502 空响应），
      * 有模型报 14018 额度用尽 —— 额度至少部分是**按模型**计的。
      * 硬挡会把还能用的模型一起误伤，极端情况下候选池清空变成 404。
-     * 所以这里钉住三件事：
+     *
+     * <p><b>4.56.0 进一步</b>：既然额度按模型计，连"扣分"也不该按账号扣 ——
+     * 实测同一账号 glm-5.3 报 14018 时 hy3 仍能跑 131KB 复杂请求，
+     * 而账号级扣分会顺带把 hy3 拖下水（{@code Repeats.wouldSucceed} 更是直接跳过）。
+     * 现在只有 {@code auth} 算账号级。所以这里钉住三件事：
      * <ol>
-     *   <li>只认 {@code quota}/{@code auth} 两类是账号级 —— 限流和渠道校验不是，
+     *   <li><b>只有凭证失效</b>是账号级；额度、限流、渠道校验都不是账号级 ——
      *       换个模型可能就好了，按账号一刀切会误伤；</li>
      *   <li>被回避的账号**仍然出现在候选池里**（不制造"没有可用候选"）；</li>
      *   <li>分数下降幅度在合理区间：要低于"正常账号"，但不能低到盖过
@@ -2559,8 +2563,11 @@ public final class Selftest {
      * </ol>
      */
     private static String checkAccountAvoid() {
-        /* 1. 作用域：只有额度/凭证算账号级 */
-        if (!Router.accountScoped("quota")) return "额度用尽没有当成账号级失败";
+        /* 1. 作用域：只有凭证失效算账号级 */
+        if (Router.accountScoped("quota")) {
+            return "额度用尽被当成了账号级失败 —— 实测同账号下 hy3 能用、付费模型报 14018，"
+                    + "按账号一刀切会把还能用的免费模型一起废掉";
+        }
         if (!Router.accountScoped("auth")) return "凭证失效没有当成账号级失败";
         if (Router.accountScoped("rate")) {
             return "限流被当成了账号级失败 —— 限流通常只挂一个模型，"
