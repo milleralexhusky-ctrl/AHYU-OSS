@@ -1540,7 +1540,7 @@ public class MainActivity extends Activity {
     /** Level two: API-key providers. */
     private void showApiKeys() {
         LinearLayout list = Ui.column(this);
-        choiceRow(list, "openai", "OpenAI 兼容中转", "OpenRouter / DeepSeek / 硅基流动 等 33 家预置",
+        choiceRow(list, "openai", "OpenAI 兼容中转", "OpenRouter / DeepSeek / 硅基流动 等 36 家预置",
                 this::addOpenAiCompatible);
         choiceRow(list, "anthropic", "Claude（API Key）", "Anthropic 官方，或智谱 / 百炼 / DeepSeek / Kimi 的 Anthropic 端点", () -> {
             Config.Provider p = new Config.Provider();
@@ -1681,11 +1681,14 @@ public class MainActivity extends Activity {
                 "火山方舟 Doubao（控制台 API Key）", "讯飞星火", "百度千帆",
                 "硅基流动 SiliconFlow", "MiniMax", "小米 MiMo",
                 "商汤日日新 SenseNova", "美团 LongCat", "魔搭 ModelScope", "阶跃星辰 StepFun",
-                /* ── 国外（19 家） ── */
+                /* ── 国外（22 家） ── */
                 "OpenRouter", "xAI Grok", "Groq", "Mistral", "Cerebras", "Together",
                 "Google AI Studio", "Cloudflare Workers AI", "NVIDIA NIM", "Cohere",
                 "HuggingFace", "SambaNova", "Fireworks", "DeepInfra", "Nebius AI Studio",
                 "Pollinations（免注册）", "Venice AI", "MiniMax 国际版（M2 免费期）",
+                /* 4.62.0：三条已核实免费条款的新渠道（端点均实测存在） */
+                "Z.AI（GLM Flash 免费）", "IteraCompute（3000 万 tok/月）",
+                "Hetzner Inference（实验免费）",
                 "自建 / 其它中转"};
         final String[] bases = {
                 "https://api.deepseek.com/v1", "https://open.bigmodel.cn/api/paas/v4",
@@ -1711,6 +1714,13 @@ public class MainActivity extends Activity {
                 "https://text.pollinations.ai/openai",
                 "https://api.venice.ai/api/v1",
                 "https://api.minimax.io/v1",
+                /* 4.62.0 新增：三家免费条款已核实的渠道。
+                   Z.AI 的 glm-4.5-flash 是真的 $0（不是试用金）；
+                   IteraCompute 每月 3000 万 token，仅 qwen3.8-27b 一个模型；
+                   Hetzner 实验期免费，但要绑卡、且只有两个 Qwen。 */
+                "https://api.z.ai/api/paas/v4",
+                "https://api.iteracompute.com/v1",
+                "https://inference.hetzner.com/api/v1",
                 ""};
         LinearLayout list = Ui.column(this);
         boolean domesticHeaderDone = false;
