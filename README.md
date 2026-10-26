@@ -4,7 +4,8 @@
 **OpenAI / Anthropic / Gemini / Ollama / Azure 风格接口**访问这些账号。
 
 - 包名：`com.ahyu`（源码包 `com.cpa.gateway`）
-- 当前版本：**4.53.3**（versionCode 664，见 `version.properties`）
+- 当前版本：**4.61.0**（versionCode 675）。**唯一来源是 `version.properties`**，
+  这一行只是方便一眼看到；发版时同步更新，若两处对不上以 `version.properties` 为准。
 - 纯 Java，**不使用 Gradle、没有任何第三方依赖**；构建脚本就是 `build.sh`
 - minSdk 26 / targetSdk 35
 
@@ -83,7 +84,7 @@ OpenAI/Anthropic/Gemini 兼容中转。
 **界面**：主页面下拉刷新；日志页**上翻即暂停跟随**（右下角「回到最新」恢复，
 不再把正在读历史的人拽回底部）；主题选择器用聚焦语义（选中的放大提亮、
 未选中的降饱和缩小）；按压手感走真阻尼弹簧（`Jelly`），帧预算由 `Perf`
-自动调档。自检 **62 项**，含手势状态机、配色亮度极差、缓存价绊线、工具结果跨协议出站等"防静默失效"断言。
+自动调档。自检 **63 项**，含手势状态机、配色亮度极差、缓存价绊线、工具结果跨协议出站等"防静默失效"断言。
 
 ## 构建
 

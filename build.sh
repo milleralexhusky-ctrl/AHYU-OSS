@@ -57,6 +57,23 @@ if [ -z "$VERSION_NAME" ]; then
     exit 1
 fi
 
+# README 顶部那行「当前版本：X（versionCode N）」必须跟 version.properties 对得上。
+# 4.60.0 之前漏更新过：代码已经是 4.60.0/674，README 还写着 4.53.3/664 ——
+# 照着 README 走的人会对不上号。这里做成构建期硬校验，忘改就编译失败，
+# 而不是等谁发现。README 不在就不查（比如把它删掉的自定义构建）。
+README_MD=$ROOT/README.md
+if [ -f "$README_MD" ]; then
+    R_NAME=$(sed -n 's/.*当前版本：\*\*\([0-9][0-9.]*\)\*\*.*/\1/p' "$README_MD" | head -1)
+    R_CODE=$(sed -n 's/.*versionCode \([0-9][0-9]*\).*/\1/p' "$README_MD" | head -1)
+    if [ "$R_NAME" != "$VERSION_NAME" ] || [ "$R_CODE" != "$VERSION_CODE" ]; then
+        echo "README 的版本行与 version.properties 对不上："
+        echo "  version.properties: $VERSION_NAME ($VERSION_CODE)"
+        echo "  README.md:          ${R_NAME:-?} (${R_CODE:-?})"
+        echo "把 README 顶部「当前版本：**$VERSION_NAME**（versionCode $VERSION_CODE）」改一致后重跑。"
+        exit 1
+    fi
+fi
+
 cd $ROOT
 rm -rf $OUT
 mkdir -p $OUT/compiled $OUT/gen $OUT/classes $OUT/dex

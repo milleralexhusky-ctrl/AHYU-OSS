@@ -4346,6 +4346,11 @@ public final class Server {
             }
         };
         try {
+            /* 出站节流（见 Pacer）：同一个账号两次真实上游请求之间留一个最小间隔。
+               放在这里而不是更靠前，是因为前面的检查（本地限额、并发槽）都是本地的，
+               没发出去就不该占用账号的"发送配额"。重试/换号/并发才会真正排到这里，
+               而那些正是需要被摊开的场景。 */
+            Pacer.await(p.name);
             Upstreams.create(p).chat(upstreamModel, req, tap);
             // 记账：预检只是"允许发"，真正的额度占用在成功之后（原版 RecordUsage 的时机）
             long usedTokens = estTokens;

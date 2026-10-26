@@ -83,6 +83,7 @@ public final class Selftest {
                 Selftest::checkGlassTintRange);
         add(out, "下拉刷新手势（方向 / 阈值 / 不抢点击与滚动）", Selftest::checkPullGesture);
         add(out, "预置服务商分组（国内/国外判据与预置清单逐个对得上）", Selftest::checkRegionClassify);
+        add(out, "出站节流（同账号两次发送留间隔，不同账号互不影响）", Selftest::checkPacer);
         add(out, "缓存价成本分段（缺价按全价 / 命中数不可超输入）", Selftest::checkCachedCost);
         add(out, "额度未知（-1）不能被当成额度用尽", Selftest::checkCreditsUnknown);
         add(out, "额度取「按周期剩余」而不是总容量（防显示 500 却发不出去）",
@@ -1842,6 +1843,50 @@ public final class Selftest {
         Router.noteSession(turn1, "");
         if (!"acc/model-x".equals(Router.sessionPinForTest(turn1))) {
             return "空候选名把亲和表写坏了";
+        }
+        return null;
+    }
+
+    /**
+     * 出站节流（4.61.0）。
+     *
+     * <p>锁两件事：**同一账号的第二次发送必须等**，**不同账号互不牵连**。
+     * 后者是竞速场景的命门——三路来自不同账号，若节流按全局算，竞速会被排队成串行。
+     *
+     * <p>只用下界断言（≥ 间隔），不给上界：机器忙的时候多等一点是正常的，
+     * 拿上界断言会在慢设备上假红。
+     */
+    private static String checkPacer() {
+        String a = "pacer-selftest-a-" + System.nanoTime();
+        String b = "pacer-selftest-b-" + System.nanoTime();
+        Pacer.resetForTest(a);
+        Pacer.resetForTest(b);
+        long gap = Pacer.minGapMsForTest();
+
+        try {
+            /* 第一次不该等（这个账号从没发过）。 */
+            long t0 = System.currentTimeMillis();
+            Pacer.await(a);
+            long first = System.currentTimeMillis() - t0;
+            if (first > 200) return "第一次发送就等了 " + first + "ms，节流把正常请求也拖慢了";
+
+            /* 第二次必须等够最小间隔（抖动只会更长）。 */
+            t0 = System.currentTimeMillis();
+            Pacer.await(a);
+            long second = System.currentTimeMillis() - t0;
+            if (second < gap - 30) {
+                return "同账号连续两次只隔了 " + second + "ms（应 ≥ " + gap + "ms）——"
+                        + "重试/并发时会变成机器式连发";
+            }
+
+            /* 另一个账号不受影响：竞速三路是不同账号，不能被排成串行。 */
+            t0 = System.currentTimeMillis();
+            Pacer.await(b);
+            long other = System.currentTimeMillis() - t0;
+            if (other > 200) return "不同账号之间互相等了 " + other + "ms，竞速会被串行化";
+        } finally {
+            Pacer.resetForTest(a);
+            Pacer.resetForTest(b);
         }
         return null;
     }
